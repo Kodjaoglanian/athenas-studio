@@ -81,18 +81,15 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
 pub async fn get(key: &str) -> Result<()> {
     let config = AppConfig::load()?;
 
-    match key {
-        "huggingface.token" => {
-            if config.huggingface.token.is_some() {
-                println!("huggingface.token = [set]");
-            } else if std::env::var("HF_TOKEN").is_ok() {
-                println!("huggingface.token = [set via HF_TOKEN env]");
-            } else {
-                println!("huggingface.token = [not set]");
-            }
-            return Ok(());
+    if key == "huggingface.token" {
+        if config.huggingface.token.is_some() {
+            println!("huggingface.token = [set]");
+        } else if std::env::var("HF_TOKEN").is_ok() {
+            println!("huggingface.token = [set via HF_TOKEN env]");
+        } else {
+            println!("huggingface.token = [not set]");
         }
-        _ => {}
+        return Ok(());
     }
 
     let content = toml::to_string_pretty(&config)
