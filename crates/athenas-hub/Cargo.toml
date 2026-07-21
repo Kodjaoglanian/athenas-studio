@@ -1,0 +1,23 @@
+[package]
+name = "athenas-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+athenas-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+indicatif = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+dirs = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
