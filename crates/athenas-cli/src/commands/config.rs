@@ -80,6 +80,21 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
 
 pub async fn get(key: &str) -> Result<()> {
     let config = AppConfig::load()?;
+
+    match key {
+        "huggingface.token" => {
+            if config.huggingface.token.is_some() {
+                println!("huggingface.token = [set]");
+            } else if std::env::var("HF_TOKEN").is_ok() {
+                println!("huggingface.token = [set via HF_TOKEN env]");
+            } else {
+                println!("huggingface.token = [not set]");
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let content = toml::to_string_pretty(&config)
         .map_err(|e| athenas_core::AthenasError::Config(e.to_string()))?;
 
@@ -108,7 +123,11 @@ pub async fn get(key: &str) -> Result<()> {
 }
 
 pub async fn show() -> Result<()> {
-    let config = AppConfig::load()?;
+    let mut config = AppConfig::load()?;
+    // Mask token for display
+    if config.huggingface.token.is_some() {
+        config.huggingface.token = Some("[set]".to_string());
+    }
     let content = toml::to_string_pretty(&config)
         .map_err(|e| athenas_core::AthenasError::Config(e.to_string()))?;
     println!("{}", content);
@@ -122,5 +141,34 @@ pub async fn init() -> Result<()> {
         "Configuration initialized at: {:?}",
         AppConfig::config_path()?
     );
+    Ok(())
+}
+
+pub async fn login(token: Option<String>) -> Result<()> {
+    let token = match token {
+        Some(t) => t,
+        None => {
+            println!("Get your token at: https://huggingface.co/settings/tokens");
+            print!("Enter your HuggingFace token: ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| athenas_core::AthenasError::InvalidInput(e.to_string()))?;
+            input.trim().to_string()
+        }
+    };
+
+    if token.is_empty() {
+        println!("No token provided. Login cancelled.");
+        return Ok(());
+    }
+
+    let mut config = AppConfig::load()?;
+    config.huggingface.token = Some(token);
+    config.save()?;
+
+    println!("HuggingFace token saved to config.");
+    println!("You can now access private and gated models.");
     Ok(())
 }

@@ -47,8 +47,11 @@ impl ModelDownloader {
         }
 
         let client = self.client.client().clone();
-        let resp = client
-            .get(&download_url)
+        let mut req = client.get(&download_url);
+        if let Some(token) = self.client.token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| AthenasError::Download(format!("Download request failed: {}", e)))?;

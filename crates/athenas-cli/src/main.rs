@@ -104,6 +104,13 @@ enum Commands {
         #[command(subcommand)]
         action: Option<BackendCommands>,
     },
+
+    /// Login to HuggingFace Hub (set access token)
+    Login {
+        /// HuggingFace access token (skip prompt if provided)
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -243,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             }
             None => commands::backend::list().await?,
         },
+        Commands::Login { token } => commands::config::login(token).await?,
     }
 
     Ok(())
