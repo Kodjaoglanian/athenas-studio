@@ -1,0 +1,8 @@
+pub mod backend;
+pub mod chat;
+pub mod config;
+pub mod hardware;
+pub mod models;
+pub mod run;
+pub mod serve;
+pub mod tui;
