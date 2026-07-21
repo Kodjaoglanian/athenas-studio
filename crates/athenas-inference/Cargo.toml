@@ -17,3 +17,6 @@ anyhow = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 which = "7.0"
+flate2 = "1.0"
+tar = "0.4"
+zip = "2.2"

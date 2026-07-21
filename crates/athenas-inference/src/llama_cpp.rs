@@ -69,23 +69,13 @@ impl LlamaCppBackend {
     }
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
-        let server_bin = self.find_llama_server().ok_or_else(|| {
-            AthenasError::Backend(
-                "llama-server not found.\n\
-                 \n\
-                 Install llama.cpp:\n\
-                 \n  \
-                   git clone https://github.com/ggerganov/llama.cpp\n\
-                   \n  \
-                   cd llama.cpp && cmake -B build && cmake --build build --config Release\n\
-                   \n  \
-                   sudo cp build/bin/llama-server /usr/local/bin/\n\
-                 \n\
-                 Or download prebuilt binaries from:\n\
-                   https://github.com/ggerganov/llama.cpp/releases"
-                    .to_string(),
-            )
-        })?;
+        let server_bin = if let Some(path) = self.find_llama_server() {
+            path
+        } else {
+            info!("llama-server not found, auto-downloading...");
+            let path = crate::backend_setup::ensure_llama_server().await?;
+            path.to_string_lossy().to_string()
+        };
 
         self.server_port = find_free_port();
 

@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod backend_setup;
 pub mod llama_cpp;
 pub mod types;
 pub mod vllm;
