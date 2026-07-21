@@ -6,35 +6,6 @@ const REPO: &str = "Kodjaoglanian/athenas-studio";
 const INSTALL_URL: &str =
     "https://github.com/Kodjaoglanian/athenas-studio/releases/latest/download/install.sh";
 
-fn print_banner() {
-    let cyan = "\x1b[0;36m";
-    let bold = "\x1b[1m";
-    let nc = "\x1b[0m";
-    println!();
-    println!(
-        "{}{}    ___   __   ____  _   _ _____ _____ ____     {}",
-        cyan, bold, nc
-    );
-    println!(
-        "{}{}   / _ \\ / /_ / ___|| | |  ___|_   _|  _ \\    {}",
-        cyan, bold, nc
-    );
-    println!(
-        "{}{}  / /_\\_/ __|\\___ \\| |_| | |_    | | | |_) |   {}",
-        cyan, bold, nc
-    );
-    println!(
-        "{}{} / /_\\  \\_| |____) |  _  |  _|   | | |  _ <    {}",
-        cyan, bold, nc
-    );
-    println!(
-        "{}{} \\____|\\__|____/ |_| |_|_|     |_| |_| \\_\\   {}",
-        cyan, bold, nc
-    );
-    println!("{}{}        Studio — Local LLM Inference{}", cyan, bold, nc);
-    println!();
-}
-
 fn info(msg: &str) {
     let cyan = "\x1b[0;36m";
     let nc = "\x1b[0m";
@@ -61,8 +32,6 @@ fn error(msg: &str) {
 }
 
 pub async fn run() -> Result<()> {
-    print_banner();
-
     let current_version = get_current_version();
     info(&format!("Current version: {}", current_version));
 
