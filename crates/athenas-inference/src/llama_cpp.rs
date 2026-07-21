@@ -121,7 +121,9 @@ impl LlamaCppBackend {
             .arg("--port")
             .arg(self.server_port.to_string())
             .arg("--host")
-            .arg("127.0.0.1");
+            .arg("127.0.0.1")
+            .arg("--parallel")
+            .arg("1");
 
         if config.gpu_layers >= 0 {
             cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
@@ -157,15 +159,9 @@ impl LlamaCppBackend {
         self.server_handle = Some(child);
 
         // Wait for server to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        for _attempt in 0..30 {
-            let url = format!("http://127.0.0.1:{}/health", self.server_port);
-            if let Ok(resp) = self.client.get(&url).send().await {
-                if resp.status().is_success() {
-                    info!("llama-server is ready on port {}", self.server_port);
-                    return Ok(());
-                }
-            }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        for _attempt in 0..20 {
+            // Check if process exited early
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
                     Ok(Some(status)) => {
@@ -197,11 +193,30 @@ impl LlamaCppBackend {
                     Err(_) => {}
                 }
             }
+
+            // Try health check with timeout
+            let url = format!("http://127.0.0.1:{}/health", self.server_port);
+            let health_req = self
+                .client
+                .get(&url)
+                .timeout(tokio::time::Duration::from_secs(2));
+            if let Ok(resp) = health_req.send().await {
+                if resp.status().is_success() {
+                    info!("llama-server is ready on port {}", self.server_port);
+                    return Ok(());
+                }
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
 
+        // Kill the server if it didn't start in time
+        if let Some(ref mut child) = self.server_handle {
+            let _ = child.kill().await;
+        }
+        self.server_handle = None;
+
         Err(AthenasError::Backend(
-            "llama-server failed to start within 15 seconds".to_string(),
+            "llama-server failed to start within 10 seconds".to_string(),
         ))
     }
 

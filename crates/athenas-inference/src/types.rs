@@ -129,14 +129,16 @@ pub struct ModelLoadConfig {
 
 impl Default for ModelLoadConfig {
     fn default() -> Self {
+        let total_threads = std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(4);
         Self {
             model_path: String::new(),
             gpu_layers: -1,
-            context_size: 4096,
-            batch_size: 512,
-            threads: std::thread::available_parallelism()
-                .map(|n| n.get() as u32)
-                .unwrap_or(4),
+            context_size: 2048,
+            batch_size: 256,
+            // Leave at least 1 core free for the system
+            threads: total_threads.saturating_sub(1).max(1),
             flash_attention: true,
             use_mmap: true,
             use_mlock: false,

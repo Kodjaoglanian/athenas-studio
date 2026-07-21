@@ -221,9 +221,46 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
 
     let server_path = bin_dir.join(server_name);
 
-    // Already installed?
+    // Already installed AND has shared libs?
     if server_path.exists() {
-        return Ok(server_path);
+        // On Linux/macOS, check for the shared lib that llama-server needs
+        let lib_ok = if std::env::consts::OS == "linux" {
+            // Check for any .so files in the same directory
+            std::fs::read_dir(&bin_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.file_name().to_string_lossy().starts_with("libllama"))
+                })
+                .unwrap_or(false)
+        } else if std::env::consts::OS == "macos" {
+            std::fs::read_dir(&bin_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
+                })
+                .unwrap_or(false)
+        } else {
+            true
+        };
+
+        if lib_ok {
+            return Ok(server_path);
+        }
+
+        // Shared libs missing — clean up and re-download
+        info!("llama-server exists but shared libs missing, re-downloading...");
+        let _ = std::fs::remove_file(&server_path);
+        // Also clean up any old .so/.dylib files
+        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("libllama") || name.starts_with("libggml") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     info!("llama-server not found, auto-downloading...");

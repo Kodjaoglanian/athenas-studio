@@ -64,6 +64,8 @@ pub struct TuiApp {
         tokio::task::JoinHandle<std::result::Result<Box<dyn Backend>, athenas_core::AthenasError>>,
     >,
     loading_spinner: usize,
+    // Background chat streaming state
+    chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
 }
 
 impl TuiApp {
@@ -93,6 +95,7 @@ impl TuiApp {
             is_loading_model: false,
             model_load_task: None,
             loading_spinner: 0,
+            chat_stream_rx: None,
         }
     }
 
@@ -130,6 +133,9 @@ impl TuiApp {
 
             // Poll model loading task
             self.poll_model_loading().await;
+
+            // Poll chat stream
+            self.poll_chat_stream().await;
 
             // Animate loading spinner
             if self.is_loading_model {
@@ -605,6 +611,10 @@ impl TuiApp {
             return;
         }
 
+        if self.chat_state.is_generating {
+            return;
+        }
+
         self.chat_state.add_message("user", &text);
         self.chat_state.input_text.clear();
         self.chat_state.is_generating = true;
@@ -640,27 +650,43 @@ impl TuiApp {
             seed: None,
         };
 
-        // Stream response
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+        // Start streaming in background — store receiver for polling
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
 
         if let Some(backend) = &self.backend {
             let _ = backend.chat_stream(req, tx).await;
         }
 
-        // Collect streamed chunks
-        while let Some(chunk) = rx.recv().await {
-            if chunk.done {
-                if let Some(stats) = chunk.stats {
-                    self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
-                }
-                self.chat_state.finalize_streaming();
-            } else {
-                self.chat_state.append_streaming(&chunk.text);
-            }
+        self.chat_stream_rx = Some(rx);
+    }
+
+    async fn poll_chat_stream(&mut self) {
+        if !self.chat_state.is_generating {
+            return;
         }
 
-        if self.chat_state.is_generating {
-            self.chat_state.finalize_streaming();
+        if let Some(rx) = &mut self.chat_stream_rx {
+            // Non-blocking: try to receive available chunks without waiting
+            while let Ok(chunk) = rx.try_recv() {
+                if chunk.done {
+                    if let Some(stats) = chunk.stats {
+                        self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+                    }
+                    self.chat_state.finalize_streaming();
+                    self.chat_stream_rx = None;
+                    return;
+                } else {
+                    self.chat_state.append_streaming(&chunk.text);
+                }
+            }
+
+            // Check if the sender was dropped (stream ended without done chunk)
+            if rx.is_closed() {
+                if self.chat_state.is_generating {
+                    self.chat_state.finalize_streaming();
+                }
+                self.chat_stream_rx = None;
+            }
         }
     }
 
@@ -709,8 +735,71 @@ impl TuiApp {
             return;
         }
 
-        self.chat_state
-            .add_message("system", &format!("Loading model: {}...", path));
+        // === Resource protections ===
+
+        // 1. Check model file size vs available RAM
+        let model_size_mb = std::fs::metadata(path)
+            .map(|m| m.len() / (1024 * 1024))
+            .unwrap_or(0);
+
+        let avail_mb = self.hardware.memory_available_mb;
+        let total_mb = self.hardware.memory_total_mb;
+
+        // Model needs roughly 1.5x its file size in RAM (weights + KV cache + overhead)
+        // For Q4 models: file size ≈ weights, context adds ~ctx_size * 2KB * layers
+        let estimated_needed_mb =
+            model_size_mb + ((self.config.inference.default_context_size as u64 / 1024) * 64);
+
+        if avail_mb > 0 && estimated_needed_mb > avail_mb {
+            self.chat_state.add_message(
+                "system",
+                &format!(
+                    "⚠ Not enough RAM to load this model safely.\n\
+                     Model: {}MB, estimated need: {}MB, available: {}MB\n\
+                     Try a smaller model, smaller context size, or close other applications.",
+                    model_size_mb, estimated_needed_mb, avail_mb
+                ),
+            );
+            return;
+        }
+
+        // 2. Cap threads to leave at least 1 core free for the system
+        let mut threads = self.config.inference.default_threads;
+        let max_threads = self.hardware.cpus.saturating_sub(1).max(1);
+        if threads > max_threads {
+            threads = max_threads;
+        }
+
+        // 3. Cap context size based on available memory
+        // Each 1K context ≈ 64MB for a 9B model, scale roughly
+        let mut context_size = self.config.inference.default_context_size;
+        let max_ctx_by_mem = if total_mb > 0 {
+            // Reserve model size + 512MB overhead, allow up to 50% of remaining for context
+            let reserved = model_size_mb + 512;
+            let usable = total_mb.saturating_sub(reserved);
+            // Rough: ctx_mb = usable * 0.4, ctx = ctx_mb / 64 * 1024
+            ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024
+        } else {
+            8192
+        };
+        if context_size > max_ctx_by_mem && max_ctx_by_mem > 0 {
+            context_size = max_ctx_by_mem.max(512);
+        }
+
+        // 4. Cap batch size — large batches consume more memory
+        let mut batch_size = self.config.inference.default_batch_size;
+        if batch_size > context_size {
+            batch_size = context_size;
+        }
+
+        self.chat_state.add_message(
+            "system",
+            &format!(
+                "Loading model: {}...\n\
+                 Resource limits: {} threads, {} ctx, {} batch (RAM: {}MB/{}MB)",
+                path, threads, context_size, batch_size, avail_mb, total_mb
+            ),
+        );
         self.is_loading_model = true;
         self.loading_spinner = 0;
 
@@ -719,9 +808,9 @@ impl TuiApp {
         let load_config = ModelLoadConfig {
             model_path: path.to_string(),
             gpu_layers: self.config.inference.default_gpu_layers,
-            context_size: self.config.inference.default_context_size,
-            batch_size: self.config.inference.default_batch_size,
-            threads: self.config.inference.default_threads,
+            context_size,
+            batch_size,
+            threads,
             flash_attention: self.config.inference.flash_attention,
             use_mmap: true,
             use_mlock: false,

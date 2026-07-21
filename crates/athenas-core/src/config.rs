@@ -115,8 +115,8 @@ impl Default for AppConfig {
             inference: InferenceConfig {
                 default_backend: BackendType::Auto,
                 default_gpu_layers: -1,
-                default_context_size: 4096,
-                default_batch_size: 512,
+                default_context_size: 2048,
+                default_batch_size: 256,
                 default_threads: num_threads(),
                 flash_attention: true,
                 default_temperature: 0.7,
@@ -149,9 +149,11 @@ impl Default for AppConfig {
 }
 
 fn num_threads() -> u32 {
-    std::thread::available_parallelism()
+    let total = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
-        .unwrap_or(4)
+        .unwrap_or(4);
+    // Leave at least 1 core free for the system to prevent freezes
+    total.saturating_sub(1).max(1)
 }
 
 impl AppConfig {
