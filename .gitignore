@@ -1,0 +1,38 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Build artifacts
+*.o
+*.so
+*.a
+*.dylib
+*.dll
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Athenas Studio local data
+.athenas/
+*.gguf
+*.safetensors
+*.bin
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Coverage
+tarpaulin-report.html
+cobertura.xml
+coverage/
