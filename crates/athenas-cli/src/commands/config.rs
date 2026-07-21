@@ -9,9 +9,12 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
                 "llama.cpp" | "llamacpp" => athenas_core::BackendType::LlamaCpp,
                 "vllm" => athenas_core::BackendType::Vllm,
                 "auto" => athenas_core::BackendType::Auto,
-                _ => return Err(athenas_core::AthenasError::InvalidInput(
-                    format!("Invalid backend: {}. Use llama.cpp, vllm, or auto", value)
-                )),
+                _ => {
+                    return Err(athenas_core::AthenasError::InvalidInput(format!(
+                        "Invalid backend: {}. Use llama.cpp, vllm, or auto",
+                        value
+                    )))
+                }
             };
         }
         "inference.default_gpu_layers" => {
@@ -46,18 +49,27 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
             })?;
         }
         "server.api_key" => {
-            config.server.api_key = if value.is_empty() { None } else { Some(value.to_string()) };
+            config.server.api_key = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         "huggingface.token" => {
-            config.huggingface.token = if value.is_empty() { None } else { Some(value.to_string()) };
+            config.huggingface.token = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         "logging.level" => {
             config.logging.level = value.to_string();
         }
         _ => {
-            return Err(athenas_core::AthenasError::InvalidInput(
-                format!("Unknown config key: {}", key)
-            ));
+            return Err(athenas_core::AthenasError::InvalidInput(format!(
+                "Unknown config key: {}",
+                key
+            )));
         }
     }
 
@@ -106,6 +118,9 @@ pub async fn show() -> Result<()> {
 pub async fn init() -> Result<()> {
     let config = AppConfig::default();
     config.save()?;
-    println!("Configuration initialized at: {:?}", AppConfig::config_path()?);
+    println!(
+        "Configuration initialized at: {:?}",
+        AppConfig::config_path()?
+    );
     Ok(())
 }

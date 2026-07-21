@@ -1,5 +1,5 @@
 use athenas_core::{AppConfig, ModelRegistry, Result};
-use comfy_table::{Table, presets::UTF8_FULL};
+use comfy_table::{presets::UTF8_FULL, Table};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use athenas_hub::{HuggingFaceClient, ModelDownloader, ModelSearchFilters};
@@ -33,7 +33,10 @@ pub async fn list() -> Result<()> {
     println!("{}", table);
 
     let disk = registry.disk_usage()?;
-    println!("\nTotal disk usage: {:.2} GB", disk as f64 / (1024.0 * 1024.0 * 1024.0));
+    println!(
+        "\nTotal disk usage: {:.2} GB",
+        disk as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
 
     Ok(())
 }
@@ -62,7 +65,13 @@ pub async fn search(query: &str, pipeline: Option<String>, gguf: bool) -> Result
     table.set_header(vec!["Model ID", "Downloads", "Likes", "Pipeline", "Tags"]);
 
     for result in results.iter().take(30) {
-        let tags = result.tags.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let tags = result
+            .tags
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         table.add_row(vec![
             result.id.clone(),
             format_downloads(result.downloads),
@@ -111,22 +120,26 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
             // Multiple GGUF files — let user pick
             println!("Multiple GGUF files found in {}:", repo_id);
             for (i, (name, size)) in gguf_files.iter().enumerate() {
-                let size_str = size.map(|s| format!("{:.2} GB", s as f64 / 1e9)).unwrap_or("?".to_string());
+                let size_str = size
+                    .map(|s| format!("{:.2} GB", s as f64 / 1e9))
+                    .unwrap_or("?".to_string());
                 println!("  [{}] {} ({})", i, name, size_str);
             }
             print!("\nSelect file number: ");
             std::io::Write::flush(&mut std::io::stdout()).ok();
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input).map_err(|e| {
-                athenas_core::AthenasError::InvalidInput(e.to_string())
-            })?;
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| athenas_core::AthenasError::InvalidInput(e.to_string()))?;
             let idx: usize = input.trim().parse().map_err(|_| {
                 athenas_core::AthenasError::InvalidInput("Invalid number".to_string())
             })?;
             gguf_files
                 .get(idx)
                 .map(|(name, _)| name.clone())
-                .ok_or_else(|| athenas_core::AthenasError::InvalidInput("Invalid selection".to_string()))?
+                .ok_or_else(|| {
+                    athenas_core::AthenasError::InvalidInput("Invalid selection".to_string())
+                })?
         }
     };
 

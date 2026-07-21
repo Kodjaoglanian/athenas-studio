@@ -28,7 +28,9 @@ fn render_messages(f: &mut Frame, area: Rect, state: &ChatState) {
         .borders(Borders::ALL)
         .title(Span::styled(
             " Athenas Studio — Chat ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(Color::DarkGray));
 
@@ -56,7 +58,9 @@ fn render_messages(f: &mut Frame, area: Rect, state: &ChatState) {
     if state.is_generating {
         lines.push(Line::styled(
             " AI is typing...",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
 
@@ -126,14 +130,18 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
         .borders(Borders::ALL)
         .title(Span::styled(
             " Models ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(Color::DarkGray));
 
     if state.models.is_empty() {
-        let p = Paragraph::new("No models downloaded.\nUse 'athenas models pull <repo-id>' to download.")
-            .block(block)
-            .style(Style::default().fg(Color::Gray));
+        let p = Paragraph::new(
+            "No models downloaded.\nUse 'athenas models pull <repo-id>' to download.",
+        )
+        .block(block)
+        .style(Style::default().fg(Color::Gray));
         f.render_widget(p, area);
         return;
     }
@@ -142,11 +150,15 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
         .models
         .iter()
         .map(|m| {
-            let mut spans = vec![
-                Span::styled(m.name.clone(), Style::default().fg(Color::White)),
-            ];
+            let mut spans = vec![Span::styled(
+                m.name.clone(),
+                Style::default().fg(Color::White),
+            )];
             if let Some(ref q) = m.quantization {
-                spans.push(Span::styled(format!(" [{}]", q), Style::default().fg(Color::Yellow)));
+                spans.push(Span::styled(
+                    format!(" [{}]", q),
+                    Style::default().fg(Color::Yellow),
+                ));
             }
             spans.push(Span::styled(
                 format!(" {}", m.format_size()),
@@ -158,13 +170,22 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
 
     f.render_stateful_widget(list, area, &mut state.list_state.clone());
 }
 
-pub fn render_sidebar(f: &mut Frame, area: Rect, conversations: &[(String, String)], selected: usize) {
+pub fn render_sidebar(
+    f: &mut Frame,
+    area: Rect,
+    conversations: &[(String, String)],
+    selected: usize,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Conversations ")
@@ -172,14 +193,16 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, conversations: &[(String, Strin
 
     let items: Vec<ListItem> = conversations
         .iter()
-        .map(|(_id, title)| {
-            ListItem::new(Line::from(title.as_str()))
-        })
+        .map(|(_id, title)| ListItem::new(Line::from(title.as_str())))
         .collect();
 
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
 
     let mut state = ratatui::widgets::ListState::default();

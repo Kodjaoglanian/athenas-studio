@@ -1,20 +1,18 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, Sse},
     response::sse::{Event, KeepAlive},
+    response::{IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::error;
 
-use athenas_inference::{
-    Backend, ChatMessage, ChatRequest, CompletionRequest, Role, StreamChunk,
-};
+use athenas_inference::{Backend, ChatMessage, ChatRequest, CompletionRequest, Role, StreamChunk};
 
 type SharedBackend = Arc<Mutex<Box<dyn Backend>>>;
 
@@ -24,7 +22,11 @@ struct AppState {
     api_key: Option<String>,
 }
 
-pub fn create_router(backend: SharedBackend, cors_enabled: bool, api_key: Option<String>) -> Router {
+pub fn create_router(
+    backend: SharedBackend,
+    cors_enabled: bool,
+    api_key: Option<String>,
+) -> Router {
     let state = AppState { backend, api_key };
 
     let mut router = Router::new()
@@ -63,10 +65,7 @@ async fn health() -> impl IntoResponse {
     }))
 }
 
-async fn list_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -81,12 +80,14 @@ async fn list_models(
                 "created": chrono::Utc::now().timestamp(),
                 "owned_by": "athenas-studio",
             }]
-        })).into_response()
+        }))
+        .into_response()
     } else {
         Json(serde_json::json!({
             "object": "list",
             "data": []
-        })).into_response()
+        }))
+        .into_response()
     }
 }
 
@@ -118,21 +119,30 @@ async fn chat_completions(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let messages: Vec<ChatMessage> = req.messages.iter().map(|m| {
-        let role = match m.role.as_str() {
-            "system" => Role::System,
-            "assistant" => Role::Assistant,
-            "tool" => Role::Tool,
-            _ => Role::User,
-        };
-        ChatMessage { role, content: m.content.clone() }
-    }).collect();
+    let messages: Vec<ChatMessage> = req
+        .messages
+        .iter()
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "system" => Role::System,
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                _ => Role::User,
+            };
+            ChatMessage {
+                role,
+                content: m.content.clone(),
+            }
+        })
+        .collect();
 
     let stop = match req.stop {
         Some(serde_json::Value::String(s)) => Some(vec![s]),
-        Some(serde_json::Value::Array(arr)) => {
-            Some(arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        }
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
         _ => None,
     };
 
@@ -151,7 +161,10 @@ async fn chat_completions(
 
     if chat_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-        let model_name = backend.model_info().map(|i| i.name.clone()).unwrap_or_default();
+        let model_name = backend
+            .model_info()
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
         drop(backend);
 
         let backend2 = state.backend.clone();
@@ -200,7 +213,9 @@ async fn chat_completions(
             }
         };
 
-        Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     } else {
         match backend.chat(chat_req).await {
             Ok(resp) => {
@@ -256,9 +271,11 @@ async fn completions(
 
     let stop = match req.stop {
         Some(serde_json::Value::String(s)) => Some(vec![s]),
-        Some(serde_json::Value::Array(arr)) => {
-            Some(arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        }
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
         _ => None,
     };
 
@@ -277,7 +294,10 @@ async fn completions(
 
     if comp_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-        let model_name = backend.model_info().map(|i| i.name.clone()).unwrap_or_default();
+        let model_name = backend
+            .model_info()
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
         drop(backend);
 
         let backend2 = state.backend.clone();
@@ -326,7 +346,9 @@ async fn completions(
             }
         };
 
-        Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
     } else {
         match backend.complete(comp_req).await {
             Ok(resp) => {

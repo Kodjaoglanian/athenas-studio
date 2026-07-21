@@ -77,9 +77,8 @@ impl ModelDownloader {
         let mut last_update = std::time::Instant::now();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                AthenasError::Download(format!("Stream error: {}", e))
-            })?;
+            let chunk =
+                chunk_result.map_err(|e| AthenasError::Download(format!("Stream error: {}", e)))?;
 
             file.write_all(&chunk)
                 .await
@@ -99,12 +98,14 @@ impl ModelDownloader {
                     };
                     let percent = total_bytes.map(|t| (downloaded as f64 / t as f64) * 100.0);
 
-                    let _ = tx.send(DownloadProgress {
-                        downloaded_bytes: downloaded,
-                        total_bytes,
-                        speed_mbps,
-                        percent,
-                    }).await;
+                    let _ = tx
+                        .send(DownloadProgress {
+                            downloaded_bytes: downloaded,
+                            total_bytes,
+                            speed_mbps,
+                            percent,
+                        })
+                        .await;
                 }
             }
         }
@@ -127,12 +128,14 @@ impl ModelDownloader {
             } else {
                 0.0
             };
-            let _ = tx.send(DownloadProgress {
-                downloaded_bytes: downloaded,
-                total_bytes: Some(downloaded),
-                speed_mbps,
-                percent: Some(100.0),
-            }).await;
+            let _ = tx
+                .send(DownloadProgress {
+                    downloaded_bytes: downloaded,
+                    total_bytes: Some(downloaded),
+                    speed_mbps,
+                    percent: Some(100.0),
+                })
+                .await;
         }
 
         info!("Downloaded {} ({} bytes)", filename, downloaded);
@@ -147,10 +150,7 @@ impl ModelDownloader {
         let files = self.client.get_model_files(repo_id, revision).await?;
         let gguf_files: Vec<(String, Option<u64>)> = files
             .iter()
-            .filter(|f| {
-                f.r#type == "file"
-                    && f.path.ends_with(".gguf")
-            })
+            .filter(|f| f.r#type == "file" && f.path.ends_with(".gguf"))
             .map(|f| {
                 let size = f.size.or(f.lfs.as_ref().and_then(|l| l.size));
                 (f.path.clone(), size)
@@ -168,8 +168,7 @@ impl ModelDownloader {
         let st_files: Vec<(String, Option<u64>)> = files
             .iter()
             .filter(|f| {
-                f.r#type == "file"
-                    && (f.path.ends_with(".safetensors") || f.path.ends_with(".bin"))
+                f.r#type == "file" && (f.path.ends_with(".safetensors") || f.path.ends_with(".bin"))
             })
             .map(|f| {
                 let size = f.size.or(f.lfs.as_ref().and_then(|l| l.size));

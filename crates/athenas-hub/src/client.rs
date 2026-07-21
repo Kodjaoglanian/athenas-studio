@@ -104,9 +104,10 @@ impl HuggingFaceClient {
         let req = self.client.get(&url).query(&params);
         let req = self.add_auth(req);
 
-        let resp = req.send().await.map_err(|e| {
-            AthenasError::HfApi(format!("Search request failed: {}", e))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Search request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -117,9 +118,10 @@ impl HuggingFaceClient {
             )));
         }
 
-        let models: Vec<HfModelInfo> = resp.json().await.map_err(|e| {
-            AthenasError::HfApi(format!("Failed to parse search results: {}", e))
-        })?;
+        let models: Vec<HfModelInfo> = resp
+            .json()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Failed to parse search results: {}", e)))?;
 
         let results: Vec<super::search::ModelSearchResult> = models
             .iter()
@@ -144,9 +146,10 @@ impl HuggingFaceClient {
         let req = self.client.get(&url);
         let req = self.add_auth(req);
 
-        let resp = req.send().await.map_err(|e| {
-            AthenasError::HfApi(format!("Failed to get model files: {}", e))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Failed to get model files: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -157,9 +160,10 @@ impl HuggingFaceClient {
             )));
         }
 
-        let files: Vec<HfModelFile> = resp.json().await.map_err(|e| {
-            AthenasError::HfApi(format!("Failed to parse model files: {}", e))
-        })?;
+        let files: Vec<HfModelFile> = resp
+            .json()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Failed to parse model files: {}", e)))?;
 
         Ok(files)
     }
@@ -169,9 +173,10 @@ impl HuggingFaceClient {
         let req = self.client.get(&url);
         let req = self.add_auth(req);
 
-        let resp = req.send().await.map_err(|e| {
-            AthenasError::HfApi(format!("Failed to get model info: {}", e))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Failed to get model info: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -182,9 +187,10 @@ impl HuggingFaceClient {
             )))?;
         }
 
-        let info: HfModelInfo = resp.json().await.map_err(|e| {
-            AthenasError::HfApi(format!("Failed to parse model info: {}", e))
-        })?;
+        let info: HfModelInfo = resp
+            .json()
+            .await
+            .map_err(|e| AthenasError::HfApi(format!("Failed to parse model info: {}", e)))?;
 
         Ok(info)
     }

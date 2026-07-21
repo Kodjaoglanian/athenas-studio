@@ -1,10 +1,10 @@
 pub mod backend;
 pub mod llama_cpp;
-pub mod vllm;
 pub mod types;
+pub mod vllm;
 
 pub use backend::{Backend, BackendFactory};
 pub use types::{
-    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse,
-    InferenceConfig, InferenceStats, ModelLoadConfig, Role, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceConfig,
+    InferenceStats, ModelLoadConfig, Role, StreamChunk,
 };

@@ -15,7 +15,13 @@ pub struct ModelSearchResult {
 
 impl std::fmt::Display for ModelSearchResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "  {} ⭐ {}  ⬇ {}", self.id, self.likes, format_downloads(self.downloads))?;
+        writeln!(
+            f,
+            "  {} ⭐ {}  ⬇ {}",
+            self.id,
+            self.likes,
+            format_downloads(self.downloads)
+        )?;
         if !self.pipeline_tag.is_empty() {
             writeln!(f, "    Pipeline: {}", self.pipeline_tag)?;
         }

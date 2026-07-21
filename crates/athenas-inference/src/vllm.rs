@@ -7,8 +7,8 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse,
-    InferenceStats, ModelLoadConfig, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
+    ModelLoadConfig, StreamChunk,
 };
 
 /// vLLM backend — manages a vLLM Python subprocess for high-throughput inference
@@ -59,11 +59,16 @@ impl VllmBackend {
         self.server_port = find_free_port();
 
         let mut cmd = tokio::process::Command::new(&python_bin);
-        cmd.arg("-m").arg("vllm.entrypoints.openai.api_server")
-            .arg("--model").arg(&config.model_path)
-            .arg("--port").arg(self.server_port.to_string())
-            .arg("--host").arg("127.0.0.1")
-            .arg("--max-model-len").arg(config.context_size.to_string());
+        cmd.arg("-m")
+            .arg("vllm.entrypoints.openai.api_server")
+            .arg("--model")
+            .arg(&config.model_path)
+            .arg("--port")
+            .arg(self.server_port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--max-model-len")
+            .arg(config.context_size.to_string());
 
         // GPU configuration
         if self.hardware.has_cuda {
@@ -76,11 +81,14 @@ impl VllmBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        info!("Starting vLLM server on port {} with model: {}", self.server_port, config.model_path);
+        info!(
+            "Starting vLLM server on port {} with model: {}",
+            self.server_port, config.model_path
+        );
 
-        let child = cmd.spawn().map_err(|e| {
-            AthenasError::Backend(format!("Failed to start vLLM: {}", e))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| AthenasError::Backend(format!("Failed to start vLLM: {}", e)))?;
 
         self.server_handle = Some(child);
 
@@ -116,9 +124,10 @@ impl VllmBackend {
 
     async fn stop_server(&mut self) -> Result<()> {
         if let Some(mut child) = self.server_handle.take() {
-            child.kill().await.map_err(|e| {
-                AthenasError::Backend(format!("Failed to kill vLLM: {}", e))
-            })?;
+            child
+                .kill()
+                .await
+                .map_err(|e| AthenasError::Backend(format!("Failed to kill vLLM: {}", e)))?;
             info!("vLLM server stopped");
         }
         Ok(())
@@ -166,12 +175,16 @@ impl Backend for VllmBackend {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let messages: Vec<serde_json::Value> = request.messages.iter().map(|m| {
-            serde_json::json!({
-                "role": m.role.to_string(),
-                "content": m.content,
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role.to_string(),
+                    "content": m.content,
+                })
             })
-        }).collect();
+            .collect();
 
         let body = serde_json::json!({
             "model": self.model_path,
@@ -183,26 +196,43 @@ impl Backend for VllmBackend {
         });
 
         let url = format!("{}/v1/chat/completions", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(AthenasError::Backend(format!("vLLM returned {}: {}", status, text)));
+            return Err(AthenasError::Backend(format!(
+                "vLLM returned {}: {}",
+                status, text
+            )));
         }
 
-        let result: serde_json::Value = resp.json().await
+        let result: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Invalid response: {}", e)))?;
 
-        let content = result.pointer("/choices/0/message/content")
+        let content = result
+            .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
         let usage = result.get("usage");
-        let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         Ok(ChatResponse {
             model: self.model_name.clone(),
@@ -216,21 +246,21 @@ impl Backend for VllmBackend {
         })
     }
 
-    async fn chat_stream(
-        &self,
-        request: ChatRequest,
-        tx: mpsc::Sender<StreamChunk>,
-    ) -> Result<()> {
+    async fn chat_stream(&self, request: ChatRequest, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let messages: Vec<serde_json::Value> = request.messages.iter().map(|m| {
-            serde_json::json!({
-                "role": m.role.to_string(),
-                "content": m.content,
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": m.role.to_string(),
+                    "content": m.content,
+                })
             })
-        }).collect();
+            .collect();
 
         let body = serde_json::json!({
             "model": self.model_path,
@@ -243,13 +273,21 @@ impl Backend for VllmBackend {
         });
 
         let url = format!("{}/v1/chat/completions", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(AthenasError::Backend(format!("vLLM returned {}: {}", status, text)));
+            return Err(AthenasError::Backend(format!(
+                "vLLM returned {}: {}",
+                status, text
+            )));
         }
 
         use futures::StreamExt;
@@ -257,9 +295,8 @@ impl Backend for VllmBackend {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                AthenasError::Backend(format!("Stream error: {}", e))
-            })?;
+            let chunk =
+                chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(pos) = buffer.find('\n') {
@@ -272,43 +309,59 @@ impl Backend for VllmBackend {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
-                    let _ = tx.send(StreamChunk {
-                        text: String::new(),
-                        done: true,
-                        stats: None,
-                    }).await;
+                    let _ = tx
+                        .send(StreamChunk {
+                            text: String::new(),
+                            done: true,
+                            stats: None,
+                        })
+                        .await;
                     return Ok(());
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    let content = json.pointer("/choices/0/delta/content")
+                    let content = json
+                        .pointer("/choices/0/delta/content")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
                     if !content.is_empty() {
-                        let _ = tx.send(StreamChunk {
-                            text: content.to_string(),
-                            done: false,
-                            stats: None,
-                        }).await;
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: content.to_string(),
+                                done: false,
+                                stats: None,
+                            })
+                            .await;
                     }
 
-                    let finish = json.pointer("/choices/0/finish_reason")
+                    let finish = json
+                        .pointer("/choices/0/finish_reason")
                         .and_then(|v| v.as_str());
                     if let Some(reason) = finish {
                         if !reason.is_null_value() && reason != "null" {
                             let usage = json.get("usage");
                             let stats = usage.map(|u| InferenceStats {
-                                tokens_generated: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                                tokens_prompt: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                                tokens_generated: u
+                                    .get("completion_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as u32,
+                                tokens_prompt: u
+                                    .get("prompt_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as u32,
                                 time_total_ms: 0,
                                 tokens_per_second: 0.0,
                             });
-                            let _ = tx.send(StreamChunk {
-                                text: String::new(),
-                                done: true,
-                                stats,
-                            }).await;
+                            let _ = tx
+                                .send(StreamChunk {
+                                    text: String::new(),
+                                    done: true,
+                                    stats,
+                                })
+                                .await;
                             return Ok(());
                         }
                     }
@@ -316,11 +369,13 @@ impl Backend for VllmBackend {
             }
         }
 
-        let _ = tx.send(StreamChunk {
-            text: String::new(),
-            done: true,
-            stats: None,
-        }).await;
+        let _ = tx
+            .send(StreamChunk {
+                text: String::new(),
+                done: true,
+                stats: None,
+            })
+            .await;
         Ok(())
     }
 
@@ -339,26 +394,43 @@ impl Backend for VllmBackend {
         });
 
         let url = format!("{}/v1/completions", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(AthenasError::Backend(format!("vLLM returned {}: {}", status, text)));
+            return Err(AthenasError::Backend(format!(
+                "vLLM returned {}: {}",
+                status, text
+            )));
         }
 
-        let result: serde_json::Value = resp.json().await
+        let result: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Invalid response: {}", e)))?;
 
-        let text = result.pointer("/choices/0/text")
+        let text = result
+            .pointer("/choices/0/text")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
         let usage = result.get("usage");
-        let prompt_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let completion_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = usage
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
 
         Ok(CompletionResponse {
             model: self.model_name.clone(),
@@ -391,13 +463,21 @@ impl Backend for VllmBackend {
         });
 
         let url = format!("{}/v1/completions", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(AthenasError::Backend(format!("vLLM returned {}: {}", status, text)));
+            return Err(AthenasError::Backend(format!(
+                "vLLM returned {}: {}",
+                status, text
+            )));
         }
 
         use futures::StreamExt;
@@ -405,9 +485,8 @@ impl Backend for VllmBackend {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                AthenasError::Backend(format!("Stream error: {}", e))
-            })?;
+            let chunk =
+                chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(pos) = buffer.find('\n') {
@@ -420,36 +499,44 @@ impl Backend for VllmBackend {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
-                    let _ = tx.send(StreamChunk {
-                        text: String::new(),
-                        done: true,
-                        stats: None,
-                    }).await;
+                    let _ = tx
+                        .send(StreamChunk {
+                            text: String::new(),
+                            done: true,
+                            stats: None,
+                        })
+                        .await;
                     return Ok(());
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    let text = json.pointer("/choices/0/text")
+                    let text = json
+                        .pointer("/choices/0/text")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
                     if !text.is_empty() {
-                        let _ = tx.send(StreamChunk {
-                            text: text.to_string(),
-                            done: false,
-                            stats: None,
-                        }).await;
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: text.to_string(),
+                                done: false,
+                                stats: None,
+                            })
+                            .await;
                     }
 
-                    let finish = json.pointer("/choices/0/finish_reason")
+                    let finish = json
+                        .pointer("/choices/0/finish_reason")
                         .and_then(|v| v.as_str());
                     if let Some(reason) = finish {
                         if !reason.is_null_value() && reason != "null" {
-                            let _ = tx.send(StreamChunk {
-                                text: String::new(),
-                                done: true,
-                                stats: None,
-                            }).await;
+                            let _ = tx
+                                .send(StreamChunk {
+                                    text: String::new(),
+                                    done: true,
+                                    stats: None,
+                                })
+                                .await;
                             return Ok(());
                         }
                     }

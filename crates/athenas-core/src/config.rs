@@ -139,16 +139,15 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| AthenasError::Config(e.to_string()))?;
+        let content =
+            toml::to_string_pretty(self).map_err(|e| AthenasError::Config(e.to_string()))?;
         std::fs::write(&path, content)?;
         Ok(())
     }
 
     pub fn config_path() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            AthenasError::Config("Cannot determine home directory".to_string())
-        })?;
+        let home = dirs::home_dir()
+            .ok_or_else(|| AthenasError::Config("Cannot determine home directory".to_string()))?;
         Ok(home.join(".athenas").join("config.toml"))
     }
 

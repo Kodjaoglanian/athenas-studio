@@ -97,8 +97,10 @@ impl Database {
     }
 
     pub fn delete_conversation(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM messages WHERE conversation_id = ?1", [id])?;
-        self.conn.execute("DELETE FROM conversations WHERE id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM messages WHERE conversation_id = ?1", [id])?;
+        self.conn
+            .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
         Ok(())
     }
 
@@ -142,7 +144,9 @@ impl Database {
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query_map([key], |row| row.get::<_, String>(0))?;
         if let Some(row) = rows.next() {
             Ok(Some(row?))

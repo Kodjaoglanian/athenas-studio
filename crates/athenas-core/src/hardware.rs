@@ -54,11 +54,7 @@ impl std::fmt::Display for GpuInfo {
         write!(
             f,
             "[{}] {} ({} VRAM: {}MB/{}MB)",
-            self.index,
-            self.name,
-            self.vendor,
-            self.vram_used_mb,
-            self.vram_total_mb
+            self.index, self.name, self.vendor, self.vram_used_mb, self.vram_total_mb
         )
     }
 }
@@ -106,7 +102,10 @@ impl HardwareDetector {
         if let Ok(nvidia_gpus) = detect_nvidia_gpus() {
             if !nvidia_gpus.is_empty() {
                 has_cuda = true;
-                info!("Found {} NVIDIA GPU(s) with CUDA support", nvidia_gpus.len());
+                info!(
+                    "Found {} NVIDIA GPU(s) with CUDA support",
+                    nvidia_gpus.len()
+                );
             }
             gpus.extend(nvidia_gpus);
         }
@@ -262,7 +261,10 @@ fn detect_amd_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
         if let Some(obj) = json.as_object() {
             for (key, value) in obj {
-                let index: u32 = key.strip_prefix("card").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let index: u32 = key
+                    .strip_prefix("card")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
 
                 let name = value
                     .get("Card series")

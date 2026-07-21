@@ -1,5 +1,5 @@
 use athenas_core::{HardwareDetector, Result};
-use comfy_table::{Table, presets::UTF8_FULL};
+use comfy_table::{presets::UTF8_FULL, Table};
 
 pub async fn list() -> Result<()> {
     let hw = HardwareDetector::detect()?;
@@ -21,7 +21,15 @@ pub async fn list() -> Result<()> {
     } else {
         "CPU only"
     };
-    table.add_row(vec!["llama.cpp", if llamacpp_available { "✓" } else { "✓ (CPU)" }, llamacpp_details]);
+    table.add_row(vec![
+        "llama.cpp",
+        if llamacpp_available {
+            "✓"
+        } else {
+            "✓ (CPU)"
+        },
+        llamacpp_details,
+    ]);
 
     // vLLM
     let vllm_available = hw.has_cuda || hw.has_rocm;
@@ -32,7 +40,11 @@ pub async fn list() -> Result<()> {
     } else {
         "Requires CUDA or ROCm"
     };
-    table.add_row(vec!["vLLM", if vllm_available { "✓" } else { "✗" }, vllm_details]);
+    table.add_row(vec![
+        "vLLM",
+        if vllm_available { "✓" } else { "✗" },
+        vllm_details,
+    ]);
 
     println!("{}", table);
 
@@ -54,7 +66,10 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
 
     println!("Hardware:");
     println!("  CPUs: {}", hw.cpus);
-    println!("  Memory: {}MB / {}MB", hw.memory_available_mb, hw.memory_total_mb);
+    println!(
+        "  Memory: {}MB / {}MB",
+        hw.memory_available_mb, hw.memory_total_mb
+    );
     println!("  CUDA: {}", if hw.has_cuda { "yes" } else { "no" });
     println!("  ROCm: {}", if hw.has_rocm { "yes" } else { "no" });
     println!("  Vulkan: {}", if hw.has_vulkan { "yes" } else { "no" });

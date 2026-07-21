@@ -1,5 +1,3 @@
-
-
 #[derive(Clone)]
 pub struct ChatMessage {
     pub role: String,

@@ -151,14 +151,9 @@ enum ModelsCommands {
 #[derive(Subcommand)]
 enum ConfigCommands {
     /// Set a configuration value
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
     /// Get a configuration value
-    Get {
-        key: String,
-    },
+    Get { key: String },
     /// Show full configuration
     Show,
     /// Initialize/reset configuration
@@ -195,23 +190,42 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         Commands::Tui => commands::tui::run().await?,
-        Commands::Chat { model, backend, gpu_layers, context_size } => {
-            commands::chat::run(model, backend, gpu_layers, context_size).await?
-        }
-        Commands::Serve { model, host, port, backend, gpu_layers, context_size } => {
-            commands::serve::run(model, &host, port, backend, gpu_layers, context_size).await?
-        }
-        Commands::Run { model, prompt, backend, temperature, max_tokens, gpu_layers } => {
+        Commands::Chat {
+            model,
+            backend,
+            gpu_layers,
+            context_size,
+        } => commands::chat::run(model, backend, gpu_layers, context_size).await?,
+        Commands::Serve {
+            model,
+            host,
+            port,
+            backend,
+            gpu_layers,
+            context_size,
+        } => commands::serve::run(model, &host, port, backend, gpu_layers, context_size).await?,
+        Commands::Run {
+            model,
+            prompt,
+            backend,
+            temperature,
+            max_tokens,
+            gpu_layers,
+        } => {
             commands::run::run(model, &prompt, backend, temperature, max_tokens, gpu_layers).await?
         }
         Commands::Models { action } => match action {
             ModelsCommands::List => commands::models::list().await?,
-            ModelsCommands::Search { query, pipeline, gguf } => {
-                commands::models::search(&query, pipeline, gguf).await?
-            }
-            ModelsCommands::Pull { repo_id, file, revision } => {
-                commands::models::pull(&repo_id, file, &revision).await?
-            }
+            ModelsCommands::Search {
+                query,
+                pipeline,
+                gguf,
+            } => commands::models::search(&query, pipeline, gguf).await?,
+            ModelsCommands::Pull {
+                repo_id,
+                file,
+                revision,
+            } => commands::models::pull(&repo_id, file, &revision).await?,
             ModelsCommands::Remove { model } => commands::models::remove(&model).await?,
             ModelsCommands::Info { model } => commands::models::info(&model).await?,
         },
