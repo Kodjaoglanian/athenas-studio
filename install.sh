@@ -72,7 +72,9 @@ main() {
     echo "  ╚══════════════════════════════════════════════╝"
     echo ""
 
-    local target version archive_name download_url tmp_dir
+    local target version archive_name download_url
+    local tmp_dir=""
+    trap 'rm -rf "$tmp_dir"' EXIT
 
     target="$(detect_target)"
     info "Detected target: ${target}"
@@ -93,7 +95,6 @@ main() {
     info "Downloading: ${download_url}"
 
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
 
     if command -v curl &>/dev/null; then
         curl -fsSL "$download_url" -o "${tmp_dir}/${archive_name}" || error "Download failed"
