@@ -123,6 +123,12 @@ impl ModelDownloader {
             .await
             .map_err(|e| AthenasError::Download(format!("Range probe failed: {}", e)))?;
 
+        // Extract the final URL after redirects (HuggingFace LFS redirects to CDN)
+        let cdn_url = probe_resp.url().to_string();
+        if cdn_url != url {
+            info!("Resolved CDN URL: {}", cdn_url);
+        }
+
         let total_bytes = probe_resp
             .headers()
             .get("content-range")
@@ -229,7 +235,7 @@ impl ModelDownloader {
             let chunk_path = temp_dir.join(format!(".athenas_chunk_{}", i));
             chunk_paths.push(chunk_path.clone());
 
-            let url = url.to_string();
+            let cdn_url = cdn_url.clone();
             let client = client.clone();
             let downloaded = downloaded.clone();
             let token = token.clone();
@@ -237,7 +243,7 @@ impl ModelDownloader {
             tasks.push(tokio::spawn(async move {
                 download_chunk_to_file(
                     &client,
-                    &url,
+                    &cdn_url,
                     token.as_deref(),
                     start,
                     end,
@@ -519,6 +525,7 @@ async fn download_chunk_to_file(
     chunk_path: &PathBuf,
     downloaded: Arc<AtomicU64>,
 ) -> Result<()> {
+    let chunk_start_time = std::time::Instant::now();
     let range = format!("bytes={}-{}", start, end - 1);
     let mut req = client.get(url).header("Range", &range);
     if let Some(t) = token {
@@ -578,8 +585,12 @@ async fn download_chunk_to_file(
         .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
 
     debug!(
-        "Chunk bytes={}..{} downloaded to {:?}",
-        start, end, chunk_path
+        "Chunk bytes={}..{} ({} MB) in {:.1}s ({:.1} MB/s)",
+        start,
+        end,
+        (end - start) / (1024 * 1024),
+        chunk_start_time.elapsed().as_secs_f64(),
+        (end - start) as f64 / (1024.0 * 1024.0) / chunk_start_time.elapsed().as_secs_f64()
     );
     Ok(())
 }

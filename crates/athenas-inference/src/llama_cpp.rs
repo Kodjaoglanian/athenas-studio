@@ -42,18 +42,47 @@ impl LlamaCppBackend {
     }
 
     fn find_llama_server(&self) -> Option<String> {
+        // 1. Check PATH
         for cmd in &["llama-server", "llama_server", "server"] {
             if which::which(cmd).is_ok() {
                 return Some(cmd.to_string());
             }
         }
+
+        // 2. Check common install locations
+        let home = std::env::var("HOME").unwrap_or_default();
+        let candidates = [
+            format!("{}/.athenas/bin/llama-server", home),
+            format!("{}/.local/bin/llama-server", home),
+            "/usr/local/bin/llama-server".to_string(),
+            "/usr/bin/llama-server".to_string(),
+            "/opt/llama.cpp/build/bin/llama-server".to_string(),
+        ];
+
+        for path in &candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(path.clone());
+            }
+        }
+
         None
     }
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
         let server_bin = self.find_llama_server().ok_or_else(|| {
             AthenasError::Backend(
-                "llama-server not found. Install llama.cpp and ensure 'llama-server' is in PATH."
+                "llama-server not found.\n\
+                 \n\
+                 Install llama.cpp:\n\
+                 \n  \
+                   git clone https://github.com/ggerganov/llama.cpp\n\
+                   \n  \
+                   cd llama.cpp && cmake -B build && cmake --build build --config Release\n\
+                   \n  \
+                   sudo cp build/bin/llama-server /usr/local/bin/\n\
+                 \n\
+                 Or download prebuilt binaries from:\n\
+                   https://github.com/ggerganov/llama.cpp/releases"
                     .to_string(),
             )
         })?;
