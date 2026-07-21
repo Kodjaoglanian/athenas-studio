@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/athenas-core",
+    "crates/athenas-inference",
+    "crates/athenas-hub",
+    "crates/athenas-server",
+    "crates/athenas-tui",
+    "crates/athenas-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Athenas Studio Contributors"]
+repository = "https://github.com/athenas-studio/athenas"
+
+[workspace.dependencies]
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+tui-textarea = "0.6"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+comfy-table = "7.1"
+indicatif = "0.17"
+
+# Async
+tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+
+# HTTP / API
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+hf-hub = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Utils
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+dirs = "5.0"
+sha2 = "0.10"
+hex = "0.4"
+regex = "1.10"
+url = "2.5"
+async-trait = "0.1"
+
+# Internal crates
+athenas-core = { path = "crates/athenas-core" }
+athenas-inference = { path = "crates/athenas-inference" }
+athenas-hub = { path = "crates/athenas-hub" }
+athenas-server = { path = "crates/athenas-server" }
+athenas-tui = { path = "crates/athenas-tui" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
