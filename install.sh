@@ -3,7 +3,7 @@
 set -euo pipefail
 
 REPO="Kodjaoglanian/athenas-studio"
-INSTALL_DIR="${ATHENAS_INSTALL_DIR:-$HOME/.athenas/bin"
+INSTALL_DIR="${ATHENAS_INSTALL_DIR:-$HOME/.athenas/bin}"
 CONFIG_DIR="${ATHENAS_CONFIG_DIR:-$HOME/.athenas}"
 
 # Colors
