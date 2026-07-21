@@ -26,7 +26,7 @@ jobs:
       upload_url: ${{ steps.create-release.outputs.upload_url }}
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -55,7 +55,7 @@ jobs:
 
       - name: Create release
         id: create-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Athenas Studio ${{ steps.version.outputs.version }}
@@ -108,7 +108,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -116,17 +116,18 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.1
         with:
           key: release-${{ matrix.target }}
           shared-key: release-build
 
       - name: Cache cross binary
         id: cross-cache
-        uses: actions/cache@v4
+        if: matrix.cross
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cross
-          key: cross-bin-${{ runner.os }}-${{ hashFiles('.github/workflows/release.yml') }}
+          key: cross-bin-v1-${{ runner.os }}
       - name: Install cross
         if: matrix.cross && steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
@@ -202,7 +203,7 @@ jobs:
           "$hash  $ARCHIVE" | Out-File -Encoding ascii "$ARCHIVE.sha256"
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.version }}
           files: |
@@ -214,8 +215,8 @@ jobs:
     needs: create-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v5
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.version }}
           files: |
@@ -227,7 +228,7 @@ jobs:
     needs: [create-release, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Generate manifest
         run: |
@@ -250,7 +251,7 @@ jobs:
           EOF
 
       - name: Upload manifest
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.version }}
           files: install-manifest.json
