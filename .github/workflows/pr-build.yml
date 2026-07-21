@@ -30,7 +30,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pr-${{ matrix.target }}
+          key: release-${{ matrix.target }}
+          shared-key: pr-build
       - if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
       - run: |
@@ -58,7 +59,8 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pr-${{ matrix.target }}
+          key: release-${{ matrix.target }}
+          shared-key: pr-build
       - run: cargo build --release --target ${{ matrix.target }}
 
   build-windows:
@@ -77,5 +79,6 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: pr-${{ matrix.target }}
+          key: release-${{ matrix.target }}
+          shared-key: pr-build
       - run: cargo build --release --target ${{ matrix.target }}

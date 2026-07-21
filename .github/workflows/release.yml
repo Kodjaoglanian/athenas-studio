@@ -118,6 +118,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          shared-key: release-build
 
       - name: Install cross
         if: matrix.cross
