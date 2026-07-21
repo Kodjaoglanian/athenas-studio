@@ -17,6 +17,7 @@ use crate::model_browser::{BrowserPhase, ModelBrowserState};
 use crate::model_list::ModelListState;
 use crate::settings::SettingsState;
 
+#[derive(PartialEq)]
 pub enum AppMode {
     Chat,
     ModelList,
@@ -133,6 +134,22 @@ impl TuiApp {
                         continue;
                     }
 
+                    // Global Tab cycling (skip when editing in settings)
+                    if key.code == KeyCode::Tab
+                        && !(self.mode == AppMode::Settings && self.settings_state.editing)
+                    {
+                        self.mode = match self.mode {
+                            AppMode::Chat => AppMode::ModelList,
+                            AppMode::ModelList => AppMode::Browser,
+                            AppMode::Browser => AppMode::Settings,
+                            AppMode::Settings => AppMode::Chat,
+                        };
+                        if matches!(self.mode, AppMode::ModelList) {
+                            self.refresh_models();
+                        }
+                        continue;
+                    }
+
                     match self.mode {
                         AppMode::Chat => self.handle_chat_key(key).await,
                         AppMode::ModelList => self.handle_model_list_key(key).await,
@@ -194,10 +211,6 @@ impl TuiApp {
             KeyCode::Backspace => {
                 self.chat_state.input_text.pop();
             }
-            KeyCode::Tab => {
-                self.mode = AppMode::ModelList;
-                self.refresh_models();
-            }
             KeyCode::Esc if self.chat_state.is_generating => {}
             _ => {}
         }
@@ -220,9 +233,6 @@ impl TuiApp {
                     self.load_model(&path).await;
                     self.mode = AppMode::Chat;
                 }
-            }
-            KeyCode::Tab => {
-                self.mode = AppMode::Browser;
             }
             KeyCode::Esc => {
                 self.mode = AppMode::Chat;
@@ -267,9 +277,6 @@ impl TuiApp {
                     self.settings_state.start_edit();
                 }
                 KeyCode::Esc => {
-                    self.mode = AppMode::Chat;
-                }
-                KeyCode::Tab => {
                     self.mode = AppMode::Chat;
                 }
                 _ => {}
