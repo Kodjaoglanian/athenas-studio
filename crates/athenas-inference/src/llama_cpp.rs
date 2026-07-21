@@ -130,15 +130,15 @@ impl LlamaCppBackend {
         }
 
         if config.flash_attention {
-            cmd.arg("--flash-attn");
+            cmd.arg("--flash-attn").arg("on");
         }
 
         if config.use_mmap {
-            cmd.arg("--mmap");
+            cmd.arg("--mmap").arg("on");
         }
 
         if config.use_mlock {
-            cmd.arg("--mlock");
+            cmd.arg("--mlock").arg("on");
         }
 
         cmd.stdout(std::process::Stdio::piped())

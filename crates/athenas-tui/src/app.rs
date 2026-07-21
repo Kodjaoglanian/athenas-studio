@@ -58,6 +58,12 @@ pub struct TuiApp {
     >,
     // Background server state
     server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
+    // Background model loading state
+    is_loading_model: bool,
+    model_load_task: Option<
+        tokio::task::JoinHandle<std::result::Result<Box<dyn Backend>, athenas_core::AthenasError>>,
+    >,
+    loading_spinner: usize,
 }
 
 impl TuiApp {
@@ -84,6 +90,9 @@ impl TuiApp {
             download_progress_rx: None,
             download_task: None,
             server_handle: None,
+            is_loading_model: false,
+            model_load_task: None,
+            loading_spinner: 0,
         }
     }
 
@@ -118,6 +127,14 @@ impl TuiApp {
 
             // Poll server task status
             self.poll_server_status().await;
+
+            // Poll model loading task
+            self.poll_model_loading().await;
+
+            // Animate loading spinner
+            if self.is_loading_model {
+                self.loading_spinner = (self.loading_spinner + 1) % 4;
+            }
 
             terminal.draw(|f| self.render(f)).ok();
 
@@ -221,7 +238,13 @@ impl TuiApp {
         let content = chunks[1];
         match self.mode {
             AppMode::Chat => {
-                components::render_chat_area(f, content, &self.chat_state);
+                components::render_chat_area(
+                    f,
+                    content,
+                    &self.chat_state,
+                    self.is_loading_model,
+                    self.loading_spinner,
+                );
             }
             AppMode::ModelList => {
                 components::render_model_list(f, content, &self.model_list_state);
@@ -680,17 +703,19 @@ impl TuiApp {
     }
 
     async fn load_model(&mut self, path: &str) {
+        if self.is_loading_model {
+            self.chat_state
+                .add_message("system", "Already loading a model, please wait...");
+            return;
+        }
+
         self.chat_state
             .add_message("system", &format!("Loading model: {}...", path));
+        self.is_loading_model = true;
+        self.loading_spinner = 0;
 
-        let mut backend =
-            BackendFactory::create(self.config.inference.default_backend, &self.hardware)
-                .unwrap_or_else(|e| {
-                    self.chat_state
-                        .add_message("system", &format!("Failed to create backend: {}", e));
-                    panic!("Backend creation failed");
-                });
-
+        let backend_type = self.config.inference.default_backend;
+        let hardware = self.hardware.clone();
         let load_config = ModelLoadConfig {
             model_path: path.to_string(),
             gpu_layers: self.config.inference.default_gpu_layers,
@@ -702,20 +727,49 @@ impl TuiApp {
             use_mlock: false,
         };
 
-        match backend.load_model(load_config).await {
-            Ok(()) => {
-                let info = backend.model_info();
-                if let Some(ref i) = info {
-                    self.chat_state.current_model = Some(i.name.clone());
-                    self.chat_state.current_backend = Some(i.backend_name.clone());
-                }
-                self.chat_state
-                    .add_message("system", "Model loaded successfully!");
-                self.backend = Some(backend);
+        let task = tokio::spawn(async move {
+            let mut backend = BackendFactory::create(backend_type, &hardware)?;
+            backend.load_model(load_config).await?;
+            Ok::<Box<dyn Backend>, athenas_core::AthenasError>(backend)
+        });
+
+        self.model_load_task = Some(task);
+    }
+
+    async fn poll_model_loading(&mut self) {
+        if !self.is_loading_model {
+            return;
+        }
+
+        if let Some(task) = &mut self.model_load_task {
+            if !task.is_finished() {
+                return;
             }
-            Err(e) => {
-                self.chat_state
-                    .add_message("system", &format!("Failed to load model: {}", e));
+
+            // Task is done, take it and get the result
+            let task = self.model_load_task.take().unwrap();
+            match task.await {
+                Ok(Ok(backend)) => {
+                    let info = backend.model_info();
+                    if let Some(ref i) = info {
+                        self.chat_state.current_model = Some(i.name.clone());
+                        self.chat_state.current_backend = Some(i.backend_name.clone());
+                    }
+                    self.chat_state
+                        .add_message("system", "Model loaded successfully!");
+                    self.backend = Some(backend);
+                    self.is_loading_model = false;
+                }
+                Ok(Err(e)) => {
+                    self.chat_state
+                        .add_message("system", &format!("Failed to load model: {}", e));
+                    self.is_loading_model = false;
+                }
+                Err(e) => {
+                    self.chat_state
+                        .add_message("system", &format!("Model loading task crashed: {}", e));
+                    self.is_loading_model = false;
+                }
             }
         }
     }

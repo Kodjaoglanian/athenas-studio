@@ -11,7 +11,13 @@ use crate::model_browser::{BrowserPhase, ModelBrowserState};
 use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
-pub fn render_chat_area(f: &mut Frame, area: Rect, state: &ChatState) {
+pub fn render_chat_area(
+    f: &mut Frame,
+    area: Rect,
+    state: &ChatState,
+    is_loading_model: bool,
+    loading_spinner: usize,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -21,12 +27,18 @@ pub fn render_chat_area(f: &mut Frame, area: Rect, state: &ChatState) {
         ])
         .split(area);
 
-    render_messages(f, chunks[0], state);
+    render_messages(f, chunks[0], state, is_loading_model, loading_spinner);
     render_input(f, chunks[1], state);
     render_status_bar(f, chunks[2], state);
 }
 
-fn render_messages(f: &mut Frame, area: Rect, state: &ChatState) {
+fn render_messages(
+    f: &mut Frame,
+    area: Rect,
+    state: &ChatState,
+    is_loading_model: bool,
+    loading_spinner: usize,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -64,6 +76,21 @@ fn render_messages(f: &mut Frame, area: Rect, state: &ChatState) {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::ITALIC),
+        ));
+    }
+
+    if is_loading_model {
+        let spinner = match loading_spinner {
+            0 => "|",
+            1 => "/",
+            2 => "-",
+            _ => "\\",
+        };
+        lines.push(Line::styled(
+            format!(" {} Loading model... Please wait", spinner),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
