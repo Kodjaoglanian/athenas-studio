@@ -38,13 +38,13 @@
 ### One-Line Install (Linux & macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Kodjaoglanian/athenas-studio/main/install.sh | bash
+curl -fsSL https://github.com/Kodjaoglanian/athenas-studio/releases/latest/download/install.sh | bash
 ```
 
 ### One-Line Install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/Kodjaoglanian/athenas-studio/main/install.ps1 | iex
+irm https://github.com/Kodjaoglanian/athenas-studio/releases/latest/download/install.ps1 | iex
 ```
 
 ### Supported Platforms
