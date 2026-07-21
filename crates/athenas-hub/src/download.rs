@@ -1,5 +1,8 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tracing::info;
 
 use athenas_core::{AthenasError, Result};
@@ -7,6 +10,8 @@ use athenas_core::{AthenasError, Result};
 use crate::client::HuggingFaceClient;
 
 const WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB write buffer
+const PARALLEL_CHUNKS: u64 = 4; // Number of parallel download connections
+const MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MB minimum chunk size
 
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -48,8 +53,266 @@ impl ModelDownloader {
             return Ok(file_path);
         }
 
+        // HEAD request to check if server supports range requests
+        let supports_range = self.check_range_support(&download_url).await?;
+
+        if supports_range {
+            info!(
+                "Server supports range requests, using parallel download ({} chunks)",
+                PARALLEL_CHUNKS
+            );
+            self.parallel_download(&download_url, &file_path, progress_tx)
+                .await
+        } else {
+            info!("Server does not support range requests, using single-stream download");
+            self.single_stream_download(&download_url, &file_path, progress_tx)
+                .await
+        }
+    }
+
+    async fn check_range_support(&self, url: &str) -> Result<bool> {
         let client = self.client.client().clone();
-        let mut req = client.get(&download_url);
+        let mut req = client.head(url);
+        if let Some(token) = self.client.token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AthenasError::Download(format!("HEAD request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Ok(false);
+        }
+
+        // Check Accept-Ranges header
+        let accepts = resp
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let has_length = resp.content_length().is_some();
+
+        Ok(accepts.eq_ignore_ascii_case("bytes") && has_length)
+    }
+
+    async fn parallel_download(
+        &self,
+        url: &str,
+        file_path: &PathBuf,
+        progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+    ) -> Result<PathBuf> {
+        // Get total file size from HEAD
+        let client = self.client.client().clone();
+        let mut head_req = client.head(url);
+        if let Some(token) = self.client.token() {
+            head_req = head_req.bearer_auth(token);
+        }
+        let head_resp = head_req
+            .send()
+            .await
+            .map_err(|e| AthenasError::Download(format!("HEAD request failed: {}", e)))?;
+
+        let total_bytes = head_resp
+            .content_length()
+            .ok_or_else(|| AthenasError::Download("No content-length in HEAD response".into()))?;
+
+        // Calculate chunk boundaries
+        let num_chunks = if total_bytes / PARALLEL_CHUNKS < MIN_CHUNK_SIZE {
+            // File too small for parallel, use fewer chunks
+            (total_bytes / MIN_CHUNK_SIZE).max(1)
+        } else {
+            PARALLEL_CHUNKS
+        };
+
+        let chunk_size = total_bytes / num_chunks;
+        let last_chunk_size = total_bytes - chunk_size * (num_chunks - 1);
+
+        info!(
+            "File size: {} bytes, {} chunks of ~{} bytes each",
+            total_bytes, num_chunks, chunk_size
+        );
+
+        // Pre-allocate the file
+        let temp_path = file_path.with_extension("part");
+        {
+            let file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|e| AthenasError::Download(format!("Failed to create file: {}", e)))?;
+            file.set_len(total_bytes)
+                .await
+                .map_err(|e| AthenasError::Download(format!("Failed to set file length: {}", e)))?;
+        }
+
+        // Shared progress counter
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let start_time = std::time::Instant::now();
+
+        // Spawn progress reporter task
+        let progress_downloaded = downloaded.clone();
+        let progress_handle = if let Some(ref tx) = progress_tx {
+            let tx = tx.clone();
+            let total = total_bytes;
+            Some(tokio::spawn(async move {
+                let mut last_update = std::time::Instant::now();
+                let mut speed_window_bytes: u64 = 0;
+                let mut speed_window_start = std::time::Instant::now();
+                let mut last_downloaded: u64 = 0;
+
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                    let current = progress_downloaded.load(Ordering::Relaxed);
+                    let now = std::time::Instant::now();
+
+                    if now.duration_since(last_update) < std::time::Duration::from_millis(200) {
+                        continue;
+                    }
+                    last_update = now;
+
+                    let delta = current.saturating_sub(last_downloaded);
+                    speed_window_bytes += delta;
+                    last_downloaded = current;
+
+                    let window_elapsed = speed_window_start.elapsed().as_secs_f64();
+                    let speed_mbps = if window_elapsed > 0.0 {
+                        (speed_window_bytes as f64 / (1024.0 * 1024.0)) / window_elapsed
+                    } else {
+                        0.0
+                    };
+
+                    if window_elapsed > 2.0 {
+                        speed_window_bytes = 0;
+                        speed_window_start = now;
+                    }
+
+                    let percent = (current as f64 / total as f64) * 100.0;
+
+                    if tx
+                        .send(DownloadProgress {
+                            downloaded_bytes: current,
+                            total_bytes: Some(total),
+                            speed_mbps,
+                            percent: Some(percent),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    if current >= total {
+                        break;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Spawn download tasks for each chunk
+        let mut tasks = Vec::new();
+        for i in 0..num_chunks {
+            let start = i * chunk_size;
+            let end = if i == num_chunks - 1 {
+                start + last_chunk_size
+            } else {
+                start + chunk_size
+            };
+
+            let url = url.to_string();
+            let token = self.client.token().map(|t| t.to_string());
+            let client = client.clone();
+            let temp_path = temp_path.clone();
+            let downloaded = downloaded.clone();
+
+            tasks.push(tokio::spawn(async move {
+                download_chunk(
+                    &client,
+                    &url,
+                    token.as_deref(),
+                    start,
+                    end,
+                    &temp_path,
+                    downloaded,
+                )
+                .await
+            }));
+        }
+
+        // Wait for all chunks
+        let mut errors = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => errors.push(e.to_string()),
+                Err(e) => errors.push(format!("Task join error: {}", e)),
+            }
+        }
+
+        // Cancel progress reporter
+        if let Some(handle) = progress_handle {
+            handle.abort();
+        }
+
+        if !errors.is_empty() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(AthenasError::Download(format!(
+                "Parallel download failed: {}",
+                errors.join("; ")
+            )));
+        }
+
+        // Verify size
+        let final_downloaded = downloaded.load(Ordering::Relaxed);
+        if final_downloaded != total_bytes {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(AthenasError::Download(format!(
+                "Download incomplete: {} / {} bytes",
+                final_downloaded, total_bytes
+            )));
+        }
+
+        // Rename temp file to final
+        tokio::fs::rename(&temp_path, file_path)
+            .await
+            .map_err(|e| AthenasError::Download(format!("Rename error: {}", e)))?;
+
+        // Send final progress
+        if let Some(ref tx) = progress_tx {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let speed_mbps = if elapsed > 0.0 {
+                (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed
+            } else {
+                0.0
+            };
+            let _ = tx
+                .send(DownloadProgress {
+                    downloaded_bytes: total_bytes,
+                    total_bytes: Some(total_bytes),
+                    speed_mbps,
+                    percent: Some(100.0),
+                })
+                .await;
+        }
+
+        info!(
+            "Downloaded {} ({} bytes) in {:.1}s",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            total_bytes,
+            start_time.elapsed().as_secs_f64()
+        );
+        Ok(file_path.clone())
+    }
+
+    async fn single_stream_download(
+        &self,
+        url: &str,
+        file_path: &PathBuf,
+        progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+    ) -> Result<PathBuf> {
+        let client = self.client.client().clone();
+        let mut req = client.get(url);
         if let Some(token) = self.client.token() {
             req = req.bearer_auth(token);
         }
@@ -68,8 +331,6 @@ impl ModelDownloader {
         }
 
         let total_bytes = resp.content_length();
-
-        // Create temp file for download
         let temp_path = file_path.with_extension("part");
         let mut file = tokio::fs::File::create(&temp_path)
             .await
@@ -81,11 +342,7 @@ impl ModelDownloader {
         let start_time = std::time::Instant::now();
         let mut last_update = std::time::Instant::now();
 
-        // Buffered writes: accumulate chunks into a 1 MB buffer before flushing to disk.
-        // This reduces syscalls dramatically vs writing every small network chunk.
         let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
-
-        // Sliding window for instant speed calculation
         let mut speed_window_bytes: u64 = 0;
         let mut speed_window_start = std::time::Instant::now();
 
@@ -97,7 +354,6 @@ impl ModelDownloader {
             downloaded += chunk.len() as u64;
             speed_window_bytes += chunk.len() as u64;
 
-            // Flush write buffer when it reaches the threshold
             if write_buf.len() >= WRITE_BUFFER_SIZE {
                 file.write_all(&write_buf)
                     .await
@@ -110,7 +366,6 @@ impl ModelDownloader {
                 if now.duration_since(last_update) > std::time::Duration::from_millis(200) {
                     last_update = now;
 
-                    // Instant speed: use sliding 2-second window
                     let window_elapsed = speed_window_start.elapsed().as_secs_f64();
                     let speed_mbps = if window_elapsed > 0.0 {
                         (speed_window_bytes as f64 / (1024.0 * 1024.0)) / window_elapsed
@@ -118,7 +373,6 @@ impl ModelDownloader {
                         0.0
                     };
 
-                    // Reset window every 2 seconds for responsive speed display
                     if window_elapsed > 2.0 {
                         speed_window_bytes = 0;
                         speed_window_start = now;
@@ -138,7 +392,6 @@ impl ModelDownloader {
             }
         }
 
-        // Flush any remaining buffered data
         if !write_buf.is_empty() {
             file.write_all(&write_buf)
                 .await
@@ -150,12 +403,10 @@ impl ModelDownloader {
             .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
         drop(file);
 
-        // Rename temp file to final
-        tokio::fs::rename(&temp_path, &file_path)
+        tokio::fs::rename(&temp_path, file_path)
             .await
             .map_err(|e| AthenasError::Download(format!("Rename error: {}", e)))?;
 
-        // Send final progress
         if let Some(ref tx) = progress_tx {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed_mbps = if elapsed > 0.0 {
@@ -173,8 +424,12 @@ impl ModelDownloader {
                 .await;
         }
 
-        info!("Downloaded {} ({} bytes)", filename, downloaded);
-        Ok(file_path)
+        info!(
+            "Downloaded {} ({} bytes)",
+            file_path.file_name().unwrap_or_default().to_string_lossy(),
+            downloaded
+        );
+        Ok(file_path.clone())
     }
 
     pub async fn list_gguf_files(
@@ -212,4 +467,85 @@ impl ModelDownloader {
             .collect();
         Ok(st_files)
     }
+}
+
+/// Download a single chunk using HTTP Range request and write it to the correct file offset.
+async fn download_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+    start: u64,
+    end: u64,
+    file_path: &PathBuf,
+    downloaded: Arc<AtomicU64>,
+) -> Result<()> {
+    let range = format!("bytes={}-{}", start, end - 1);
+    let mut req = client.get(url).header("Range", &range);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| AthenasError::Download(format!("Chunk request failed: {}", e)))?;
+
+    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AthenasError::Download(format!(
+            "Chunk download failed: {} - {}",
+            status, text
+        )));
+    }
+
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+
+    // Open file and seek to the correct offset
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(file_path)
+        .await
+        .map_err(|e| AthenasError::Download(format!("Failed to open file for chunk: {}", e)))?;
+
+    let file = Arc::new(Mutex::new(file));
+    let mut writer = file.lock().await;
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    writer
+        .seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| AthenasError::Download(format!("Seek error: {}", e)))?;
+
+    let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk =
+            chunk_result.map_err(|e| AthenasError::Download(format!("Stream error: {}", e)))?;
+
+        write_buf.extend_from_slice(&chunk);
+        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+
+        if write_buf.len() >= WRITE_BUFFER_SIZE {
+            writer
+                .write_all(&write_buf)
+                .await
+                .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
+            write_buf.clear();
+        }
+    }
+
+    if !write_buf.is_empty() {
+        writer
+            .write_all(&write_buf)
+            .await
+            .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
+    }
+
+    writer
+        .flush()
+        .await
+        .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
+
+    Ok(())
 }
