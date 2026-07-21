@@ -1,0 +1,224 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create-release.outputs.upload_url }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            BODY=$(git log --pretty=format:"- %s (%h)" HEAD~50..HEAD 2>/dev/null || echo "Initial release")
+          else
+            BODY=$(git log --pretty=format:"- %s (%h)" ${PREV_TAG}..HEAD)
+          fi
+          # Write to file to preserve newlines
+          echo "$BODY" > changelog.txt
+          echo "Changelog generated:"
+          cat changelog.txt
+
+      - name: Create release
+        id: create-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Athenas Studio ${{ steps.version.outputs.version }}
+          body_path: changelog.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          generate_release_notes: true
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          # macOS
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: tar.gz
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: tar.gz
+            cross: false
+          # Windows
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            cross: false
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            cross: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install aarch64-linux-gnu linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> $GITHUB_ENV
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Prepare archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          ARCHIVE="athenas-${VERSION}-${TARGET}.tar.gz"
+          STAGING="athenas-${VERSION}-${TARGET}"
+          mkdir -p "$STAGING"
+          cp target/${TARGET}/release/athenas "$STAGING/"
+          cp README.md "$STAGING/"
+          cp LICENSE "$STAGING/"
+          tar czf "$ARCHIVE" -C "$STAGING" .
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Prepare archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.create-release.outputs.version }}"
+          $TARGET = "${{ matrix.target }}"
+          $ARCHIVE = "athenas-$VERSION-$TARGET.zip"
+          $STAGING = "athenas-$VERSION-$TARGET"
+          New-Item -ItemType Directory -Force -Path $STAGING
+          Copy-Item "target/$TARGET/release/athenas.exe" "$STAGING/"
+          Copy-Item "README.md" "$STAGING/"
+          Copy-Item "LICENSE" "$STAGING/"
+          Compress-Archive -Path "$STAGING/*" -DestinationPath $ARCHIVE
+          echo "ARCHIVE=$ARCHIVE" >> $env:GITHUB_ENV
+
+      - name: Generate SHA256 (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          sha256sum ${{ env.ARCHIVE }} > ${{ env.ARCHIVE }}.sha256
+
+      - name: Generate SHA256 (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash ${{ env.ARCHIVE }} -Algorithm SHA256).Hash
+          "$hash  ${{ env.ARCHIVE }}" | Out-File -Encoding ascii ${{ env.ARCHIVE }}.sha256
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  publish-install-manifest:
+    name: Publish Install Manifest
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate manifest
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          cat > install-manifest.json << EOF
+          {
+            "version": "${VERSION}",
+            "release_url": "https://github.com/athenas-studio/athenas/releases/tag/${VERSION}",
+            "targets": {
+              "x86_64-unknown-linux-gnu": "athenas-${VERSION}-x86_64-unknown-linux-gnu.tar.gz",
+              "aarch64-unknown-linux-gnu": "athenas-${VERSION}-aarch64-unknown-linux-gnu.tar.gz",
+              "x86_64-unknown-linux-musl": "athenas-${VERSION}-x86_64-unknown-linux-musl.tar.gz",
+              "aarch64-unknown-linux-musl": "athenas-${VERSION}-aarch64-unknown-linux-musl.tar.gz",
+              "x86_64-apple-darwin": "athenas-${VERSION}-x86_64-apple-darwin.tar.gz",
+              "aarch64-apple-darwin": "athenas-${VERSION}-aarch64-apple-darwin.tar.gz",
+              "x86_64-pc-windows-msvc": "athenas-${VERSION}-x86_64-pc-windows-msvc.zip",
+              "aarch64-pc-windows-msvc": "athenas-${VERSION}-aarch64-pc-windows-msvc.zip"
+            }
+          }
+          EOF
+
+      - name: Upload manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          files: install-manifest.json
