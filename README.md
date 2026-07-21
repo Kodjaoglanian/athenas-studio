@@ -27,6 +27,9 @@
 - **OpenAI-Compatible API Server** — Drop-in replacement for OpenAI API endpoints
 - **Hardware Auto-Detection** — Automatically detects CUDA, ROCm, Vulkan, and Metal
 - **Streaming** — Real-time token streaming in both TUI and API server
+- **Self-Update** — Built-in `athenas update` command to upgrade to the latest release
+- **Model Management** — List, search, download, inspect, and remove local models
+- **Backend Benchmarking** — Compare backend performance with `athenas backend benchmark`
 
 ## Installation
 
@@ -70,6 +73,15 @@ cargo build --release
 - **llama.cpp** — Install and ensure `llama-server` is in PATH (for llama.cpp backend)
 - **vLLM** — `pip install vllm` (for vLLM backend, requires CUDA or ROCm)
 
+### Global Flags
+
+All commands support these optional flags:
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--verbose` | `-v` | Enable info-level logging |
+| `--debug` | `-d` | Enable debug-level logging |
+
 ## Usage
 
 ### Start TUI (default)
@@ -86,26 +98,59 @@ athenas chat --backend llama.cpp --gpu-layers -1 --context-size 4096
 ### One-shot inference
 ```bash
 athenas run model.gguf "What is the meaning of life?"
+athenas run model.gguf "Explain quantum computing" --temperature 0.3 --max-tokens 512
 ```
 
 ### Start API server
 ```bash
 athenas serve model.gguf --port 8080
+athenas serve model.gguf --host 0.0.0.0 --port 8080 --backend vllm
 ```
+
+#### Production server flags
+
+```bash
+athenas serve model.gguf \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --max-concurrent 20 \
+  --rate-limit 50 \
+  --timeout 300 \
+  --max-body-size 50
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-concurrent` | 10 | Max simultaneous inference requests (semaphore) |
+| `--rate-limit` | 20 | Requests per second per IP (token bucket) |
+| `--timeout` | 120 | Request timeout in seconds |
+| `--max-body-size` | 10 | Max request body size in MB |
 
 ### Search HuggingFace
 ```bash
 athenas models search "llama 3" --gguf
+athenas models search "mistral" --pipeline text-generation
 ```
 
 ### Download a model
 ```bash
 athenas models pull TheBloke/Llama-2-7B-Chat-GGUF
+athenas models pull TheBloke/Llama-2-7B-Chat-GGUF --file llama-2-7b-chat.Q4_K_M.gguf
 ```
 
 ### List local models
 ```bash
 athenas models list
+```
+
+### Show model details
+```bash
+athenas models info llama-2-7b-chat
+```
+
+### Remove a local model
+```bash
+athenas models remove llama-2-7b-chat
 ```
 
 ### Show hardware info
@@ -118,11 +163,29 @@ athenas hardware
 athenas backend list
 ```
 
+### Benchmark backends
+```bash
+athenas backend benchmark
+athenas backend benchmark --model model.gguf
+```
+
 ### Configuration
 ```bash
 athenas config show
+athenas config get inference.default_backend
 athenas config set inference.default_backend llama.cpp
 athenas config set huggingface.token hf_xxxxx
+athenas config init  # reset to defaults
+```
+
+### Login to HuggingFace Hub
+```bash
+athenas login --token hf_xxxxx
+```
+
+### Update athenas to latest release
+```bash
+athenas update
 ```
 
 ## API Server Endpoints
@@ -132,7 +195,9 @@ athenas config set huggingface.token hf_xxxxx
 | `/v1/chat/completions` | POST | Chat completions (with SSE streaming) |
 | `/v1/completions` | POST | Text completions (with SSE streaming) |
 | `/v1/models` | GET | List loaded models |
-| `/v1/health` | GET | Health check |
+| `/v1/health` | GET | Health check with model info, uptime, and backend status |
+| `/v1/ready` | GET | Kubernetes readiness probe (503 if no model loaded) |
+| `/metrics` | GET | Prometheus-compatible metrics (request count, latency, tokens, errors) |
 
 ### Example: Using with curl
 ```bash
@@ -180,7 +245,9 @@ athenas-studio/
 │   ├── athenas-server/      # OpenAI-compatible API server (axum)
 │   ├── athenas-tui/         # Terminal UI (ratatui + crossterm)
 │   └── athenas-cli/         # CLI entry point (clap)
-├── .github/workflows/       # CI pipeline
+├── .github/workflows/       # CI, release & PR build pipelines
+├── install.sh               # Linux/macOS installer script
+├── install.ps1              # Windows installer script
 ├── Cargo.toml               # Workspace
 ├── LICENSE                  # MIT
 ├── CONTRIBUTING.md          # Contribution guide
@@ -194,7 +261,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.1.0"
+version = "0.1.3"
 
 [paths]
 models_dir = "~/.athenas/models"
@@ -216,6 +283,12 @@ default_host = "127.0.0.1"
 default_port = 8080
 cors_enabled = true
 # api_key = "your-secret-key"   # optional auth
+max_concurrent_requests = 10    # max simultaneous inferences
+rate_limit_per_second = 20      # token bucket per IP
+request_timeout_secs = 120      # kill stuck requests
+max_body_size_mb = 10           # DoS protection
+enable_metrics = true           # Prometheus /metrics endpoint
+enable_compression = true       # gzip response compression
 
 [huggingface]
 # token = "hf_xxxxx"            # for gated models
@@ -237,6 +310,14 @@ file_logging = false
 - **Best for:** High-throughput serving, multi-user, PagedAttention
 - **GPU support:** CUDA, ROCm
 - **Install:** `pip install vllm`
+
+## CI/CD
+
+The project includes three GitHub Actions workflows:
+
+- **CI** (`ci.yml`) — Formatting checks, clippy lints, tests, and cross-compilation for all supported targets
+- **Release** (`release.yml`) — Triggered on version tags (`v*`), builds and publishes binaries for all platforms with SHA256 checksums and install scripts
+- **PR Build** (`pr-build.yml`) — Build verification on pull requests
 
 ## License
 

@@ -1,18 +1,27 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
+    middleware::from_fn_with_state,
     response::sse::{Event, KeepAlive},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tower_http::cors::CorsLayer;
-use tracing::error;
+use tokio::sync::{Mutex, Semaphore};
+use tower_http::{
+    compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
+    timeout::TimeoutLayer, trace::TraceLayer,
+};
 
+use athenas_core::ServerConfig;
 use athenas_inference::{Backend, ChatMessage, ChatRequest, CompletionRequest, Role, StreamChunk};
+
+use crate::metrics::{metrics_middleware, SharedMetrics};
+use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
 
 type SharedBackend = Arc<Mutex<Box<dyn Backend>>>;
 
@@ -20,25 +29,57 @@ type SharedBackend = Arc<Mutex<Box<dyn Backend>>>;
 struct AppState {
     backend: SharedBackend,
     api_key: Option<String>,
+    metrics: SharedMetrics,
+    semaphore: Arc<Semaphore>,
+    start_time: std::time::Instant,
 }
 
 pub fn create_router(
     backend: SharedBackend,
-    cors_enabled: bool,
-    api_key: Option<String>,
+    metrics: SharedMetrics,
+    semaphore: Arc<Semaphore>,
+    rate_limiter: SharedRateLimiter,
+    config: &ServerConfig,
 ) -> Router {
-    let state = AppState { backend, api_key };
+    let state = AppState {
+        backend,
+        api_key: config.api_key.clone(),
+        metrics: metrics.clone(),
+        semaphore,
+        start_time: std::time::Instant::now(),
+    };
 
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(list_models))
         .route("/v1/health", get(health))
-        .route("/health", get(health));
+        .route("/v1/ready", get(ready))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics_endpoint));
 
-    if cors_enabled {
+    if config.cors_enabled {
         router = router.layer(CorsLayer::permissive());
     }
+
+    if config.enable_compression {
+        router = router.layer(CompressionLayer::new());
+    }
+
+    router = router
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(config.request_timeout_secs),
+        ))
+        .layer(RequestBodyLimitLayer::new(
+            (config.max_body_size_mb as usize) * 1024 * 1024,
+        ))
+        .layer(TraceLayer::new_for_http())
+        .layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
+        .layer(from_fn_with_state(metrics, metrics_middleware))
+        .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
+            tower_http::request_id::MakeRequestUuid,
+        ));
 
     router.with_state(state)
 }
@@ -58,11 +99,51 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
     false
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let backend = state.backend.lock().await;
+    let model_info = backend.model_info();
+    let uptime = state.start_time.elapsed().as_secs();
+
+    let mut json = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-    }))
+        "uptime_seconds": uptime,
+        "backend": backend.name(),
+        "model_loaded": backend.is_loaded(),
+    });
+
+    if let Some(info) = model_info {
+        json["model"] = serde_json::json!({
+            "name": info.name,
+            "context_size": info.context_size,
+            "gpu_layers": info.gpu_layers,
+            "backend": info.backend_name,
+        });
+    }
+
+    Json(json)
+}
+
+async fn ready(State(state): State<AppState>) -> Response {
+    let backend = state.backend.lock().await;
+    if backend.is_loaded() {
+        Json(serde_json::json!({"status": "ready"})).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"status": "not_ready", "reason": "no model loaded"})),
+        )
+            .into_response()
+    }
+}
+
+async fn metrics_endpoint() -> impl IntoResponse {
+    let body = crate::metrics::Metrics::render();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -119,6 +200,13 @@ async fn chat_completions(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    let _permit = match state.semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+
     let messages: Vec<ChatMessage> = req
         .messages
         .iter()
@@ -168,10 +256,11 @@ async fn chat_completions(
         drop(backend);
 
         let backend2 = state.backend.clone();
+        let metrics = state.metrics.clone();
         tokio::spawn(async move {
             let b = backend2.lock().await;
             if let Err(e) = b.chat_stream(chat_req, tx).await {
-                error!("Stream error: {}", e);
+                tracing::error!("Stream error: {}", e);
             }
         });
 
@@ -179,6 +268,9 @@ async fn chat_completions(
             let mut rx = rx;
             while let Some(chunk) = rx.recv().await {
                 if chunk.done {
+                    if let Some(stats) = &chunk.stats {
+                        metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
+                    }
                     let json = serde_json::json!({
                         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                         "object": "chat.completion.chunk",
@@ -219,6 +311,11 @@ async fn chat_completions(
     } else {
         match backend.chat(chat_req).await {
             Ok(resp) => {
+                state.metrics.record_tokens(
+                    &resp.model,
+                    resp.stats.tokens_prompt,
+                    resp.stats.tokens_generated,
+                );
                 let json = serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion",
@@ -241,7 +338,12 @@ async fn chat_completions(
                 Json(json).into_response()
             }
             Err(e) => {
-                error!("Chat completion error: {}", e);
+                tracing::error!("Chat completion error: {}", e);
+                state
+                    .metrics
+                    .errors_total
+                    .with_label_values(&["/v1/chat/completions", "inference"])
+                    .inc();
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }
@@ -268,6 +370,13 @@ async fn completions(
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
+    let _permit = match state.semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
 
     let stop = match req.stop {
         Some(serde_json::Value::String(s)) => Some(vec![s]),
@@ -301,10 +410,11 @@ async fn completions(
         drop(backend);
 
         let backend2 = state.backend.clone();
+        let metrics = state.metrics.clone();
         tokio::spawn(async move {
             let b = backend2.lock().await;
             if let Err(e) = b.complete_stream(comp_req, tx).await {
-                error!("Stream error: {}", e);
+                tracing::error!("Stream error: {}", e);
             }
         });
 
@@ -312,6 +422,9 @@ async fn completions(
             let mut rx = rx;
             while let Some(chunk) = rx.recv().await {
                 if chunk.done {
+                    if let Some(stats) = &chunk.stats {
+                        metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
+                    }
                     let json = serde_json::json!({
                         "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
                         "object": "text_completion",
@@ -352,6 +465,11 @@ async fn completions(
     } else {
         match backend.complete(comp_req).await {
             Ok(resp) => {
+                state.metrics.record_tokens(
+                    &resp.model,
+                    resp.stats.tokens_prompt,
+                    resp.stats.tokens_generated,
+                );
                 let json = serde_json::json!({
                     "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
                     "object": "text_completion",
@@ -371,7 +489,12 @@ async fn completions(
                 Json(json).into_response()
             }
             Err(e) => {
-                error!("Completion error: {}", e);
+                tracing::error!("Completion error: {}", e);
+                state
+                    .metrics
+                    .errors_total
+                    .with_label_values(&["/v1/completions", "inference"])
+                    .inc();
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             }
         }

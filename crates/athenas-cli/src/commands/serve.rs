@@ -2,6 +2,7 @@ use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Resu
 use athenas_inference::{BackendFactory, ModelLoadConfig};
 use athenas_server::ApiServer;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     model: String,
     host: &str,
@@ -9,9 +10,26 @@ pub async fn run(
     backend_type: BackendType,
     gpu_layers: i32,
     context_size: u32,
+    max_concurrent: Option<u32>,
+    rate_limit: Option<u32>,
+    timeout_secs: Option<u64>,
+    max_body_size_mb: Option<u32>,
 ) -> Result<()> {
-    let config = AppConfig::load()?;
+    let mut config = AppConfig::load()?;
     config.ensure_dirs()?;
+
+    if let Some(mc) = max_concurrent {
+        config.server.max_concurrent_requests = mc;
+    }
+    if let Some(rl) = rate_limit {
+        config.server.rate_limit_per_second = rl;
+    }
+    if let Some(t) = timeout_secs {
+        config.server.request_timeout_secs = t;
+    }
+    if let Some(bs) = max_body_size_mb {
+        config.server.max_body_size_mb = bs;
+    }
 
     let hardware = HardwareDetector::detect()?;
 
@@ -34,19 +52,101 @@ pub async fn run(
     backend.load_model(load_config).await?;
     println!("Model loaded with backend: {}", backend.name());
 
+    print_startup_banner(&config, host, port, &hardware, &model);
+
     let server = ApiServer::new(config, backend);
+    server.start(host, port).await
+}
+
+fn print_startup_banner(
+    config: &AppConfig,
+    host: &str,
+    port: u16,
+    hardware: &athenas_core::HardwareInfo,
+    model: &str,
+) {
+    println!();
+    println!("  ┌─────────────────────────────────────────────────────────┐");
+    println!("  │                   Athenas Studio Server                 │");
+    println!("  ├─────────────────────────────────────────────────────────┤");
     println!(
-        "\nStarting OpenAI-compatible API server on http://{}:{}",
+        "  │  Endpoint:  http://{}:{}                        │",
         host, port
     );
-    println!("Endpoints:");
-    println!("  POST /v1/chat/completions");
-    println!("  POST /v1/completions");
-    println!("  GET  /v1/models");
-    println!("  GET  /v1/health");
-    println!("\nPress Ctrl+C to stop.\n");
+    println!("  │  Model:     {:<44}│", truncate(model, 44));
+    println!("  │  Backend:   {:<44}│", config.inference.default_backend);
+    println!("  ├─────────────────────────────────────────────────────────┤");
+    println!("  │  Hardware:                                              │");
+    println!("  │    CPU threads: {:<38}│", hardware.cpus);
+    if !hardware.gpus.is_empty() {
+        let gpu_str = hardware
+            .gpus
+            .iter()
+            .map(|g| g.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  │    GPU:         {:<38}│", truncate(&gpu_str, 38));
+    } else {
+        println!("  │    GPU:         {:<38}│", "None (CPU-only)");
+    }
+    println!(
+        "  │    Memory:      {:<38}│",
+        format!("{} MB", hardware.memory_total_mb)
+    );
+    println!("  ├─────────────────────────────────────────────────────────┤");
+    println!("  │  Server Config:                                         │");
+    println!(
+        "  │    Max concurrent: {:<34}│",
+        config.server.max_concurrent_requests
+    );
+    println!(
+        "  │    Rate limit:     {:<34}│",
+        format!("{}/s", config.server.rate_limit_per_second)
+    );
+    println!(
+        "  │    Timeout:        {:<34}│",
+        format!("{}s", config.server.request_timeout_secs)
+    );
+    println!(
+        "  │    Max body size:  {:<34}│",
+        format!("{}MB", config.server.max_body_size_mb)
+    );
+    println!(
+        "  │    Compression:    {:<34}│",
+        if config.server.enable_compression {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "  │    Metrics:        {:<34}│",
+        if config.server.enable_metrics {
+            "enabled (/metrics)"
+        } else {
+            "disabled"
+        }
+    );
+    println!("  ├─────────────────────────────────────────────────────────┤");
+    println!("  │  Endpoints:                                             │");
+    println!("  │    POST /v1/chat/completions   (OpenAI-compatible)      │");
+    println!("  │    POST /v1/completions        (OpenAI-compatible)      │");
+    println!("  │    GET  /v1/models             (List loaded models)     │");
+    println!("  │    GET  /v1/health             (Health + system info)   │");
+    println!("  │    GET  /v1/ready              (Kubernetes readiness)   │");
+    println!("  │    GET  /metrics               (Prometheus metrics)     │");
+    println!("  └─────────────────────────────────────────────────────────┘");
+    println!();
+    println!("  Press Ctrl+C to stop.");
+    println!();
+}
 
-    server.start(host, port).await
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
+    }
 }
 
 fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {

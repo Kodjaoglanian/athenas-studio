@@ -39,6 +39,12 @@ pub struct ServerConfig {
     pub default_port: u16,
     pub cors_enabled: bool,
     pub api_key: Option<String>,
+    pub max_concurrent_requests: u32,
+    pub rate_limit_per_second: u32,
+    pub request_timeout_secs: u64,
+    pub max_body_size_mb: u32,
+    pub enable_metrics: bool,
+    pub enable_compression: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +106,12 @@ impl Default for AppConfig {
                 default_port: 8080,
                 cors_enabled: true,
                 api_key: None,
+                max_concurrent_requests: 10,
+                rate_limit_per_second: 20,
+                request_timeout_secs: 120,
+                max_body_size_mb: 10,
+                enable_metrics: true,
+                enable_compression: true,
             },
             huggingface: HuggingFaceConfig {
                 token: None,

@@ -62,6 +62,18 @@ enum Commands {
         /// Context size
         #[arg(long, default_value = "4096")]
         context_size: u32,
+        /// Max concurrent requests (semaphore)
+        #[arg(long)]
+        max_concurrent: Option<u32>,
+        /// Rate limit (requests per second per IP)
+        #[arg(long)]
+        rate_limit: Option<u32>,
+        /// Request timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Max request body size in MB
+        #[arg(long)]
+        max_body_size: Option<u32>,
     },
 
     /// Run a one-shot inference
@@ -213,7 +225,25 @@ async fn main() -> anyhow::Result<()> {
             backend,
             gpu_layers,
             context_size,
-        } => commands::serve::run(model, &host, port, backend, gpu_layers, context_size).await?,
+            max_concurrent,
+            rate_limit,
+            timeout,
+            max_body_size,
+        } => {
+            commands::serve::run(
+                model,
+                &host,
+                port,
+                backend,
+                gpu_layers,
+                context_size,
+                max_concurrent,
+                rate_limit,
+                timeout,
+                max_body_size,
+            )
+            .await?
+        }
         Commands::Run {
             model,
             prompt,
