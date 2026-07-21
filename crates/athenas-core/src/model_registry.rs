@@ -83,7 +83,11 @@ impl std::fmt::Display for ModelInfo {
         if !self.tags.is_empty() {
             writeln!(f, "  Tags:        {}", self.tags.join(", "))?;
         }
-        writeln!(f, "  Downloaded:  {}", self.downloaded_at.format("%Y-%m-%d %H:%M"))?;
+        writeln!(
+            f,
+            "  Downloaded:  {}",
+            self.downloaded_at.format("%Y-%m-%d %H:%M")
+        )?;
         if let Some(last) = self.last_used_at {
             writeln!(f, "  Last used:   {}", last.format("%Y-%m-%d %H:%M"))?;
         }
@@ -156,10 +160,10 @@ impl ModelRegistry {
 }
 
 fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()> {
-    let entries = std::fs::read_dir(dir).map_err(|e| AthenasError::Io(e))?;
+    let entries = std::fs::read_dir(dir).map_err(AthenasError::Io)?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| AthenasError::Io(e))?;
+        let entry = entry.map_err(AthenasError::Io)?;
         let path = entry.path();
 
         if path.is_dir() {
@@ -218,9 +222,9 @@ fn create_model_info_from_file(path: &PathBuf, format: ModelFormat) -> Result<Mo
 fn detect_quantization(filename: &str) -> Option<String> {
     let lower = filename.to_lowercase();
     let quants = [
-        "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0", "q4_k_m", "q4_k_s",
-        "q3_k_m", "q3_k_s", "q3_k_l", "q2_k", "q1_0", "f16", "f32", "iq4_xs", "iq3_xs",
-        "q8_0_k", "q6_k", "q5_k_m", "q5_k_s",
+        "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0", "q4_k_m", "q4_k_s", "q3_k_m",
+        "q3_k_s", "q3_k_l", "q2_k", "q1_0", "f16", "f32", "iq4_xs", "iq3_xs", "q8_0_k", "q6_k",
+        "q5_k_m", "q5_k_s",
     ];
 
     for q in &quants {

@@ -1,18 +1,10 @@
-use ratatui::widgets::ListState;
 use athenas_core::ModelInfo;
+use ratatui::widgets::ListState;
 
+#[derive(Default)]
 pub struct ModelListState {
     pub models: Vec<ModelInfo>,
     pub list_state: ListState,
-}
-
-impl Default for ModelListState {
-    fn default() -> Self {
-        Self {
-            models: Vec::new(),
-            list_state: ListState::default(),
-        }
-    }
 }
 
 impl ModelListState {
@@ -42,8 +34,6 @@ impl ModelListState {
     }
 
     pub fn selected(&self) -> Option<&ModelInfo> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.models.get(i))
+        self.list_state.selected().and_then(|i| self.models.get(i))
     }
 }

@@ -16,11 +16,7 @@ pub trait Backend: Send + Sync {
     async fn unload_model(&mut self) -> Result<()>;
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse>;
-    async fn chat_stream(
-        &self,
-        request: ChatRequest,
-        tx: mpsc::Sender<StreamChunk>,
-    ) -> Result<()>;
+    async fn chat_stream(&self, request: ChatRequest, tx: mpsc::Sender<StreamChunk>) -> Result<()>;
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse>;
     async fn complete_stream(
@@ -55,11 +51,7 @@ impl BackendFactory {
                 Ok(Box::new(crate::vllm::VllmBackend::new(hardware)))
             }
             athenas_core::BackendType::Auto => {
-                if hardware.has_cuda || hardware.has_rocm {
-                    Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new(hardware)))
-                } else {
-                    Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new(hardware)))
-                }
+                Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new(hardware)))
             }
         }
     }

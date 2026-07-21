@@ -6,8 +6,8 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse,
-    InferenceStats, ModelLoadConfig, Role, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
+    ModelLoadConfig, Role, StreamChunk,
 };
 
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
@@ -61,12 +61,18 @@ impl LlamaCppBackend {
         self.server_port = find_free_port();
 
         let mut cmd = tokio::process::Command::new(&server_bin);
-        cmd.arg("--model").arg(&config.model_path)
-            .arg("--ctx-size").arg(config.context_size.to_string())
-            .arg("--batch-size").arg(config.batch_size.to_string())
-            .arg("--threads").arg(config.threads.to_string())
-            .arg("--port").arg(self.server_port.to_string())
-            .arg("--host").arg("127.0.0.1");
+        cmd.arg("--model")
+            .arg(&config.model_path)
+            .arg("--ctx-size")
+            .arg(config.context_size.to_string())
+            .arg("--batch-size")
+            .arg(config.batch_size.to_string())
+            .arg("--threads")
+            .arg(config.threads.to_string())
+            .arg("--port")
+            .arg(self.server_port.to_string())
+            .arg("--host")
+            .arg("127.0.0.1");
 
         if config.gpu_layers >= 0 {
             cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
@@ -90,11 +96,14 @@ impl LlamaCppBackend {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        info!("Starting llama-server on port {} with model: {}", self.server_port, config.model_path);
+        info!(
+            "Starting llama-server on port {} with model: {}",
+            self.server_port, config.model_path
+        );
 
-        let child = cmd.spawn().map_err(|e| {
-            AthenasError::Backend(format!("Failed to start llama-server: {}", e))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| AthenasError::Backend(format!("Failed to start llama-server: {}", e)))?;
 
         self.server_handle = Some(child);
 
@@ -203,11 +212,16 @@ impl Backend for LlamaCppBackend {
             "top_p": request.top_p.unwrap_or(0.9),
             "n_predict": request.max_tokens.unwrap_or(2048),
             "stream": false,
-            "stop": request.stop.as_ref().map(|s| s.as_slice()).unwrap_or(&[]),
+            "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
         let url = format!("{}/completion", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
@@ -219,18 +233,23 @@ impl Backend for LlamaCppBackend {
             )));
         }
 
-        let result: serde_json::Value = resp.json().await
+        let result: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Invalid response: {}", e)))?;
 
-        let content = result.get("content")
+        let content = result
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let tokens_predicted = result.get("tokens_predicted")
+        let tokens_predicted = result
+            .get("tokens_predicted")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let tokens_decoded = result.get("tokens_decoded")
+        let tokens_decoded = result
+            .get("tokens_decoded")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let timings = result.get("timings");
@@ -257,11 +276,7 @@ impl Backend for LlamaCppBackend {
         })
     }
 
-    async fn chat_stream(
-        &self,
-        request: ChatRequest,
-        tx: mpsc::Sender<StreamChunk>,
-    ) -> Result<()> {
+    async fn chat_stream(&self, request: ChatRequest, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
@@ -274,11 +289,16 @@ impl Backend for LlamaCppBackend {
             "top_p": request.top_p.unwrap_or(0.9),
             "n_predict": request.max_tokens.unwrap_or(2048),
             "stream": true,
-            "stop": request.stop.as_ref().map(|s| s.as_slice()).unwrap_or(&[]),
+            "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
         let url = format!("{}/completion", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
@@ -296,9 +316,8 @@ impl Backend for LlamaCppBackend {
         let mut full_text = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                AthenasError::Backend(format!("Stream error: {}", e))
-            })?;
+            let chunk =
+                chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(pos) = buffer.find('\n') {
@@ -311,30 +330,32 @@ impl Backend for LlamaCppBackend {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
-                    let _ = tx.send(StreamChunk {
-                        text: String::new(),
-                        done: true,
-                        stats: Some(InferenceStats {
-                            tokens_generated: full_text.split_whitespace().count() as u32,
-                            tokens_prompt: 0,
-                            time_total_ms: 0,
-                            tokens_per_second: 0.0,
-                        }),
-                    }).await;
+                    let _ = tx
+                        .send(StreamChunk {
+                            text: String::new(),
+                            done: true,
+                            stats: Some(InferenceStats {
+                                tokens_generated: full_text.split_whitespace().count() as u32,
+                                tokens_prompt: 0,
+                                time_total_ms: 0,
+                                tokens_per_second: 0.0,
+                            }),
+                        })
+                        .await;
                     return Ok(());
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    let content = json.get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     if !content.is_empty() {
                         full_text.push_str(content);
-                        let _ = tx.send(StreamChunk {
-                            text: content.to_string(),
-                            done: false,
-                            stats: None,
-                        }).await;
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: content.to_string(),
+                                done: false,
+                                stats: None,
+                            })
+                            .await;
                     }
 
                     let stop = json.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -344,27 +365,31 @@ impl Backend for LlamaCppBackend {
                             .and_then(|t| t.get("tokens_per_second"))
                             .and_then(|v| v.as_f64())
                             .unwrap_or(0.0) as f32;
-                        let _ = tx.send(StreamChunk {
-                            text: String::new(),
-                            done: true,
-                            stats: Some(InferenceStats {
-                                tokens_generated: full_text.split_whitespace().count() as u32,
-                                tokens_prompt: 0,
-                                time_total_ms: 0,
-                                tokens_per_second: tps,
-                            }),
-                        }).await;
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: String::new(),
+                                done: true,
+                                stats: Some(InferenceStats {
+                                    tokens_generated: full_text.split_whitespace().count() as u32,
+                                    tokens_prompt: 0,
+                                    time_total_ms: 0,
+                                    tokens_per_second: tps,
+                                }),
+                            })
+                            .await;
                         return Ok(());
                     }
                 }
             }
         }
 
-        let _ = tx.send(StreamChunk {
-            text: String::new(),
-            done: true,
-            stats: None,
-        }).await;
+        let _ = tx
+            .send(StreamChunk {
+                text: String::new(),
+                done: true,
+                stats: None,
+            })
+            .await;
         Ok(())
     }
 
@@ -379,11 +404,16 @@ impl Backend for LlamaCppBackend {
             "top_p": request.top_p.unwrap_or(0.9),
             "n_predict": request.max_tokens.unwrap_or(2048),
             "stream": false,
-            "stop": request.stop.as_ref().map(|s| s.as_slice()).unwrap_or(&[]),
+            "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
         let url = format!("{}/completion", self.server_url());
-        let resp = self.client.post(&url).json(&body).send().await
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
 
         if !resp.status().is_success() {
@@ -395,18 +425,23 @@ impl Backend for LlamaCppBackend {
             )));
         }
 
-        let result: serde_json::Value = resp.json().await
+        let result: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| AthenasError::Backend(format!("Invalid response: {}", e)))?;
 
-        let content = result.get("content")
+        let content = result
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let tokens_decoded = result.get("tokens_decoded")
+        let tokens_decoded = result
+            .get("tokens_decoded")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let tokens_predicted = result.get("tokens_predicted")
+        let tokens_predicted = result
+            .get("tokens_predicted")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let timings = result.get("timings");
@@ -436,14 +471,16 @@ impl Backend for LlamaCppBackend {
         request: CompletionRequest,
         tx: mpsc::Sender<StreamChunk>,
     ) -> Result<()> {
-        let mut chat_req = ChatRequest::default();
-        chat_req.model = request.model.clone();
-        chat_req.messages = vec![ChatMessage::user(&request.prompt)];
-        chat_req.temperature = request.temperature;
-        chat_req.top_p = request.top_p;
-        chat_req.max_tokens = request.max_tokens;
-        chat_req.stream = true;
-        chat_req.stop = request.stop.clone();
+        let chat_req = ChatRequest {
+            model: request.model.clone(),
+            messages: vec![ChatMessage::user(&request.prompt)],
+            temperature: request.temperature,
+            top_p: request.top_p,
+            max_tokens: request.max_tokens,
+            stream: true,
+            stop: request.stop.clone(),
+            ..Default::default()
+        };
         self.chat_stream(chat_req, tx).await
     }
 

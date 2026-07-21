@@ -1,5 +1,5 @@
 use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Result};
-use athenas_inference::{Backend, BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig, StreamChunk};
+use athenas_inference::{BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig, StreamChunk};
 use tokio::sync::mpsc;
 
 pub async fn run(
@@ -45,9 +45,9 @@ pub async fn run(
         std::io::Write::flush(&mut std::io::stdout()).ok();
 
         let mut input = String::new();
-        stdin.read_line(&mut input).map_err(|e| {
-            athenas_core::AthenasError::InvalidInput(e.to_string())
-        })?;
+        stdin
+            .read_line(&mut input)
+            .map_err(|e| athenas_core::AthenasError::InvalidInput(e.to_string()))?;
         let input = input.trim().to_string();
 
         if input.is_empty() {
@@ -91,7 +91,7 @@ pub async fn run(
 
         let (tx, mut rx) = mpsc::channel::<StreamChunk>(100);
         let backend_ref = &backend;
-        backend_ref.chat_stream(req, tx).await;
+        let _ = backend_ref.chat_stream(req, tx).await;
 
         print!("AI: ");
         std::io::Write::flush(&mut std::io::stdout()).ok();
@@ -131,7 +131,9 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
         return Ok(model_id.to_string());
     }
 
-    Err(athenas_core::AthenasError::ModelNotFound(model_id.to_string()))
+    Err(athenas_core::AthenasError::ModelNotFound(
+        model_id.to_string(),
+    ))
 }
 
 fn print_model_selector(config: &AppConfig) -> Result<String> {
@@ -154,17 +156,16 @@ fn print_model_selector(config: &AppConfig) -> Result<String> {
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).map_err(|e| {
-        athenas_core::AthenasError::InvalidInput(e.to_string())
-    })?;
-    let idx: usize = input.trim().parse().map_err(|_| {
-        athenas_core::AthenasError::InvalidInput("Invalid number".to_string())
-    })?;
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| athenas_core::AthenasError::InvalidInput(e.to_string()))?;
+    let idx: usize = input
+        .trim()
+        .parse()
+        .map_err(|_| athenas_core::AthenasError::InvalidInput("Invalid number".to_string()))?;
 
     models
         .get(idx)
         .map(|m| m.file_path.to_string_lossy().to_string())
-        .ok_or_else(|| {
-            athenas_core::AthenasError::InvalidInput("Invalid selection".to_string())
-        })
+        .ok_or_else(|| athenas_core::AthenasError::InvalidInput("Invalid selection".to_string()))
 }

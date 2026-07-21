@@ -1,5 +1,5 @@
 use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Result};
-use athenas_inference::{Backend, BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig};
+use athenas_inference::{BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig};
 
 pub async fn run(
     model: String,
@@ -63,5 +63,7 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
     if path.exists() && path.is_file() {
         return Ok(model_id.to_string());
     }
-    Err(athenas_core::AthenasError::ModelNotFound(model_id.to_string()))
+    Err(athenas_core::AthenasError::ModelNotFound(
+        model_id.to_string(),
+    ))
 }

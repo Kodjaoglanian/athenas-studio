@@ -1,5 +1,5 @@
 use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Result};
-use athenas_inference::{Backend, BackendFactory, ModelLoadConfig};
+use athenas_inference::{BackendFactory, ModelLoadConfig};
 use athenas_server::ApiServer;
 
 pub async fn run(
@@ -35,7 +35,10 @@ pub async fn run(
     println!("Model loaded with backend: {}", backend.name());
 
     let server = ApiServer::new(config, backend);
-    println!("\nStarting OpenAI-compatible API server on http://{}:{}", host, port);
+    println!(
+        "\nStarting OpenAI-compatible API server on http://{}:{}",
+        host, port
+    );
     println!("Endpoints:");
     println!("  POST /v1/chat/completions");
     println!("  POST /v1/completions");
@@ -55,5 +58,7 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
     if path.exists() && path.is_file() {
         return Ok(model_id.to_string());
     }
-    Err(athenas_core::AthenasError::ModelNotFound(model_id.to_string()))
+    Err(athenas_core::AthenasError::ModelNotFound(
+        model_id.to_string(),
+    ))
 }

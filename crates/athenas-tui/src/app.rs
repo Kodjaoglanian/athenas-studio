@@ -1,13 +1,15 @@
-use std::io::stdout;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::stdout;
 
 use athenas_core::{AppConfig, HardwareInfo, ModelRegistry, Result};
-use athenas_inference::{Backend, BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig, Role, StreamChunk};
+use athenas_inference::{
+    Backend, BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig, Role, StreamChunk,
+};
 
 use crate::chat::ChatState;
 use crate::components;
@@ -51,15 +53,16 @@ impl TuiApp {
         execute!(stdout, EnterAlternateScreen)
             .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)
-            .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
+        let mut terminal =
+            Terminal::new(backend).map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
         let result = self.main_loop(&mut terminal).await;
 
         disable_raw_mode().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)
             .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
-        terminal.show_cursor()
+        terminal
+            .show_cursor()
             .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
         result
@@ -75,8 +78,8 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(100))
                 .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?
             {
-                let event = event::read()
-                    .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
+                let event =
+                    event::read().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
                 if let Event::Key(key) = event {
                     if key.kind != KeyEventKind::Press {
@@ -84,7 +87,9 @@ impl TuiApp {
                     }
 
                     // Global keys
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
                         break;
                     }
 
@@ -103,34 +108,34 @@ impl TuiApp {
                                 KeyCode::Tab => {
                                     self.mode = AppMode::ModelList;
                                 }
-                                KeyCode::Esc => {
-                                    if self.chat_state.is_generating {
-                                        // Can't easily cancel, just ignore
-                                    }
+                                KeyCode::Esc if self.chat_state.is_generating => {
+                                    // Can't easily cancel, just ignore
                                 }
                                 _ => {}
                             }
                         }
-                        AppMode::ModelList => {
-                            match key.code {
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    self.model_list_state.next();
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    self.model_list_state.previous();
-                                }
-                                KeyCode::Enter => {
-                                    if let Some(path) = self.model_list_state.selected().map(|m| m.file_path.to_string_lossy().to_string()) {
-                                        self.load_model(&path).await;
-                                        self.mode = AppMode::Chat;
-                                    }
-                                }
-                                KeyCode::Tab | KeyCode::Esc => {
+                        AppMode::ModelList => match key.code {
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                self.model_list_state.next();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                self.model_list_state.previous();
+                            }
+                            KeyCode::Enter => {
+                                if let Some(path) = self
+                                    .model_list_state
+                                    .selected()
+                                    .map(|m| m.file_path.to_string_lossy().to_string())
+                                {
+                                    self.load_model(&path).await;
                                     self.mode = AppMode::Chat;
                                 }
-                                _ => {}
                             }
-                        }
+                            KeyCode::Tab | KeyCode::Esc => {
+                                self.mode = AppMode::Chat;
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -168,7 +173,8 @@ impl TuiApp {
         }
 
         if self.backend.is_none() {
-            self.chat_state.add_message("system", "No model loaded. Press Tab to select a model.");
+            self.chat_state
+                .add_message("system", "No model loaded. Press Tab to select a model.");
             return;
         }
 
@@ -177,7 +183,9 @@ impl TuiApp {
         self.chat_state.is_generating = true;
 
         // Build chat request from current messages
-        let messages: Vec<ChatMessage> = self.chat_state.messages
+        let messages: Vec<ChatMessage> = self
+            .chat_state
+            .messages
             .iter()
             .filter(|m| m.role != "system" || !m.content.contains("Welcome"))
             .map(|m| {
@@ -187,7 +195,10 @@ impl TuiApp {
                     "system" => Role::System,
                     _ => Role::User,
                 };
-                ChatMessage { role, content: m.content.clone() }
+                ChatMessage {
+                    role,
+                    content: m.content.clone(),
+                }
             })
             .collect();
 
@@ -239,30 +250,32 @@ impl TuiApp {
                 self.mode = AppMode::ModelList;
             }
             "/help" => {
-                self.chat_state.add_message("system",
-                    "Commands: /clear, /model, /help, /quit");
+                self.chat_state
+                    .add_message("system", "Commands: /clear, /model, /help, /quit");
             }
             "/quit" => {
                 // Signal exit
                 self.chat_state.add_message("system", "Use Ctrl+C to quit");
             }
             _ => {
-                self.chat_state.add_message("system", &format!("Unknown command: {}", parts[0]));
+                self.chat_state
+                    .add_message("system", &format!("Unknown command: {}", parts[0]));
             }
         }
         self.chat_state.input_text.clear();
     }
 
     async fn load_model(&mut self, path: &str) {
-        self.chat_state.add_message("system", &format!("Loading model: {}...", path));
+        self.chat_state
+            .add_message("system", &format!("Loading model: {}...", path));
 
-        let mut backend = BackendFactory::create(
-            self.config.inference.default_backend,
-            &self.hardware,
-        ).unwrap_or_else(|e| {
-            self.chat_state.add_message("system", &format!("Failed to create backend: {}", e));
-            panic!("Backend creation failed");
-        });
+        let mut backend =
+            BackendFactory::create(self.config.inference.default_backend, &self.hardware)
+                .unwrap_or_else(|e| {
+                    self.chat_state
+                        .add_message("system", &format!("Failed to create backend: {}", e));
+                    panic!("Backend creation failed");
+                });
 
         let load_config = ModelLoadConfig {
             model_path: path.to_string(),
@@ -282,11 +295,13 @@ impl TuiApp {
                     self.chat_state.current_model = Some(i.name.clone());
                     self.chat_state.current_backend = Some(i.backend_name.clone());
                 }
-                self.chat_state.add_message("system", "Model loaded successfully!");
+                self.chat_state
+                    .add_message("system", "Model loaded successfully!");
                 self.backend = Some(backend);
             }
             Err(e) => {
-                self.chat_state.add_message("system", &format!("Failed to load model: {}", e));
+                self.chat_state
+                    .add_message("system", &format!("Failed to load model: {}", e));
             }
         }
     }
