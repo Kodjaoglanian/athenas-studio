@@ -330,7 +330,7 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
             ));
             lines.push(Line::from(""));
             lines.push(Line::styled(
-                " Press Enter to search | G: toggle GGUF filter",
+                " Enter to search | G: toggle GGUF filter | Ctrl+U: clear",
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -380,7 +380,7 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::styled(
-                    " Enter: Download selected | Esc: New search",
+                    " Enter: Download | Esc or /: Edit search | R: Reset",
                     Style::default().fg(Color::DarkGray),
                 ));
             }

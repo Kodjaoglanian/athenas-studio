@@ -81,4 +81,10 @@ impl ModelBrowserState {
         self.results_selected = 0;
         self.status_message = None;
     }
+
+    /// Go back to search editing phase, keeping the current query text.
+    pub fn back_to_search_edit(&mut self) {
+        self.phase = BrowserPhase::Search;
+        self.status_message = None;
+    }
 }

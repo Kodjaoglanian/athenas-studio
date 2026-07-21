@@ -341,6 +341,9 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.mode = AppMode::Chat;
                 }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.browser_state.search_input.clear();
+                }
                 KeyCode::Char(c) => {
                     self.browser_state.search_input.push(c);
                 }
@@ -361,6 +364,12 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Esc => {
+                    self.browser_state.back_to_search_edit();
+                }
+                KeyCode::Char('/') => {
+                    self.browser_state.back_to_search_edit();
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
                     self.browser_state.reset_search();
                 }
                 _ => {}
