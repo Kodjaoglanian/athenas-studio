@@ -139,10 +139,29 @@ impl LlamaCppBackend {
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        return Err(AthenasError::Backend(format!(
-                            "llama-server exited early with status: {}",
-                            status
-                        )));
+                        // Try to read stderr for diagnostic info
+                        let stderr_msg = if let Some(stderr) = child.stderr.take() {
+                            use tokio::io::AsyncReadExt;
+                            let mut buf = Vec::new();
+                            let mut stderr = stderr;
+                            let _ = stderr.read_to_end(&mut buf).await;
+                            String::from_utf8_lossy(&buf).to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        let mut msg = format!("llama-server exited early with status: {}", status);
+                        if !stderr_msg.is_empty() {
+                            msg.push_str(&format!("\nstderr: {}", stderr_msg));
+                        }
+                        if status.code() == Some(127) {
+                            msg.push_str(
+                                "\n\nHint: exit code 127 usually means the binary has missing \
+                                 shared libraries. Try running 'ldd <path>' to check.\n\
+                                 On Ubuntu/Debian: apt install -y libgomp1",
+                            );
+                        }
+                        return Err(AthenasError::Backend(msg));
                     }
                     Ok(None) => {}
                     Err(_) => {}

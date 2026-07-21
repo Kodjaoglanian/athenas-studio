@@ -240,6 +240,51 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
             .map_err(|e| AthenasError::Backend(format!("chmod error: {}", e)))?;
     }
 
+    // Verify the binary actually works
+    info!("Verifying llama-server binary...");
+    let verify = tokio::process::Command::new(&extracted_path)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match verify {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            info!(
+                "llama-server verified: {}",
+                version.lines().next().unwrap_or("ok")
+            );
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(AthenasError::Backend(format!(
+                "Downloaded llama-server failed to run (exit code: {:?}).\n\
+                 stdout: {}\n\
+                 stderr: {}\n\
+                 This usually means missing shared libraries.\n\
+                 Try: ldd {}\n\
+                 On Ubuntu/Debian: apt install -y libgomp1",
+                output.status.code(),
+                stdout,
+                stderr,
+                extracted_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(AthenasError::Backend(format!(
+                "Cannot execute downloaded llama-server: {}\n\
+                 Path: {}\n\
+                 Try: ldd {} to check for missing libraries",
+                e,
+                extracted_path.display(),
+                extracted_path.display()
+            )));
+        }
+    }
+
     info!("llama-server installed to {}", extracted_path.display());
     Ok(extracted_path)
 }
