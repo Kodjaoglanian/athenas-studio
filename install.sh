@@ -52,16 +52,23 @@ detect_target() {
 
 # Fetch latest release version
 get_latest_version() {
+    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
+    local resp
+
     if command -v curl &>/dev/null; then
-        curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"([^"]+)".*/\1/'
+        resp="$(curl -fsSL "$api_url")"
     elif command -v wget &>/dev/null; then
-        wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" \
-            | grep '"tag_name"' \
-            | sed -E 's/.*"([^"]+)".*/\1/'
+        resp="$(wget -qO- "$api_url")"
     else
         error "Neither curl nor wget found. Please install one."
+    fi
+
+    # Prefer jq for robust JSON parsing
+    if command -v jq &>/dev/null; then
+        echo "$resp" | jq -r '.tag_name'
+    else
+        # Fallback: extract tag_name with sed (handles both pretty and minified JSON)
+        echo "$resp" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
     fi
 }
 

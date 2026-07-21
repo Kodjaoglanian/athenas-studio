@@ -60,7 +60,6 @@ jobs:
           body_path: changelog.txt
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
-          generate_release_notes: true
 
   build:
     name: Build ${{ matrix.target }}
