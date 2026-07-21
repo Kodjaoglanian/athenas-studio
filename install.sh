@@ -67,9 +67,13 @@ get_latest_version() {
 
 main() {
     echo ""
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║    Athenas Studio — LLM CLI/TUI Installer     ║"
-    echo "  ╚══════════════════════════════════════════════╝"
+    echo "                   d8b                                            d8b   d8,"
+    echo "             d8P   ?88                        d8P                 88P  \`8P"
+    echo "          d888888P  88b                    d888888P              d88"
+    echo " d888b8b    ?88'    888888b  d8888b  88bd88b  d888b8b   .d888b,     .d888b,  ?88'  ?88   d8P d888888    88b d8888b"
+    echo "d8P' ?88    88P     88P \`?8bd8b_,dP  88P' ?8bd8P' ?88   ?8b,        ?8b,     88P   d88   88 d8P' ?88    88Pd8P' ?88"
+    echo "88b  ,88b   88b    d88   88P88b     d88   88P88b  ,88b    \`?8b        \`?8b   88b   ?8(  d88 88b  ,88b  d88 88b  d88"
+    echo "\`?88P'\`88b  \`?8b  d88'   88b\`?888P'd88'   88b\`?88P'\`88b\`?888P'     \`?888P'   \`?8b  \`?88P'?8b\`?88P'\`88bd88' \`?8888P'"
     echo ""
 
     local target version archive_name download_url
@@ -190,10 +194,8 @@ main() {
         echo ""
         success "Athenas Studio installed successfully!"
         echo ""
-        echo "  ╔══════════════════════════════════════════════╗"
-        echo "  ║  Run 'athenas --help' to get started          ║"
-        echo "  ║  Or start the TUI with 'athenas'              ║"
-        echo "  ╚══════════════════════════════════════════════╝"
+        echo "  Run 'athenas --help' to get started"
+        echo "  Or start the TUI with 'athenas'"
         echo ""
         if [ -n "$shell_rc" ]; then
             warn "Restart your shell or run: source ${shell_rc}"

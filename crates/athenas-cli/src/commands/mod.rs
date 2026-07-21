@@ -6,3 +6,4 @@ pub mod models;
 pub mod run;
 pub mod serve;
 pub mod tui;
+pub mod update;

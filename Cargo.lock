@@ -141,6 +141,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "indicatif",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

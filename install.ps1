@@ -15,9 +15,13 @@ function Write-Warn($msg) { Write-Host "[warn] $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "[error] $msg" -ForegroundColor Red; exit 1 }
 
 Write-Host ""
-Write-Host "  ==================================================" -ForegroundColor DarkCyan
-Write-Host "    Athenas Studio — LLM CLI/TUI Installer (Windows)" -ForegroundColor DarkCyan
-Write-Host "  ==================================================" -ForegroundColor DarkCyan
+Write-Host "                   d8b                                            d8b   d8," -ForegroundColor DarkCyan
+Write-Host "             d8P   ?88                        d8P                 88P  ``8P" -ForegroundColor DarkCyan
+Write-Host "          d888888P  88b                    d888888P              d88" -ForegroundColor DarkCyan
+Write-Host " d888b8b    ?88'    888888b  d8888b  88bd88b  d888b8b   .d888b,     .d888b,  ?88'  ?88   d8P d888888    88b d8888b" -ForegroundColor DarkCyan
+Write-Host "d8P' ?88    88P     88P ``?8bd8b_,dP  88P' ?8bd8P' ?88   ?8b,        ?8b,     88P   d88   88 d8P' ?88    88Pd8P' ?88" -ForegroundColor DarkCyan
+Write-Host "88b  ,88b   88b    d88   88P88b     d88   88P88b  ,88b    ``?8b        ``?8b   88b   ?8(  d88 88b  ,88b  d88 88b  d88" -ForegroundColor DarkCyan
+Write-Host "``?88P'``88b  ``?8b  d88'   88b``?888P'd88'   88b``?88P'``88b``?888P'     ``?888P'   ``?8b  ``?88P'?8b``?88P'``88bd88' ``?8888P'" -ForegroundColor DarkCyan
 Write-Host ""
 
 # Detect architecture

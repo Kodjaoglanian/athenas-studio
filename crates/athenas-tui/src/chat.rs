@@ -20,7 +20,7 @@ impl Default for ChatState {
         Self {
             messages: vec![ChatMessage {
                 role: "system".to_string(),
-                content: "Welcome to Athenas Studio! Type a message to start chatting.".to_string(),
+                content: "Welcome to Athenas Studio!\n\n  F1: Chat | F2: Models | F3: Browser | F4: Settings\n  Type /help for commands. Press Ctrl+C to quit.".to_string(),
             }],
             input_text: String::new(),
             scroll: 0,

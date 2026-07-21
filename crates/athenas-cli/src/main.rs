@@ -111,6 +111,9 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
+
+    /// Update athenas to the latest release
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -251,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
             None => commands::backend::list().await?,
         },
         Commands::Login { token } => commands::config::login(token).await?,
+        Commands::Update => commands::update::run().await?,
     }
 
     Ok(())
