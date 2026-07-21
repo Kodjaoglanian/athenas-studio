@@ -134,11 +134,11 @@ impl LlamaCppBackend {
         }
 
         if config.use_mmap {
-            cmd.arg("--mmap").arg("on");
+            cmd.arg("--mmap");
         }
 
         if config.use_mlock {
-            cmd.arg("--mlock").arg("on");
+            cmd.arg("--mlock");
         }
 
         cmd.stdout(std::process::Stdio::piped())
