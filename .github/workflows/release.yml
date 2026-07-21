@@ -201,7 +201,7 @@ jobs:
           cat > install-manifest.json << EOF
           {
             "version": "${VERSION}",
-            "release_url": "https://github.com/athenas-studio/athenas/releases/tag/${VERSION}",
+            "release_url": "https://github.com/Kodjaoglanian/athenas-studio/releases/tag/${VERSION}",
             "targets": {
               "x86_64-unknown-linux-gnu": "athenas-${VERSION}-x86_64-unknown-linux-gnu.tar.gz",
               "aarch64-unknown-linux-gnu": "athenas-${VERSION}-aarch64-unknown-linux-gnu.tar.gz",

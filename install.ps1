@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "athenas-studio/athenas"
+$Repo = "Kodjaoglanian/athenas-studio"
 
 function Write-Info($msg) { Write-Host "[info] $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "[ok] $msg" -ForegroundColor Green }

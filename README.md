@@ -2,7 +2,7 @@
 
 > A powerful CLI/TUI tool for running LLM models locally with CUDA, ROCm, and vLLM support. Compatible with HuggingFace model hub and OpenAI API.
 
-[![CI](https://github.com/athenas-studio/athenas/actions/workflows/ci.yml/badge.svg)](https://github.com/athenas-studio/athenas/actions/workflows/ci.yml)
+[![CI](https://github.com/Kodjaoglanian/athenas-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/Kodjaoglanian/athenas-studio/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org)
 
@@ -38,13 +38,13 @@
 ### One-Line Install (Linux & macOS)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/athenas-studio/athenas/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Kodjaoglanian/athenas-studio/main/install.sh | bash
 ```
 
 ### One-Line Install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/athenas-studio/athenas/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Kodjaoglanian/athenas-studio/main/install.ps1 | iex
 ```
 
 ### Supported Platforms
@@ -63,7 +63,7 @@ The installer automatically detects your platform, downloads the latest release,
 ### From Source
 
 ```bash
-git clone https://github.com/athenas-studio/athenas.git
+git clone https://github.com/Kodjaoglanian/athenas-studio.git
 cd athenas
 cargo build --release
 # Binary at target/release/athenas

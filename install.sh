@@ -2,7 +2,7 @@
 # Athenas Studio installer — one-line install: curl -fsSL https://athenas.studio/install.sh | bash
 set -euo pipefail
 
-REPO="athenas-studio/athenas"
+REPO="Kodjaoglanian/athenas-studio"
 INSTALL_DIR="${ATHENAS_INSTALL_DIR:-$HOME/.athenas/bin"
 CONFIG_DIR="${ATHENAS_CONFIG_DIR:-$HOME/.athenas}"
 

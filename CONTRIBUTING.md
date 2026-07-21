@@ -7,7 +7,7 @@ Thank you for your interest in contributing to Athenas Studio! This document out
 1. **Install Rust** via [rustup](https://rustup.rs)
 2. Clone the repository:
    ```bash
-   git clone https://github.com/athenas-studio/athenas.git
+   git clone https://github.com/Kodjaoglanian/athenas-studio.git
    cd athenas
    ```
 3. Build:
@@ -46,7 +46,7 @@ The project is organized as a Cargo workspace with 6 crates:
 
 ## Reporting Issues
 
-Use [GitHub Issues](https://github.com/athenas-studio/athenas/issues) to report bugs or request features. Include:
+Use [GitHub Issues](https://github.com/Kodjaoglanian/athenas-studio/issues) to report bugs or request features. Include:
 
 - OS and version
 - Rust version (`rustc --version`)

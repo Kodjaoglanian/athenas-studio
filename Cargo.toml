@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Athenas Studio Contributors"]
-repository = "https://github.com/athenas-studio/athenas"
+repository = "https://github.com/Kodjaoglanian/athenas-studio"
 
 [workspace.dependencies]
 # TUI
