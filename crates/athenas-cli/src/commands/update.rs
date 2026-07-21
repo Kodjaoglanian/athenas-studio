@@ -6,35 +6,82 @@ const REPO: &str = "Kodjaoglanian/athenas-studio";
 const INSTALL_URL: &str =
     "https://github.com/Kodjaoglanian/athenas-studio/releases/latest/download/install.sh";
 
+fn print_banner() {
+    let cyan = "\x1b[0;36m";
+    let bold = "\x1b[1m";
+    let nc = "\x1b[0m";
+    println!();
+    println!(
+        "{}{}    ___   __   ____  _   _ _____ _____ ____     {}",
+        cyan, bold, nc
+    );
+    println!(
+        "{}{}   / _ \\ / /_ / ___|| | |  ___|_   _|  _ \\    {}",
+        cyan, bold, nc
+    );
+    println!(
+        "{}{}  / /_\\_/ __|\\___ \\| |_| | |_    | | | |_) |   {}",
+        cyan, bold, nc
+    );
+    println!(
+        "{}{} / /_\\  \\_| |____) |  _  |  _|   | | |  _ <    {}",
+        cyan, bold, nc
+    );
+    println!(
+        "{}{} \\____|\\__|____/ |_| |_|_|     |_| |_| \\_\\   {}",
+        cyan, bold, nc
+    );
+    println!("{}{}        Studio — Local LLM Inference{}", cyan, bold, nc);
+    println!();
+}
+
+fn info(msg: &str) {
+    let cyan = "\x1b[0;36m";
+    let nc = "\x1b[0m";
+    println!("  {}[info]{} {}", cyan, nc, msg);
+}
+
+fn success(msg: &str) {
+    let green = "\x1b[0;32m";
+    let nc = "\x1b[0m";
+    println!("  {}[ok]{}   {}", green, nc, msg);
+}
+
+#[allow(dead_code)]
+fn warn(msg: &str) {
+    let yellow = "\x1b[1;33m";
+    let nc = "\x1b[0m";
+    println!("  {}[warn]{} {}", yellow, nc, msg);
+}
+
+fn error(msg: &str) {
+    let red = "\x1b[0;31m";
+    let nc = "\x1b[0m";
+    println!("  {}[err]{}  {}", red, nc, msg);
+}
+
 pub async fn run() -> Result<()> {
-    println!();
-    println!(" ░▒▓██████▓▒░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░▒▓███████▓▒░ ░▒▓██████▓▒░ ░▒▓███████▓▒░       ░▒▓███████▓▒░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓█▓▒░░▒▓██████▓▒░  ");
-    println!("░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░             ░▒▓█▓▒░         ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ");
-    println!("░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░             ░▒▓█▓▒░         ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ");
-    println!("░▒▓████████▓▒░ ░▒▓█▓▒░   ░▒▓████████▓▒░▒▓██████▓▒░ ░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░░▒▓██████▓▒░        ░▒▓██████▓▒░   ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ");
-    println!("░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░      ░▒▓█▓▒░             ░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ");
-    println!("░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░      ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░      ░▒▓█▓▒░             ░▒▓█▓▒░  ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ ");
-    println!("░▒▓█▓▒░░▒▓█▓▒░ ░▒▓█▓▒░   ░▒▓█▓▒░░▒▓█▓▒░▒▓████████▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░       ░▒▓███████▓▒░   ░▒▓█▓▒░    ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓█▓▒░░▒▓██████▓▒░  ");
-    println!();
+    print_banner();
 
     let current_version = get_current_version();
-    println!("[info] Current version: {}", current_version);
+    info(&format!("Current version: {}", current_version));
 
-    println!("[info] Checking for latest release...");
+    info("Checking for latest release...");
     let latest_version = get_latest_version().await?;
-    println!("[info] Latest version:  {}", latest_version);
+    info(&format!("Latest version:  {}", latest_version));
 
     if current_version == latest_version {
         println!();
-        println!("[ok] You're already up to date!");
+        success("You're already up to date!");
+        println!();
         return Ok(());
     }
 
     println!();
-    println!(
-        "[info] Updating from {} to {}...",
+    info(&format!(
+        "Updating from {} to {}...",
         current_version, latest_version
-    );
+    ));
     println!();
 
     let platform = env::consts::OS;
@@ -43,7 +90,7 @@ pub async fn run() -> Result<()> {
             run_install_script().await?;
         }
         "windows" => {
-            println!("[info] On Windows, please run the following in PowerShell:");
+            info("On Windows, please run the following in PowerShell:");
             println!();
             println!(
                 "  irm https://github.com/{}/releases/latest/download/install.ps1 | iex",
@@ -52,10 +99,10 @@ pub async fn run() -> Result<()> {
             println!();
         }
         _ => {
-            println!(
-                "[error] Unsupported platform: {}. Please download manually from:",
+            error(&format!(
+                "Unsupported platform: {}. Please download manually from:",
                 platform
-            );
+            ));
             println!("  https://github.com/{}/releases/latest", REPO);
         }
     }
@@ -91,7 +138,7 @@ async fn get_latest_version() -> Result<String> {
 }
 
 async fn run_install_script() -> Result<()> {
-    println!("[info] Downloading and running installer...");
+    info("Downloading and running installer...");
     println!();
 
     let status = Command::new("bash")
@@ -105,6 +152,6 @@ async fn run_install_script() -> Result<()> {
     }
 
     println!();
-    println!("[ok] Update complete! Run 'athenas --version' to verify.");
+    success("Update complete! Run 'athenas --version' to verify.");
     Ok(())
 }
