@@ -73,8 +73,8 @@ main() {
     echo ""
 
     local target version archive_name download_url
-    local tmp_dir=""
-    trap 'rm -rf "$tmp_dir"' EXIT
+    tmp_dir=""
+    trap 'rm -rf "${tmp_dir:-}"' EXIT
 
     target="$(detect_target)"
     info "Detected target: ${target}"
