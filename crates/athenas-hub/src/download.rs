@@ -214,7 +214,7 @@ impl ModelDownloader {
         };
 
         // Each chunk downloads to its own temp file — no Mutex needed
-        let temp_dir = file_path.parent().unwrap_or(&file_path).to_path_buf();
+        let temp_dir = file_path.parent().unwrap_or(file_path).to_path_buf();
         let mut tasks = Vec::new();
         let mut chunk_paths = Vec::new();
 
