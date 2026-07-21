@@ -184,7 +184,7 @@ impl HuggingFaceClient {
             return Err(AthenasError::HfApi(format!(
                 "HuggingFace API returned {}: {}",
                 status, text
-            )))?;
+            )));
         }
 
         let info: HfModelInfo = resp
