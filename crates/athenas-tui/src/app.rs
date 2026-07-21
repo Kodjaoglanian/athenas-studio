@@ -15,6 +15,7 @@ use crate::chat::ChatState;
 use crate::components;
 use crate::model_browser::{BrowserPhase, ModelBrowserState};
 use crate::model_list::ModelListState;
+use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
 #[derive(PartialEq)]
@@ -22,6 +23,7 @@ pub enum AppMode {
     Chat,
     ModelList,
     Browser,
+    Server,
     Settings,
 }
 
@@ -31,7 +33,8 @@ impl AppMode {
             AppMode::Chat => 0,
             AppMode::ModelList => 1,
             AppMode::Browser => 2,
-            AppMode::Settings => 3,
+            AppMode::Server => 3,
+            AppMode::Settings => 4,
         }
     }
 }
@@ -42,9 +45,19 @@ pub struct TuiApp {
     chat_state: ChatState,
     model_list_state: ModelListState,
     browser_state: ModelBrowserState,
+    server_panel_state: ServerPanelState,
     settings_state: SettingsState,
     mode: AppMode,
     backend: Option<Box<dyn Backend>>,
+    // Background download state
+    download_progress_rx: Option<tokio::sync::mpsc::Receiver<athenas_hub::DownloadProgress>>,
+    download_task: Option<
+        tokio::task::JoinHandle<
+            std::result::Result<std::path::PathBuf, athenas_core::AthenasError>,
+        >,
+    >,
+    // Background server state
+    server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
 }
 
 impl TuiApp {
@@ -56,6 +69,7 @@ impl TuiApp {
         model_list_state.set_models(models);
 
         let settings_state = SettingsState::new(config.clone());
+        let server_panel_state = ServerPanelState::new(&config, hardware.clone());
 
         Self {
             config,
@@ -63,9 +77,13 @@ impl TuiApp {
             chat_state: ChatState::default(),
             model_list_state,
             browser_state: ModelBrowserState::default(),
+            server_panel_state,
             settings_state,
             mode: AppMode::Chat,
             backend: None,
+            download_progress_rx: None,
+            download_task: None,
+            server_handle: None,
         }
     }
 
@@ -95,6 +113,12 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         loop {
+            // Poll background download progress (non-blocking)
+            self.poll_download_progress().await;
+
+            // Poll server task status
+            self.poll_server_status().await;
+
             terminal.draw(|f| self.render(f)).ok();
 
             if event::poll(std::time::Duration::from_millis(100))
@@ -115,7 +139,7 @@ impl TuiApp {
                         break;
                     }
 
-                    // Tab navigation with F1-F4
+                    // Tab navigation with F1-F5
                     if key.code == KeyCode::F(1) {
                         self.mode = AppMode::Chat;
                         continue;
@@ -130,22 +154,32 @@ impl TuiApp {
                         continue;
                     }
                     if key.code == KeyCode::F(4) {
+                        self.mode = AppMode::Server;
+                        self.server_panel_state.refresh_models(&self.config);
+                        continue;
+                    }
+                    if key.code == KeyCode::F(5) {
                         self.mode = AppMode::Settings;
                         continue;
                     }
 
-                    // Global Tab cycling (skip when editing in settings)
+                    // Global Tab cycling (skip when editing)
                     if key.code == KeyCode::Tab
                         && !(self.mode == AppMode::Settings && self.settings_state.editing)
+                        && !(self.mode == AppMode::Server && self.server_panel_state.editing)
                     {
                         self.mode = match self.mode {
                             AppMode::Chat => AppMode::ModelList,
                             AppMode::ModelList => AppMode::Browser,
-                            AppMode::Browser => AppMode::Settings,
+                            AppMode::Browser => AppMode::Server,
+                            AppMode::Server => AppMode::Settings,
                             AppMode::Settings => AppMode::Chat,
                         };
                         if matches!(self.mode, AppMode::ModelList) {
                             self.refresh_models();
+                        }
+                        if matches!(self.mode, AppMode::Server) {
+                            self.server_panel_state.refresh_models(&self.config);
                         }
                         continue;
                     }
@@ -154,6 +188,7 @@ impl TuiApp {
                         AppMode::Chat => self.handle_chat_key(key).await,
                         AppMode::ModelList => self.handle_model_list_key(key).await,
                         AppMode::Browser => self.handle_browser_key(key).await,
+                        AppMode::Server => self.handle_server_key(key).await,
                         AppMode::Settings => self.handle_settings_key(key).await,
                     }
                 }
@@ -193,6 +228,9 @@ impl TuiApp {
             }
             AppMode::Browser => {
                 components::render_model_browser(f, content, &self.browser_state);
+            }
+            AppMode::Server => {
+                components::render_server_panel(f, content, &self.server_panel_state);
             }
             AppMode::Settings => {
                 components::render_settings(f, content, &self.settings_state);
@@ -350,7 +388,7 @@ impl TuiApp {
                         self.browser_state.download_filename = Some(filename.clone());
                         self.browser_state.download_progress = None;
                         self.browser_state.status_message = None;
-                        self.download_model(&repo_id, &filename).await;
+                        self.start_download(&repo_id, &filename);
                     }
                 }
                 KeyCode::Esc => {
@@ -360,6 +398,11 @@ impl TuiApp {
             },
             BrowserPhase::Downloading => {
                 if key.code == KeyCode::Esc {
+                    // Abort: drop the receiver and task
+                    self.download_progress_rx = None;
+                    if let Some(handle) = self.download_task.take() {
+                        handle.abort();
+                    }
                     self.browser_state.phase = BrowserPhase::Results;
                     self.browser_state.download_progress = None;
                     self.browser_state.download_filename = None;
@@ -443,13 +486,13 @@ impl TuiApp {
         }
     }
 
-    async fn download_model(&mut self, repo_id: &str, filename: &str) {
+    fn start_download(&mut self, repo_id: &str, filename: &str) {
         let token = self.config.huggingface.token.clone();
         let client = athenas_hub::HuggingFaceClient::new(token);
         let downloader =
             athenas_hub::ModelDownloader::new(client.clone(), self.config.paths.models_dir.clone());
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<athenas_hub::DownloadProgress>(10);
+        let (tx, rx) = tokio::sync::mpsc::channel::<athenas_hub::DownloadProgress>(10);
 
         let repo_id_owned = repo_id.to_string();
         let filename_owned = filename.to_string();
@@ -460,31 +503,51 @@ impl TuiApp {
                 .await
         });
 
-        while let Some(progress) = rx.recv().await {
+        self.download_progress_rx = Some(rx);
+        self.download_task = Some(download_task);
+    }
+
+    async fn poll_download_progress(&mut self) {
+        if self.download_progress_rx.is_none() {
+            return;
+        }
+
+        // Drain all pending progress updates (non-blocking)
+        while let Ok(progress) = self.download_progress_rx.as_mut().unwrap().try_recv() {
             self.browser_state.download_progress =
                 Some((progress.downloaded_bytes, progress.total_bytes.unwrap_or(0)));
         }
 
-        match download_task.await {
-            Ok(Ok(path)) => {
-                self.browser_state.phase = BrowserPhase::Results;
-                self.browser_state.download_progress = None;
-                self.browser_state.download_filename = None;
-                self.browser_state.status_message =
-                    Some(format!("Downloaded to: {}", path.display()));
-                self.refresh_models();
-            }
-            Ok(Err(e)) => {
-                self.browser_state.phase = BrowserPhase::Results;
-                self.browser_state.download_progress = None;
-                self.browser_state.download_filename = None;
-                self.browser_state.status_message = Some(format!("Download failed: {}", e));
-            }
-            Err(e) => {
-                self.browser_state.phase = BrowserPhase::Results;
-                self.browser_state.download_progress = None;
-                self.browser_state.download_filename = None;
-                self.browser_state.status_message = Some(format!("Task failed: {}", e));
+        // Check if download task is done
+        if let Some(handle) = &mut self.download_task {
+            if handle.is_finished() {
+                let result = handle.await;
+                self.download_task = None;
+                self.download_progress_rx = None;
+
+                match result {
+                    Ok(Ok(path)) => {
+                        self.browser_state.phase = BrowserPhase::Results;
+                        self.browser_state.download_progress = None;
+                        self.browser_state.download_filename = None;
+                        self.browser_state.status_message =
+                            Some(format!("Downloaded to: {}", path.display()));
+                        self.refresh_models();
+                        self.server_panel_state.refresh_models(&self.config);
+                    }
+                    Ok(Err(e)) => {
+                        self.browser_state.phase = BrowserPhase::Results;
+                        self.browser_state.download_progress = None;
+                        self.browser_state.download_filename = None;
+                        self.browser_state.status_message = Some(format!("Download failed: {}", e));
+                    }
+                    Err(e) => {
+                        self.browser_state.phase = BrowserPhase::Results;
+                        self.browser_state.download_progress = None;
+                        self.browser_state.download_filename = None;
+                        self.browser_state.status_message = Some(format!("Task failed: {}", e));
+                    }
+                }
             }
         }
     }
@@ -579,14 +642,18 @@ impl TuiApp {
             "/browser" => {
                 self.mode = AppMode::Browser;
             }
+            "/server" => {
+                self.mode = AppMode::Server;
+                self.server_panel_state.refresh_models(&self.config);
+            }
             "/settings" => {
                 self.mode = AppMode::Settings;
             }
             "/help" => {
                 self.chat_state.add_message(
                     "system",
-                    "Commands: /clear, /model, /models, /browser, /settings, /help, /quit\n\
-                     F1: Chat | F2: Models | F3: Browser | F4: Settings | Ctrl+C: Quit",
+                    "Commands: /clear, /model, /models, /browser, /server, /settings, /help, /quit\n\
+                     F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | Ctrl+C: Quit",
                 );
             }
             "/quit" => {
@@ -637,6 +704,173 @@ impl TuiApp {
             Err(e) => {
                 self.chat_state
                     .add_message("system", &format!("Failed to load model: {}", e));
+            }
+        }
+    }
+
+    async fn handle_server_key(&mut self, key: event::KeyEvent) {
+        if self.server_panel_state.editing {
+            match key.code {
+                KeyCode::Esc => {
+                    self.server_panel_state.cancel_edit();
+                }
+                KeyCode::Enter => {
+                    if let Err(e) = self.server_panel_state.save_edit() {
+                        self.server_panel_state.status_message = Some(e);
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.server_panel_state.edit_buffer.pop();
+                }
+                KeyCode::Char(c) => {
+                    if self.server_panel_state.edit_buffer == "[type to replace]" {
+                        self.server_panel_state.edit_buffer.clear();
+                    }
+                    self.server_panel_state.edit_buffer.push(c);
+                }
+                _ => {}
+            }
+        } else {
+            let field = self.server_panel_state.current_field().clone();
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.server_panel_state.next();
+                    self.server_panel_state.status_message = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.server_panel_state.previous();
+                    self.server_panel_state.status_message = None;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if field == ConfigField::ModelSelection {
+                        self.server_panel_state.select_model_prev();
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    if field == ConfigField::ModelSelection {
+                        self.server_panel_state.select_model_next();
+                    }
+                }
+                KeyCode::Enter => {
+                    if field.is_toggle() {
+                        self.server_panel_state.toggle();
+                    } else if field.is_editable() {
+                        self.server_panel_state.start_edit();
+                    } else if field == ConfigField::StartServer {
+                        self.start_server().await;
+                    } else if field == ConfigField::StopServer {
+                        self.stop_server();
+                    }
+                }
+                KeyCode::Esc => {
+                    self.mode = AppMode::Chat;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn start_server(&mut self) {
+        if self.server_panel_state.phase == ServerPhase::Running {
+            self.server_panel_state.status_message = Some("Server is already running".to_string());
+            return;
+        }
+
+        let model_path = match self.server_panel_state.selected_model_path() {
+            Some(p) => p,
+            None => {
+                self.server_panel_state.status_message =
+                    Some("No model selected. Use Left/Right to pick a model.".to_string());
+                return;
+            }
+        };
+
+        self.server_panel_state.phase = ServerPhase::LoadingModel;
+        self.server_panel_state.status_message = Some(format!("Loading model: {}...", model_path));
+
+        // Create backend and load model
+        let mut backend = match self.server_panel_state.create_backend() {
+            Ok(b) => b,
+            Err(e) => {
+                self.server_panel_state.phase = ServerPhase::Error;
+                self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                return;
+            }
+        };
+
+        let load_config = self.server_panel_state.build_load_config(&model_path);
+
+        if let Err(e) = backend.load_model(load_config).await {
+            self.server_panel_state.phase = ServerPhase::Error;
+            self.server_panel_state.status_message = Some(format!("Failed to load model: {}", e));
+            return;
+        }
+
+        // Get model info
+        let model_name = backend
+            .model_info()
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let backend_name = backend.name().to_string();
+
+        self.server_panel_state.loaded_model_name = Some(model_name.clone());
+        self.server_panel_state.loaded_backend_name = Some(backend_name.clone());
+
+        // Build config for server
+        let server_config = self.server_panel_state.build_app_config(&self.config);
+        let host = self.server_panel_state.host.clone();
+        let port = self.server_panel_state.port;
+
+        let api_server = athenas_server::ApiServer::new(server_config, backend);
+
+        self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
+        self.server_panel_state.phase = ServerPhase::Running;
+        self.server_panel_state.status_message = None;
+
+        let handle = tokio::spawn(async move { api_server.start(&host, port).await });
+
+        self.server_handle = Some(handle);
+    }
+
+    fn stop_server(&mut self) {
+        if self.server_panel_state.phase != ServerPhase::Running {
+            self.server_panel_state.status_message = Some("Server is not running".to_string());
+            return;
+        }
+
+        // Abort the server task
+        if let Some(handle) = self.server_handle.take() {
+            handle.abort();
+        }
+        self.server_panel_state.phase = ServerPhase::Configuring;
+        self.server_panel_state.server_url = None;
+        self.server_panel_state.loaded_model_name = None;
+        self.server_panel_state.loaded_backend_name = None;
+        self.server_panel_state.status_message = Some("Server stopped".to_string());
+    }
+
+    async fn poll_server_status(&mut self) {
+        if let Some(handle) = &mut self.server_handle {
+            if handle.is_finished() {
+                let result = handle.await;
+                self.server_handle = None;
+
+                match result {
+                    Ok(Ok(())) => {
+                        self.server_panel_state.phase = ServerPhase::Configuring;
+                        self.server_panel_state.server_url = None;
+                        self.server_panel_state.status_message = Some("Server stopped".to_string());
+                    }
+                    Ok(Err(e)) => {
+                        self.server_panel_state.phase = ServerPhase::Error;
+                        self.server_panel_state.server_url = None;
+                        self.server_panel_state.status_message =
+                            Some(format!("Server error: {}", e));
+                    }
+                    Err(_) => {
+                        // Aborted — already handled by stop_server
+                    }
+                }
             }
         }
     }

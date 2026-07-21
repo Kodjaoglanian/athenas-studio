@@ -8,6 +8,7 @@ use ratatui::{
 
 use crate::chat::ChatState;
 use crate::model_browser::{BrowserPhase, ModelBrowserState};
+use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
 pub fn render_chat_area(f: &mut Frame, area: Rect, state: &ChatState) {
@@ -183,7 +184,7 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
 }
 
 pub fn render_tab_bar(f: &mut Frame, area: Rect, active: usize) {
-    let tabs = ["Chat", "Models", "Browser", "Settings"];
+    let tabs = ["Chat", "Models", "Browser", "Server", "Settings"];
     let spans: Vec<Span> = tabs
         .iter()
         .enumerate()
@@ -510,6 +511,321 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+pub fn render_server_panel(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7), // Hardware info banner
+            Constraint::Min(3),    // Config fields
+            Constraint::Length(3), // Status bar
+        ])
+        .split(area);
+
+    render_hardware_banner(f, chunks[0], state);
+    render_config_fields(f, chunks[1], state);
+    render_server_status_bar(f, chunks[2], state);
+}
+
+fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Hardware ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let cpu_threads = state.hardware.cpus;
+    lines.push(Line::from(vec![
+        Span::styled(" CPU: ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{} threads", cpu_threads),
+            Style::default().fg(Color::White),
+        ),
+        Span::raw("  "),
+        Span::styled("Mem: ", Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{} MB", state.hardware.memory_total_mb),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+
+    let gpu_str = if state.hardware.gpus.is_empty() {
+        "None (CPU-only)".to_string()
+    } else {
+        state
+            .hardware
+            .gpus
+            .iter()
+            .map(|g| format!("{} ({} MB)", g.name, g.vram_total_mb))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(" GPU: ", Style::default().fg(Color::Yellow)),
+        Span::styled(gpu_str, Style::default().fg(Color::White)),
+    ]));
+
+    let status_line = match &state.phase {
+        ServerPhase::Configuring => Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(Color::Yellow)),
+            Span::styled("Configuring", Style::default().fg(Color::Gray)),
+        ]),
+        ServerPhase::LoadingModel => Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "Loading model...",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        ServerPhase::Running => {
+            let url = state.server_url.as_deref().unwrap_or("?");
+            let model = state.loaded_model_name.as_deref().unwrap_or("unknown");
+            Line::from(vec![
+                Span::styled(" Status: ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    "RUNNING",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled("URL: ", Style::default().fg(Color::Yellow)),
+                Span::styled(url, Style::default().fg(Color::Cyan)),
+                Span::raw("  "),
+                Span::styled("Model: ", Style::default().fg(Color::Yellow)),
+                Span::styled(model, Style::default().fg(Color::White)),
+            ])
+        }
+        ServerPhase::Error => Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(Color::Yellow)),
+            Span::styled("ERROR", Style::default().fg(Color::Red)),
+        ]),
+    };
+    lines.push(status_line);
+
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Server Configuration — Enter to edit/toggle, Up/Down to navigate ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut current_section = "";
+
+    for (i, field) in state.fields.iter().enumerate() {
+        let section = field.section();
+        if section != current_section {
+            current_section = section;
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(" {} ", section),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                " ─────────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        let is_selected = i == state.selected;
+        let prefix = if is_selected { " > " } else { "   " };
+
+        // Special rendering for model selection
+        if *field == ConfigField::ModelSelection {
+            let value = if state.models.is_empty() {
+                "No models found — use F3 to download".to_string()
+            } else {
+                state
+                    .models
+                    .get(state.model_selected)
+                    .map(|m| {
+                        let q = m
+                            .quantization
+                            .as_ref()
+                            .map(|q| format!(" [{}]", q))
+                            .unwrap_or_default();
+                        format!("{}{} ({})", m.name, q, m.format_size())
+                    })
+                    .unwrap_or_default()
+            };
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+
+            lines.push(Line::styled(
+                format!("{}{: <16}: {}", prefix, field.label(), value),
+                style,
+            ));
+
+            if is_selected && !state.editing {
+                lines.push(Line::styled(
+                    "     hint: Left/Right to cycle models",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            continue;
+        }
+
+        // Special rendering for action buttons
+        if field.is_action() {
+            let is_start = *field == ConfigField::StartServer;
+            let is_stop = *field == ConfigField::StopServer;
+
+            let (action_color, action_text) = if is_start {
+                if state.phase == ServerPhase::Running {
+                    (Color::DarkGray, "● Server is running")
+                } else if state.phase == ServerPhase::LoadingModel {
+                    (Color::Cyan, "⟳ Loading model...")
+                } else {
+                    (Color::Green, "▶ Start Server")
+                }
+            } else if is_stop {
+                if state.phase == ServerPhase::Running {
+                    (Color::Red, "■ Stop Server")
+                } else {
+                    (Color::DarkGray, "■ Server not running")
+                }
+            } else {
+                (Color::Gray, "")
+            };
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(action_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(action_color)
+            };
+
+            lines.push(Line::styled(format!("{}  {}", prefix, action_text), style));
+            continue;
+        }
+
+        let value = if state.editing && is_selected {
+            format!("{}|", state.edit_buffer)
+        } else {
+            state.field_value(field)
+        };
+
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let value_style = if field.is_toggle() {
+            let v = state.field_value(field);
+            if v == "ON" {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            }
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{}{: <16}: ", prefix, field.label()), style),
+            Span::styled(value, value_style),
+        ]));
+
+        if is_selected && !state.editing {
+            lines.push(Line::styled(
+                format!("     hint: {}", state.field_hint(field)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    // Show endpoints when running
+    if state.phase == ServerPhase::Running {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            " ENDPOINTS",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            "   POST /v1/chat/completions   GET /v1/models",
+            Style::default().fg(Color::Gray),
+        ));
+        lines.push(Line::styled(
+            "   POST /v1/completions        GET /v1/health",
+            Style::default().fg(Color::Gray),
+        ));
+        lines.push(Line::styled(
+            "   GET /v1/ready               GET /metrics",
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    let p = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_server_status_bar(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    let status = if state.editing {
+        " Enter: Save | Esc: Cancel | Type to edit ".to_string()
+    } else if let Some(ref msg) = state.status_message {
+        msg.clone()
+    } else if state.phase == ServerPhase::Running {
+        format!(
+            " Server running on {} | Enter on Stop to halt ",
+            state.server_url.as_deref().unwrap_or("?")
+        )
+    } else {
+        " Up/Down: Navigate | Enter: Edit/Toggle/Action | Left/Right: Cycle Model | F5: Server "
+            .to_string()
+    };
+
+    let color = if state
+        .status_message
+        .as_ref()
+        .is_some_and(|m| m.starts_with("Error") || m.starts_with("["))
+    {
+        Color::Red
+    } else if state.phase == ServerPhase::Running {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+
+    let status_bar = Paragraph::new(status)
+        .style(Style::default().fg(color).bg(Color::Black))
+        .alignment(Alignment::Center);
+    f.render_widget(status_bar, area);
 }
 
 pub fn render_sidebar(

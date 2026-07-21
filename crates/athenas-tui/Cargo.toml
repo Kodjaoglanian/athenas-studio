@@ -8,6 +8,7 @@ license.workspace = true
 athenas-core = { workspace = true }
 athenas-inference = { workspace = true }
 athenas-hub = { workspace = true }
+athenas-server = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 tui-textarea = { workspace = true }

@@ -52,7 +52,7 @@ impl HuggingFaceClient {
     pub fn new(token: Option<String>) -> Self {
         let token = token.or_else(|| std::env::var("HF_TOKEN").ok());
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(30))
             .user_agent("athenas-studio/0.1")
             .build()
             .unwrap();
