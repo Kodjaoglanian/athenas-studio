@@ -2,15 +2,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use athenas_core::{AthenasError, Result};
 
 use crate::client::HuggingFaceClient;
 
 const WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB write buffer
-const PARALLEL_CHUNKS: u64 = 4; // Number of parallel download connections
+const PARALLEL_CHUNKS: u64 = 8; // Number of parallel download connections
 const MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MB minimum chunk size
 
 #[derive(Debug, Clone)]
@@ -72,28 +71,36 @@ impl ModelDownloader {
 
     async fn check_range_support(&self, url: &str) -> Result<bool> {
         let client = self.client.client().clone();
-        let mut req = client.head(url);
+        let mut req = client.get(url).header("Range", "bytes=0-0");
         if let Some(token) = self.client.token() {
             req = req.bearer_auth(token);
         }
         let resp = req
             .send()
             .await
-            .map_err(|e| AthenasError::Download(format!("HEAD request failed: {}", e)))?;
+            .map_err(|e| AthenasError::Download(format!("Range probe failed: {}", e)))?;
 
-        if !resp.status().is_success() {
-            return Ok(false);
+        let status = resp.status();
+        debug!("Range probe status: {}", status);
+        debug!("Response headers: {:?}", resp.headers());
+
+        // 206 Partial Content means server supports Range requests
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            // Extract total size from Content-Range header: "bytes 0-0/12345"
+            if let Some(cr) = resp.headers().get("content-range") {
+                if let Ok(s) = cr.to_str() {
+                    debug!("Content-Range: {}", s);
+                }
+            }
+            return Ok(true);
         }
 
-        // Check Accept-Ranges header
-        let accepts = resp
-            .headers()
-            .get("accept-ranges")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let has_length = resp.content_length().is_some();
-
-        Ok(accepts.eq_ignore_ascii_case("bytes") && has_length)
+        // Some servers return 200 and ignore the Range header
+        warn!(
+            "Server does not support Range requests (status: {}), falling back to single-stream",
+            status
+        );
+        Ok(false)
     }
 
     async fn parallel_download(
@@ -102,24 +109,36 @@ impl ModelDownloader {
         file_path: &PathBuf,
         progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
     ) -> Result<PathBuf> {
-        // Get total file size from HEAD
         let client = self.client.client().clone();
-        let mut head_req = client.head(url);
-        if let Some(token) = self.client.token() {
-            head_req = head_req.bearer_auth(token);
+        let token = self.client.token().map(|t| t.to_string());
+
+        // Get total file size via a Range probe (bytes=0-0)
+        // Content-Range header format: "bytes 0-0/12345678"
+        let mut probe_req = client.get(url).header("Range", "bytes=0-0");
+        if let Some(ref t) = token {
+            probe_req = probe_req.bearer_auth(t);
         }
-        let head_resp = head_req
+        let probe_resp = probe_req
             .send()
             .await
-            .map_err(|e| AthenasError::Download(format!("HEAD request failed: {}", e)))?;
+            .map_err(|e| AthenasError::Download(format!("Range probe failed: {}", e)))?;
 
-        let total_bytes = head_resp
-            .content_length()
-            .ok_or_else(|| AthenasError::Download("No content-length in HEAD response".into()))?;
+        let total_bytes = probe_resp
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split('/').nth(1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| AthenasError::Download("No Content-Range in probe response".into()))?;
+
+        info!(
+            "File size: {} bytes ({:.1} MB)",
+            total_bytes,
+            total_bytes as f64 / (1024.0 * 1024.0)
+        );
 
         // Calculate chunk boundaries
         let num_chunks = if total_bytes / PARALLEL_CHUNKS < MIN_CHUNK_SIZE {
-            // File too small for parallel, use fewer chunks
             (total_bytes / MIN_CHUNK_SIZE).max(1)
         } else {
             PARALLEL_CHUNKS
@@ -129,20 +148,10 @@ impl ModelDownloader {
         let last_chunk_size = total_bytes - chunk_size * (num_chunks - 1);
 
         info!(
-            "File size: {} bytes, {} chunks of ~{} bytes each",
-            total_bytes, num_chunks, chunk_size
+            "Using {} parallel chunks of ~{:.1} MB each",
+            num_chunks,
+            chunk_size as f64 / (1024.0 * 1024.0)
         );
-
-        // Pre-allocate the file
-        let temp_path = file_path.with_extension("part");
-        {
-            let file = tokio::fs::File::create(&temp_path)
-                .await
-                .map_err(|e| AthenasError::Download(format!("Failed to create file: {}", e)))?;
-            file.set_len(total_bytes)
-                .await
-                .map_err(|e| AthenasError::Download(format!("Failed to set file length: {}", e)))?;
-        }
 
         // Shared progress counter
         let downloaded = Arc::new(AtomicU64::new(0));
@@ -154,7 +163,6 @@ impl ModelDownloader {
             let tx = tx.clone();
             let total = total_bytes;
             Some(tokio::spawn(async move {
-                let mut last_update = std::time::Instant::now();
                 let mut speed_window_bytes: u64 = 0;
                 let mut speed_window_start = std::time::Instant::now();
                 let mut last_downloaded: u64 = 0;
@@ -164,11 +172,6 @@ impl ModelDownloader {
 
                     let current = progress_downloaded.load(Ordering::Relaxed);
                     let now = std::time::Instant::now();
-
-                    if now.duration_since(last_update) < std::time::Duration::from_millis(200) {
-                        continue;
-                    }
-                    last_update = now;
 
                     let delta = current.saturating_sub(last_downloaded);
                     speed_window_bytes += delta;
@@ -210,8 +213,11 @@ impl ModelDownloader {
             None
         };
 
-        // Spawn download tasks for each chunk
+        // Each chunk downloads to its own temp file — no Mutex needed
+        let temp_dir = file_path.parent().unwrap_or(&file_path).to_path_buf();
         let mut tasks = Vec::new();
+        let mut chunk_paths = Vec::new();
+
         for i in 0..num_chunks {
             let start = i * chunk_size;
             let end = if i == num_chunks - 1 {
@@ -220,20 +226,22 @@ impl ModelDownloader {
                 start + chunk_size
             };
 
+            let chunk_path = temp_dir.join(format!(".athenas_chunk_{}", i));
+            chunk_paths.push(chunk_path.clone());
+
             let url = url.to_string();
-            let token = self.client.token().map(|t| t.to_string());
             let client = client.clone();
-            let temp_path = temp_path.clone();
             let downloaded = downloaded.clone();
+            let token = token.clone();
 
             tasks.push(tokio::spawn(async move {
-                download_chunk(
+                download_chunk_to_file(
                     &client,
                     &url,
                     token.as_deref(),
                     start,
                     end,
-                    &temp_path,
+                    &chunk_path,
                     downloaded,
                 )
                 .await
@@ -256,7 +264,9 @@ impl ModelDownloader {
         }
 
         if !errors.is_empty() {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            for p in &chunk_paths {
+                let _ = tokio::fs::remove_file(p).await;
+            }
             return Err(AthenasError::Download(format!(
                 "Parallel download failed: {}",
                 errors.join("; ")
@@ -266,11 +276,39 @@ impl ModelDownloader {
         // Verify size
         let final_downloaded = downloaded.load(Ordering::Relaxed);
         if final_downloaded != total_bytes {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+            for p in &chunk_paths {
+                let _ = tokio::fs::remove_file(p).await;
+            }
             return Err(AthenasError::Download(format!(
                 "Download incomplete: {} / {} bytes",
                 final_downloaded, total_bytes
             )));
+        }
+
+        // Concatenate chunk files into final file
+        info!("Concatenating {} chunk files...", num_chunks);
+        let temp_path = file_path.with_extension("part");
+        {
+            let mut out = tokio::fs::File::create(&temp_path).await.map_err(|e| {
+                AthenasError::Download(format!("Failed to create output file: {}", e))
+            })?;
+
+            for p in &chunk_paths {
+                let mut chunk_file = tokio::fs::File::open(p).await.map_err(|e| {
+                    AthenasError::Download(format!("Failed to open chunk file: {}", e))
+                })?;
+                tokio::io::copy(&mut chunk_file, &mut out)
+                    .await
+                    .map_err(|e| AthenasError::Download(format!("Concat error: {}", e)))?;
+            }
+            out.flush()
+                .await
+                .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
+        }
+
+        // Cleanup chunk files
+        for p in &chunk_paths {
+            let _ = tokio::fs::remove_file(p).await;
         }
 
         // Rename temp file to final
@@ -297,10 +335,11 @@ impl ModelDownloader {
         }
 
         info!(
-            "Downloaded {} ({} bytes) in {:.1}s",
+            "Downloaded {} ({} bytes) in {:.1}s ({:.1} MB/s avg)",
             file_path.file_name().unwrap_or_default().to_string_lossy(),
             total_bytes,
-            start_time.elapsed().as_secs_f64()
+            start_time.elapsed().as_secs_f64(),
+            (total_bytes as f64 / (1024.0 * 1024.0)) / start_time.elapsed().as_secs_f64()
         );
         Ok(file_path.clone())
     }
@@ -469,14 +508,15 @@ impl ModelDownloader {
     }
 }
 
-/// Download a single chunk using HTTP Range request and write it to the correct file offset.
-async fn download_chunk(
+/// Download a single chunk using HTTP Range request and write it to a dedicated temp file.
+/// Each chunk gets its own file — no Mutex or seeking needed, enabling true parallel I/O.
+async fn download_chunk_to_file(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
     start: u64,
     end: u64,
-    file_path: &PathBuf,
+    chunk_path: &PathBuf,
     downloaded: Arc<AtomicU64>,
 ) -> Result<()> {
     let range = format!("bytes={}-{}", start, end - 1);
@@ -490,7 +530,7 @@ async fn download_chunk(
         .await
         .map_err(|e| AthenasError::Download(format!("Chunk request failed: {}", e)))?;
 
-    if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         return Err(AthenasError::Download(format!(
@@ -502,20 +542,10 @@ async fn download_chunk(
     use futures::StreamExt;
     let mut stream = resp.bytes_stream();
 
-    // Open file and seek to the correct offset
-    let file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(file_path)
+    // Write to our own dedicated file — no lock contention
+    let mut writer = tokio::fs::File::create(chunk_path)
         .await
-        .map_err(|e| AthenasError::Download(format!("Failed to open file for chunk: {}", e)))?;
-
-    let file = Arc::new(Mutex::new(file));
-    let mut writer = file.lock().await;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-    writer
-        .seek(std::io::SeekFrom::Start(start))
-        .await
-        .map_err(|e| AthenasError::Download(format!("Seek error: {}", e)))?;
+        .map_err(|e| AthenasError::Download(format!("Failed to create chunk file: {}", e)))?;
 
     let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
 
@@ -547,5 +577,9 @@ async fn download_chunk(
         .await
         .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
 
+    debug!(
+        "Chunk bytes={}..{} downloaded to {:?}",
+        start, end, chunk_path
+    );
     Ok(())
 }
