@@ -39,12 +39,34 @@ pub struct ServerConfig {
     pub default_port: u16,
     pub cors_enabled: bool,
     pub api_key: Option<String>,
+    #[serde(default = "default_max_concurrent")]
     pub max_concurrent_requests: u32,
+    #[serde(default = "default_rate_limit")]
     pub rate_limit_per_second: u32,
+    #[serde(default = "default_timeout_secs")]
     pub request_timeout_secs: u64,
+    #[serde(default = "default_max_body_size")]
     pub max_body_size_mb: u32,
+    #[serde(default = "default_true")]
     pub enable_metrics: bool,
+    #[serde(default = "default_true")]
     pub enable_compression: bool,
+}
+
+fn default_max_concurrent() -> u32 {
+    10
+}
+fn default_rate_limit() -> u32 {
+    20
+}
+fn default_timeout_secs() -> u64 {
+    120
+}
+fn default_max_body_size() -> u32 {
+    10
+}
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
