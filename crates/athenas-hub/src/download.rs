@@ -6,6 +6,8 @@ use athenas_core::{AthenasError, Result};
 
 use crate::client::HuggingFaceClient;
 
+const WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB write buffer
+
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
     pub downloaded_bytes: u64,
@@ -79,26 +81,49 @@ impl ModelDownloader {
         let start_time = std::time::Instant::now();
         let mut last_update = std::time::Instant::now();
 
+        // Buffered writes: accumulate chunks into a 1 MB buffer before flushing to disk.
+        // This reduces syscalls dramatically vs writing every small network chunk.
+        let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
+
+        // Sliding window for instant speed calculation
+        let mut speed_window_bytes: u64 = 0;
+        let mut speed_window_start = std::time::Instant::now();
+
         while let Some(chunk_result) = stream.next().await {
             let chunk =
                 chunk_result.map_err(|e| AthenasError::Download(format!("Stream error: {}", e)))?;
 
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
-
+            write_buf.extend_from_slice(&chunk);
             downloaded += chunk.len() as u64;
+            speed_window_bytes += chunk.len() as u64;
+
+            // Flush write buffer when it reaches the threshold
+            if write_buf.len() >= WRITE_BUFFER_SIZE {
+                file.write_all(&write_buf)
+                    .await
+                    .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
+                write_buf.clear();
+            }
 
             if let Some(ref tx) = progress_tx {
                 let now = std::time::Instant::now();
-                if now.duration_since(last_update) > std::time::Duration::from_millis(100) {
+                if now.duration_since(last_update) > std::time::Duration::from_millis(200) {
                     last_update = now;
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    let speed_mbps = if elapsed > 0.0 {
-                        (downloaded as f64 / (1024.0 * 1024.0)) / elapsed
+
+                    // Instant speed: use sliding 2-second window
+                    let window_elapsed = speed_window_start.elapsed().as_secs_f64();
+                    let speed_mbps = if window_elapsed > 0.0 {
+                        (speed_window_bytes as f64 / (1024.0 * 1024.0)) / window_elapsed
                     } else {
                         0.0
                     };
+
+                    // Reset window every 2 seconds for responsive speed display
+                    if window_elapsed > 2.0 {
+                        speed_window_bytes = 0;
+                        speed_window_start = now;
+                    }
+
                     let percent = total_bytes.map(|t| (downloaded as f64 / t as f64) * 100.0);
 
                     let _ = tx
@@ -111,6 +136,13 @@ impl ModelDownloader {
                         .await;
                 }
             }
+        }
+
+        // Flush any remaining buffered data
+        if !write_buf.is_empty() {
+            file.write_all(&write_buf)
+                .await
+                .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
         }
 
         file.flush()

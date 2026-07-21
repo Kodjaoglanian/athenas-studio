@@ -15,6 +15,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 3
 
 jobs:
   create-release:
@@ -119,8 +121,14 @@ jobs:
           key: release-${{ matrix.target }}
           shared-key: release-build
 
+      - name: Cache cross binary
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-bin-${{ runner.os }}-${{ hashFiles('.github/workflows/release.yml') }}
       - name: Install cross
-        if: matrix.cross
+        if: matrix.cross && steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Build
@@ -133,6 +141,7 @@ jobs:
           fi
 
       - name: Prepare archive (Unix)
+        id: archive-unix
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
@@ -145,9 +154,10 @@ jobs:
           cp README.md "$STAGING/"
           cp LICENSE "$STAGING/"
           tar czf "$ARCHIVE" -C "$STAGING" .
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Prepare archive (Windows)
+        id: archive-win
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
@@ -160,32 +170,44 @@ jobs:
           Copy-Item "README.md" "$STAGING/"
           Copy-Item "LICENSE" "$STAGING/"
           Compress-Archive -Path "$STAGING/*" -DestinationPath $ARCHIVE
-          echo "ARCHIVE=$ARCHIVE" >> $env:GITHUB_ENV
+          echo "ARCHIVE=$ARCHIVE" >> $env:GITHUB_OUTPUT
+
+      - name: Set archive name
+        id: archive
+        shell: bash
+        run: |
+          if [ -n "${{ steps.archive-unix.outputs.ARCHIVE }}" ]; then
+            echo "name=${{ steps.archive-unix.outputs.ARCHIVE }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ steps.archive-win.outputs.ARCHIVE }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Generate SHA256 (Unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
+          ARCHIVE="${{ steps.archive.outputs.name }}"
           if command -v sha256sum &>/dev/null; then
-            sha256sum ${{ env.ARCHIVE }} > ${{ env.ARCHIVE }}.sha256
+            sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
           else
-            shasum -a 256 ${{ env.ARCHIVE }} > ${{ env.ARCHIVE }}.sha256
+            shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
           fi
 
       - name: Generate SHA256 (Windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $hash = (Get-FileHash ${{ env.ARCHIVE }} -Algorithm SHA256).Hash
-          "$hash  ${{ env.ARCHIVE }}" | Out-File -Encoding ascii ${{ env.ARCHIVE }}.sha256
+          $ARCHIVE = "${{ steps.archive.outputs.name }}"
+          $hash = (Get-FileHash $ARCHIVE -Algorithm SHA256).Hash
+          "$hash  $ARCHIVE" | Out-File -Encoding ascii "$ARCHIVE.sha256"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.create-release.outputs.version }}
           files: |
-            ${{ env.ARCHIVE }}
-            ${{ env.ARCHIVE }}.sha256
+            ${{ steps.archive.outputs.name }}
+            ${{ steps.archive.outputs.name }}.sha256
 
   publish-installers:
     name: Publish Install Scripts

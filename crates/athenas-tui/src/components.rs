@@ -436,7 +436,7 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
                 ));
             }
 
-            if let Some((downloaded, total)) = state.download_progress {
+            if let Some((downloaded, total, speed_mbps)) = state.download_progress {
                 let percent = if total > 0 {
                     (downloaded as f64 / total as f64 * 100.0) as u16
                 } else {
@@ -453,6 +453,10 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
                 lines.push(Line::styled(
                     format!(" {} / {} ({}%)", dl_str, total_str, percent),
                     Style::default().fg(Color::Cyan),
+                ));
+                lines.push(Line::styled(
+                    format!(" Speed: {:.2} MB/s", speed_mbps),
+                    Style::default().fg(Color::Green),
                 ));
 
                 let gauge = Gauge::default()

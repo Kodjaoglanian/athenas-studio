@@ -14,7 +14,7 @@ pub struct ModelBrowserState {
     pub results_selected: usize,
     pub gguf_only: bool,
     pub status_message: Option<String>,
-    pub download_progress: Option<(u64, u64)>,
+    pub download_progress: Option<(u64, u64, f64)>,
     pub download_filename: Option<String>,
     pub file_options: Vec<(String, Option<u64>)>,
     pub file_selected: usize,

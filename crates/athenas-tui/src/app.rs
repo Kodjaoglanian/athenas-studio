@@ -514,8 +514,11 @@ impl TuiApp {
 
         // Drain all pending progress updates (non-blocking)
         while let Ok(progress) = self.download_progress_rx.as_mut().unwrap().try_recv() {
-            self.browser_state.download_progress =
-                Some((progress.downloaded_bytes, progress.total_bytes.unwrap_or(0)));
+            self.browser_state.download_progress = Some((
+                progress.downloaded_bytes,
+                progress.total_bytes.unwrap_or(0),
+                progress.speed_mbps,
+            ));
         }
 
         // Check if download task is done

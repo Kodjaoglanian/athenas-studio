@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 3
 
 jobs:
   fmt:
@@ -89,6 +91,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: cross-${{ matrix.target }}
+      - name: Cache cross binary
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-bin-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
       - name: Install cross
+        if: steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
       - run: cross check --target ${{ matrix.target }} --all
