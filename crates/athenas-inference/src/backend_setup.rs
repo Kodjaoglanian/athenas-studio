@@ -106,10 +106,10 @@ async fn download_file(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Extract llama-server from a tar.gz archive.
+/// Extract all files from a tar.gz archive into bin_dir.
+/// Returns the path to llama-server.
 fn extract_tar_gz(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
     use flate2::read::GzDecoder;
-
     use tar::Archive;
 
     let decoder = GzDecoder::new(data);
@@ -121,6 +121,8 @@ fn extract_tar_gz(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
         "llama-server"
     };
 
+    let mut server_path = None;
+
     for entry in archive
         .entries()
         .map_err(|e| AthenasError::Backend(format!("Failed to read tar entries: {}", e)))?
@@ -128,33 +130,48 @@ fn extract_tar_gz(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
         let mut entry =
             entry.map_err(|e| AthenasError::Backend(format!("Failed to read tar entry: {}", e)))?;
 
-        let path = entry
+        let file_name = entry
             .path()
-            .map_err(|e| AthenasError::Backend(format!("Failed to get entry path: {}", e)))?;
+            .map_err(|e| AthenasError::Backend(format!("Failed to get entry path: {}", e)))?
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
 
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if file_name.is_empty() || file_name == "." || file_name == ".." {
+            continue;
+        }
+
+        // Extract all files flat into bin_dir (flatten directory structure)
+        let dest = bin_dir.join(&file_name);
+
+        // Preserve permissions (makes executables executable)
+        #[cfg(unix)]
+        {
+            entry.set_preserve_permissions(true);
+        }
+
+        entry.unpack(&dest).map_err(|e| {
+            AthenasError::Backend(format!("Failed to extract {}: {}", file_name, e))
+        })?;
 
         if file_name == server_name {
-            let dest = bin_dir.join(server_name);
-            entry.unpack(&dest).map_err(|e| {
-                AthenasError::Backend(format!("Failed to extract llama-server: {}", e))
-            })?;
-            return Ok(dest);
+            server_path = Some(dest);
         }
     }
 
-    Err(AthenasError::Backend(
-        "llama-server not found in archive".into(),
-    ))
+    server_path.ok_or_else(|| AthenasError::Backend("llama-server not found in archive".into()))
 }
 
-/// Extract llama-server from a zip archive (Windows).
+/// Extract all files from a zip archive into bin_dir.
+/// Returns the path to llama-server.exe.
 fn extract_zip(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor)
         .map_err(|e| AthenasError::Backend(format!("Failed to open zip: {}", e)))?;
 
     let server_name = "llama-server.exe";
+    let mut server_path = None;
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -163,19 +180,33 @@ fn extract_zip(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
 
         let name = file.name().to_string();
 
-        if name.ends_with(server_name) {
-            let dest = bin_dir.join(server_name);
-            let mut out = std::fs::File::create(&dest)
-                .map_err(|e| AthenasError::Backend(format!("Failed to create file: {}", e)))?;
-            std::io::copy(&mut file, &mut out)
-                .map_err(|e| AthenasError::Backend(format!("Failed to write file: {}", e)))?;
-            return Ok(dest);
+        // Skip directories
+        if name.ends_with('/') {
+            continue;
+        }
+
+        // Flatten: just take the file name (strip any directory prefix)
+        let file_name = std::path::Path::new(&name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if file_name.is_empty() {
+            continue;
+        }
+
+        let dest = bin_dir.join(file_name);
+        let mut out = std::fs::File::create(&dest)
+            .map_err(|e| AthenasError::Backend(format!("Failed to create {}: {}", file_name, e)))?;
+        std::io::copy(&mut file, &mut out)
+            .map_err(|e| AthenasError::Backend(format!("Failed to write {}: {}", file_name, e)))?;
+
+        if file_name == server_name {
+            server_path = Some(dest);
         }
     }
 
-    Err(AthenasError::Backend(
-        "llama-server.exe not found in zip".into(),
-    ))
+    server_path.ok_or_else(|| AthenasError::Backend("llama-server.exe not found in zip".into()))
 }
 
 /// Auto-download and install llama-server to ~/.athenas/bin/
@@ -242,12 +273,25 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
 
     // Verify the binary actually works
     info!("Verifying llama-server binary...");
-    let verify = tokio::process::Command::new(&extracted_path)
+    let mut verify_cmd = tokio::process::Command::new(&extracted_path);
+    verify_cmd
         .arg("--version")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+        .stderr(std::process::Stdio::piped());
+
+    // Set LD_LIBRARY_PATH so it finds shared libs in the same dir
+    if let Some(parent) = extracted_path.parent() {
+        let lib_path = parent.to_string_lossy().to_string();
+        let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let new_ld_path = if existing.is_empty() {
+            lib_path
+        } else {
+            format!("{}:{}", lib_path, existing)
+        };
+        verify_cmd.env("LD_LIBRARY_PATH", new_ld_path);
+    }
+
+    let verify = verify_cmd.output().await;
 
     match verify {
         Ok(output) if output.status.success() => {

@@ -70,7 +70,23 @@ impl LlamaCppBackend {
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
         let server_bin = if let Some(path) = self.find_llama_server() {
-            path
+            // Validate: if it's in ~/.athenas/bin, check for shared libs
+            let p = std::path::Path::new(&path);
+            if let Some(parent) = p.parent() {
+                let needs_lib = std::env::consts::OS == "linux" || std::env::consts::OS == "macos";
+                let has_lib = parent.join("libllama-server-impl.so").exists()
+                    || parent.join("libllama-server-impl.dylib").exists();
+                if needs_lib && !has_lib && path.contains(".athenas") {
+                    info!("llama-server found but shared libs missing, re-downloading...");
+                    let _ = std::fs::remove_file(&path);
+                    let new_path = crate::backend_setup::ensure_llama_server().await?;
+                    new_path.to_string_lossy().to_string()
+                } else {
+                    path
+                }
+            } else {
+                path
+            }
         } else {
             info!("llama-server not found, auto-downloading...");
             let path = crate::backend_setup::ensure_llama_server().await?;
@@ -80,6 +96,20 @@ impl LlamaCppBackend {
         self.server_port = find_free_port();
 
         let mut cmd = tokio::process::Command::new(&server_bin);
+
+        // Set LD_LIBRARY_PATH to the directory containing llama-server
+        // so it can find shared libraries (libllama-server-impl.so, etc.)
+        if let Some(parent) = std::path::Path::new(&server_bin).parent() {
+            let lib_path = parent.to_string_lossy().to_string();
+            let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld_path = if existing.is_empty() {
+                lib_path
+            } else {
+                format!("{}:{}", lib_path, existing)
+            };
+            cmd.env("LD_LIBRARY_PATH", new_ld_path);
+        }
+
         cmd.arg("--model")
             .arg(&config.model_path)
             .arg("--ctx-size")
