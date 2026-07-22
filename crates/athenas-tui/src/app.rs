@@ -377,6 +377,7 @@ impl TuiApp {
                     let query = self.browser_state.search_input.trim().to_string();
                     if !query.is_empty() {
                         self.browser_state.status_message = Some("Searching...".to_string());
+                        self.browser_state.status_is_error = false;
                         self.perform_search(&query).await;
                     }
                 }
@@ -408,6 +409,7 @@ impl TuiApp {
                     if let Some(result) = self.browser_state.selected_result() {
                         let repo_id = result.id.clone();
                         self.browser_state.status_message = Some("Loading files...".to_string());
+                        self.browser_state.status_is_error = false;
                         self.list_files(&repo_id).await;
                     }
                 }
@@ -445,6 +447,7 @@ impl TuiApp {
                         self.browser_state.download_filename = Some(filename.clone());
                         self.browser_state.download_progress = None;
                         self.browser_state.status_message = None;
+                        self.browser_state.status_is_error = false;
                         self.start_download(&repo_id, &filename);
                     }
                 }
@@ -464,6 +467,7 @@ impl TuiApp {
                     self.browser_state.download_progress = None;
                     self.browser_state.download_filename = None;
                     self.browser_state.status_message = Some("Download cancelled".to_string());
+                    self.browser_state.status_is_error = false;
                 }
             }
         }
@@ -485,9 +489,11 @@ impl TuiApp {
                 self.browser_state.results_selected = 0;
                 self.browser_state.phase = BrowserPhase::Results;
                 self.browser_state.status_message = None;
+                self.browser_state.status_is_error = false;
             }
             Err(e) => {
                 self.browser_state.status_message = Some(format!("Search failed: {}", e));
+                self.browser_state.status_is_error = true;
             }
         }
     }
@@ -515,15 +521,18 @@ impl TuiApp {
                          Try searching for GGUF-quantized versions."
                             .to_string(),
                     );
+                    self.browser_state.status_is_error = true;
                 } else {
                     self.browser_state.file_options = gguf_files;
                     self.browser_state.file_selected = 0;
                     self.browser_state.phase = BrowserPhase::SelectFile;
                     self.browser_state.status_message = None;
+                    self.browser_state.status_is_error = false;
                 }
             }
             Err(e) => {
                 self.browser_state.status_message = Some(format!("Failed to list files: {}", e));
+                self.browser_state.status_is_error = true;
             }
         }
     }
@@ -577,6 +586,7 @@ impl TuiApp {
                         self.browser_state.download_filename = None;
                         self.browser_state.status_message =
                             Some(format!("Downloaded to: {}", path.display()));
+                        self.browser_state.status_is_error = false;
                         self.refresh_models();
                         self.server_panel_state.refresh_models(&self.config);
                     }
@@ -585,12 +595,14 @@ impl TuiApp {
                         self.browser_state.download_progress = None;
                         self.browser_state.download_filename = None;
                         self.browser_state.status_message = Some(format!("Download failed: {}", e));
+                        self.browser_state.status_is_error = true;
                     }
                     Err(e) => {
                         self.browser_state.phase = BrowserPhase::Results;
                         self.browser_state.download_progress = None;
                         self.browser_state.download_filename = None;
                         self.browser_state.status_message = Some(format!("Task failed: {}", e));
+                        self.browser_state.status_is_error = true;
                     }
                 }
             }
@@ -622,6 +634,7 @@ impl TuiApp {
         self.chat_state.add_message("user", &text);
         self.chat_state.input_text.clear();
         self.chat_state.is_generating = true;
+        self.chat_state.generation_start = Some(std::time::Instant::now());
 
         // Build chat request from current messages
         // Filter out ALL system messages — they are TUI informational messages
@@ -708,6 +721,21 @@ impl TuiApp {
     async fn poll_chat_stream(&mut self) {
         if !self.chat_state.is_generating {
             return;
+        }
+
+        // Timeout check: if generating for over 90s with no response, abort
+        if let Some(start) = self.chat_state.generation_start {
+            let elapsed = start.elapsed().as_secs();
+            if elapsed > 90 {
+                self.chat_state.add_message(
+                    "system",
+                    "Request timed out (90s). The model may not be responding. \
+                     Try a smaller model, reduce context size, or check server resources.",
+                );
+                self.chat_state.finalize_streaming();
+                self.chat_stream_rx = None;
+                return;
+            }
         }
 
         if let Some(rx) = &mut self.chat_stream_rx {
@@ -863,6 +891,8 @@ impl TuiApp {
             flash_attention: self.config.inference.flash_attention,
             use_mmap: true,
             use_mlock: false,
+            reasoning_enabled: self.config.inference.reasoning_enabled,
+            reasoning_budget: self.config.inference.reasoning_budget,
         };
 
         let task = tokio::spawn(async move {

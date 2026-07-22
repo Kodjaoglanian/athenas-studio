@@ -33,6 +33,12 @@ pub struct InferenceConfig {
     pub default_max_tokens: u32,
     #[serde(default = "default_true")]
     pub streaming_enabled: bool,
+    /// Enable reasoning/thinking mode for models that support it (Qwen3.5, DeepSeek R1, etc.)
+    #[serde(default = "default_true")]
+    pub reasoning_enabled: bool,
+    /// Token budget for thinking: -1 for unrestricted, 0 for disabled, N>0 for specific budget
+    #[serde(default = "default_reasoning_budget")]
+    pub reasoning_budget: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +75,9 @@ fn default_max_body_size() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_reasoning_budget() -> i32 {
+    -1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +134,8 @@ impl Default for AppConfig {
                 default_top_p: 0.9,
                 default_max_tokens: 2048,
                 streaming_enabled: true,
+                reasoning_enabled: true,
+                reasoning_budget: -1,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),

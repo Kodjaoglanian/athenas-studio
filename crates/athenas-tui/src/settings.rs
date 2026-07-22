@@ -6,10 +6,15 @@ pub enum SettingsField {
     Backend,
     GpuLayers,
     ContextSize,
+    BatchSize,
+    Threads,
     Temperature,
+    TopP,
     MaxTokens,
     FlashAttention,
     Streaming,
+    Reasoning,
+    ReasoningBudget,
     ServerHost,
     ServerPort,
     ServerApiKey,
@@ -22,10 +27,15 @@ impl SettingsField {
             SettingsField::Backend,
             SettingsField::GpuLayers,
             SettingsField::ContextSize,
+            SettingsField::BatchSize,
+            SettingsField::Threads,
             SettingsField::Temperature,
+            SettingsField::TopP,
             SettingsField::MaxTokens,
             SettingsField::FlashAttention,
             SettingsField::Streaming,
+            SettingsField::Reasoning,
+            SettingsField::ReasoningBudget,
             SettingsField::ServerHost,
             SettingsField::ServerPort,
             SettingsField::ServerApiKey,
@@ -38,10 +48,15 @@ impl SettingsField {
             SettingsField::Backend => "Backend",
             SettingsField::GpuLayers => "GPU Layers",
             SettingsField::ContextSize => "Context Size",
+            SettingsField::BatchSize => "Batch Size",
+            SettingsField::Threads => "Threads",
             SettingsField::Temperature => "Temperature",
+            SettingsField::TopP => "Top P",
             SettingsField::MaxTokens => "Max Tokens",
             SettingsField::FlashAttention => "Flash Attention",
             SettingsField::Streaming => "Streaming",
+            SettingsField::Reasoning => "Reasoning/Thinking",
+            SettingsField::ReasoningBudget => "Reasoning Budget",
             SettingsField::ServerHost => "Server Host",
             SettingsField::ServerPort => "Server Port",
             SettingsField::ServerApiKey => "Server API Key",
@@ -54,10 +69,15 @@ impl SettingsField {
             SettingsField::Backend
             | SettingsField::GpuLayers
             | SettingsField::ContextSize
+            | SettingsField::BatchSize
+            | SettingsField::Threads
             | SettingsField::Temperature
+            | SettingsField::TopP
             | SettingsField::MaxTokens
             | SettingsField::FlashAttention
-            | SettingsField::Streaming => "Inference",
+            | SettingsField::Streaming
+            | SettingsField::Reasoning
+            | SettingsField::ReasoningBudget => "Inference",
             SettingsField::ServerHost | SettingsField::ServerPort | SettingsField::ServerApiKey => {
                 "Server"
             }
@@ -152,10 +172,23 @@ impl SettingsState {
                 self.config.inference.default_context_size =
                     value.parse().map_err(|_| "Must be a number".to_string())?;
             }
+            SettingsField::BatchSize => {
+                self.config.inference.default_batch_size =
+                    value.parse().map_err(|_| "Must be a number".to_string())?;
+            }
+            SettingsField::Threads => {
+                self.config.inference.default_threads =
+                    value.parse().map_err(|_| "Must be a number (0 = auto)".to_string())?;
+            }
             SettingsField::Temperature => {
                 self.config.inference.default_temperature = value
                     .parse()
                     .map_err(|_| "Must be a float (0.0-2.0)".to_string())?;
+            }
+            SettingsField::TopP => {
+                self.config.inference.default_top_p = value
+                    .parse()
+                    .map_err(|_| "Must be a float (0.0-1.0)".to_string())?;
             }
             SettingsField::MaxTokens => {
                 self.config.inference.default_max_tokens =
@@ -166,6 +199,14 @@ impl SettingsState {
             }
             SettingsField::Streaming => {
                 self.config.inference.streaming_enabled = value == "true" || value == "1";
+            }
+            SettingsField::Reasoning => {
+                self.config.inference.reasoning_enabled = value == "true" || value == "1";
+            }
+            SettingsField::ReasoningBudget => {
+                self.config.inference.reasoning_budget = value
+                    .parse()
+                    .map_err(|_| "-1 = unlimited, 0 = disabled, N = token budget".to_string())?;
             }
             SettingsField::ServerHost => {
                 self.config.server.default_host = value;
@@ -202,7 +243,10 @@ impl SettingsState {
             SettingsField::Backend => self.config.inference.default_backend.to_string(),
             SettingsField::GpuLayers => self.config.inference.default_gpu_layers.to_string(),
             SettingsField::ContextSize => self.config.inference.default_context_size.to_string(),
+            SettingsField::BatchSize => self.config.inference.default_batch_size.to_string(),
+            SettingsField::Threads => self.config.inference.default_threads.to_string(),
             SettingsField::Temperature => self.config.inference.default_temperature.to_string(),
+            SettingsField::TopP => self.config.inference.default_top_p.to_string(),
             SettingsField::MaxTokens => self.config.inference.default_max_tokens.to_string(),
             SettingsField::FlashAttention => {
                 if self.config.inference.flash_attention {
@@ -218,6 +262,14 @@ impl SettingsState {
                     "false".to_string()
                 }
             }
+            SettingsField::Reasoning => {
+                if self.config.inference.reasoning_enabled {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+            SettingsField::ReasoningBudget => self.config.inference.reasoning_budget.to_string(),
             SettingsField::ServerHost => self.config.server.default_host.clone(),
             SettingsField::ServerPort => self.config.server.default_port.to_string(),
             SettingsField::ServerApiKey => {
@@ -236,10 +288,15 @@ impl SettingsState {
             SettingsField::Backend => "llama.cpp | vllm | auto",
             SettingsField::GpuLayers => "-1 for all GPU layers",
             SettingsField::ContextSize => "e.g. 4096",
+            SettingsField::BatchSize => "e.g. 256 (larger = faster but more RAM)",
+            SettingsField::Threads => "0 = auto (uses CPU count - 1)",
             SettingsField::Temperature => "0.0 - 2.0",
+            SettingsField::TopP => "0.0 - 1.0 (nucleus sampling)",
             SettingsField::MaxTokens => "e.g. 2048",
             SettingsField::FlashAttention => "true | false",
             SettingsField::Streaming => "true | false (show text as it generates)",
+            SettingsField::Reasoning => "true | false (disable for Qwen3.5 to avoid hangs)",
+            SettingsField::ReasoningBudget => "-1 = unlimited, 0 = off, N = token limit",
             SettingsField::ServerHost => "e.g. 127.0.0.1",
             SettingsField::ServerPort => "e.g. 8080",
             SettingsField::ServerApiKey => "Leave empty to disable auth",

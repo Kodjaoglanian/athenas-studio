@@ -130,6 +130,8 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             flash_attention: config.inference.flash_attention,
             use_mmap: true,
             use_mlock: false,
+            reasoning_enabled: config.inference.reasoning_enabled,
+            reasoning_budget: config.inference.reasoning_budget,
         })
         .await?;
     let load_time = load_start.elapsed();

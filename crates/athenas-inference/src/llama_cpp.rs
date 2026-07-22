@@ -21,6 +21,10 @@ pub struct LlamaCppBackend {
     server_handle: Option<tokio::process::Child>,
     server_port: u16,
     client: reqwest::Client,
+    /// Set to true if --reasoning flag caused server to fail, so we skip it on retry
+    skip_reasoning_flag: bool,
+    /// Whether reasoning/thinking mode is enabled (from config)
+    reasoning_enabled: bool,
 }
 
 impl LlamaCppBackend {
@@ -39,6 +43,8 @@ impl LlamaCppBackend {
                 .http1_only()
                 .build()
                 .unwrap(),
+            skip_reasoning_flag: false,
+            reasoning_enabled: true,
         }
     }
 
@@ -133,6 +139,9 @@ impl LlamaCppBackend {
 
         self.server_port = find_free_port();
 
+        // Store reasoning config for use in chat requests
+        self.reasoning_enabled = config.reasoning_enabled;
+
         let mut cmd = tokio::process::Command::new(&server_bin);
 
         // Set LD_LIBRARY_PATH to the directory containing llama-server
@@ -168,6 +177,19 @@ impl LlamaCppBackend {
             .arg("--warmup")
             .arg("--jinja")
             .arg("--metrics");
+
+        // Reasoning/thinking mode — configurable per model.
+        // Models like Qwen3.5 can hang or produce extremely long thinking
+        // traces. Use --reasoning off and --reasoning-budget 0 when disabled.
+        // Skip if these flags caused a previous failure (unsupported version).
+        if !self.skip_reasoning_flag {
+            if !config.reasoning_enabled {
+                cmd.arg("--reasoning").arg("off");
+                cmd.arg("--reasoning-budget").arg("0");
+            } else if config.reasoning_budget >= 0 {
+                cmd.arg("--reasoning-budget").arg(config.reasoning_budget.to_string());
+            }
+        }
 
         if config.gpu_layers >= 0 {
             cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
@@ -224,6 +246,20 @@ impl LlamaCppBackend {
                         if !stderr_msg.is_empty() {
                             msg.push_str(&format!("\nstderr: {}", stderr_msg));
                         }
+
+                        // Check if --reasoning flags are unsupported by this version
+                        if (stderr_msg.contains("reasoning") || stderr_msg.contains("unrecognized"))
+                            && !self.skip_reasoning_flag
+                        {
+                            info!("--reasoning flag not supported, retrying without it...");
+                            self.skip_reasoning_flag = true;
+                            if let Some(ref mut child) = self.server_handle {
+                                let _ = child.kill().await;
+                            }
+                            self.server_handle = None;
+                            return self.retry_start_server(config).await;
+                        }
+
                         if status.code() == Some(127) {
                             // Check if it's libgomp missing — try to auto-install
                             if stderr_msg.contains("libgomp.so.1") {
@@ -428,6 +464,7 @@ impl Backend for LlamaCppBackend {
             "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": false,
             "stop": request.stop.as_deref().unwrap_or(&[]),
+            "chat_template_kwargs": {"enable_thinking": self.reasoning_enabled},
         });
 
         let url = format!("{}/v1/chat/completions", self.server_url());
@@ -461,6 +498,20 @@ impl Backend for LlamaCppBackend {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // If content is empty, try reasoning_content (Qwen3.5 thinking mode)
+        let content = if content.is_empty() {
+            result
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("reasoning_content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        } else {
+            content
+        };
 
         let usage = result.get("usage");
         let tokens_prompt = usage
@@ -520,6 +571,7 @@ impl Backend for LlamaCppBackend {
             "stream_options": {"include_usage": true},
             "timings_per_token": true,
             "stop": request.stop.as_deref().unwrap_or(&[]),
+            "chat_template_kwargs": {"enable_thinking": self.reasoning_enabled},
         });
 
         let url = format!("{}/v1/chat/completions", self.server_url());
@@ -527,6 +579,7 @@ impl Backend for LlamaCppBackend {
             .client
             .post(&url)
             .header("Accept-Encoding", "identity")
+            .timeout(std::time::Duration::from_secs(120))
             .json(&body)
             .send()
             .await
@@ -612,14 +665,47 @@ impl Backend for LlamaCppBackend {
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    // OpenAI format: choices[0].delta.content
-                    let content = json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("delta"))
+                    let choices = json.get("choices").and_then(|c| c.get(0));
+                    let delta = choices.and_then(|c| c.get("delta"));
+
+                    // Read both content and reasoning_content.
+                    // Qwen3.5 and similar models put thinking tokens in
+                    // reasoning_content — if we only read content, the model
+                    // appears to hang while it generates internal reasoning.
+                    let content = delta
                         .and_then(|d| d.get("content"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    let reasoning = delta
+                        .and_then(|d| d.get("reasoning_content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Send reasoning tokens (if any) with a visual prefix
+                    // so the user sees the model is working.
+                    if !reasoning.is_empty() {
+                        token_count += 1;
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        let tps = if elapsed > 0.0 {
+                            token_count as f32 / elapsed
+                        } else {
+                            0.0
+                        };
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: reasoning.to_string(),
+                                done: false,
+                                stats: Some(InferenceStats {
+                                    tokens_generated: token_count,
+                                    tokens_prompt: 0,
+                                    time_total_ms: (elapsed * 1000.0) as u64,
+                                    tokens_per_second: tps,
+                                }),
+                            })
+                            .await;
+                    }
+
+                    // Send actual content tokens
                     if !content.is_empty() {
                         full_text.push_str(content);
                         token_count += 1;
@@ -831,6 +917,8 @@ impl Backend for LlamaCppBackend {
             server_handle: None, // Child is not Clone; not needed for streaming
             server_port: self.server_port,
             client: self.client.clone(),
+            skip_reasoning_flag: self.skip_reasoning_flag,
+            reasoning_enabled: self.reasoning_enabled,
         })
     }
 }

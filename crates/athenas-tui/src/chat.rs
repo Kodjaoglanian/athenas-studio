@@ -13,6 +13,7 @@ pub struct ChatState {
     pub current_backend: Option<String>,
     pub tokens_per_second: Option<f32>,
     pub streaming_text: String,
+    pub generation_start: Option<std::time::Instant>,
 }
 
 impl Default for ChatState {
@@ -29,6 +30,7 @@ impl Default for ChatState {
             current_backend: None,
             tokens_per_second: None,
             streaming_text: String::new(),
+            generation_start: None,
         }
     }
 }
@@ -45,6 +47,7 @@ impl ChatState {
         self.messages.clear();
         self.streaming_text.clear();
         self.is_generating = false;
+        self.generation_start = None;
     }
 
     pub fn append_streaming(&mut self, text: &str) {
@@ -57,5 +60,6 @@ impl ChatState {
             self.streaming_text.clear();
         }
         self.is_generating = false;
+        self.generation_start = None;
     }
 }

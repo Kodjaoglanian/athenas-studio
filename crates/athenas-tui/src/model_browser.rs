@@ -14,6 +14,7 @@ pub struct ModelBrowserState {
     pub results_selected: usize,
     pub gguf_only: bool,
     pub status_message: Option<String>,
+    pub status_is_error: bool,
     pub download_progress: Option<(u64, u64, f64)>,
     pub download_filename: Option<String>,
     pub file_options: Vec<(String, Option<u64>)>,
@@ -29,6 +30,7 @@ impl Default for ModelBrowserState {
             results_selected: 0,
             gguf_only: true,
             status_message: None,
+            status_is_error: false,
             download_progress: None,
             download_filename: None,
             file_options: Vec::new(),
@@ -80,11 +82,13 @@ impl ModelBrowserState {
         self.search_results.clear();
         self.results_selected = 0;
         self.status_message = None;
+        self.status_is_error = false;
     }
 
     /// Go back to search editing phase, keeping the current query text.
     pub fn back_to_search_edit(&mut self) {
         self.phase = BrowserPhase::Search;
         self.status_message = None;
+        self.status_is_error = false;
     }
 }

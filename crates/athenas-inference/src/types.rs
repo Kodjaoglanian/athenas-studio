@@ -125,6 +125,8 @@ pub struct ModelLoadConfig {
     pub flash_attention: bool,
     pub use_mmap: bool,
     pub use_mlock: bool,
+    pub reasoning_enabled: bool,
+    pub reasoning_budget: i32,
 }
 
 impl Default for ModelLoadConfig {
@@ -142,6 +144,8 @@ impl Default for ModelLoadConfig {
             flash_attention: true,
             use_mmap: true,
             use_mlock: false,
+            reasoning_enabled: true,
+            reasoning_budget: -1,
         }
     }
 }

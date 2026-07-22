@@ -464,6 +464,8 @@ impl ServerPanelState {
             flash_attention: self.flash_attention,
             use_mmap: true,
             use_mlock: false,
+            reasoning_enabled: true,
+            reasoning_budget: -1,
         }
     }
 

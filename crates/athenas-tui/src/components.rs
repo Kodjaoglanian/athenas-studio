@@ -71,6 +71,8 @@ fn render_messages(
     }
 
     if state.is_generating {
+        let elapsed = state.generation_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+
         lines.push(Line::styled(
             " AI",
             Style::default()
@@ -78,15 +80,50 @@ fn render_messages(
                 .add_modifier(Modifier::BOLD),
         ));
         if state.streaming_text.is_empty() {
+            // Show animated spinner + elapsed time while waiting for first token
+            let spinner_char = match elapsed % 4 {
+                0 => "|",
+                1 => "/",
+                2 => "-",
+                _ => "\\",
+            };
+            let wait_msg = if elapsed > 60 {
+                format!("  {} Still waiting... {}s (model may be thinking or stuck)", spinner_char, elapsed)
+            } else if elapsed > 30 {
+                format!("  {} Waiting for response... {}s", spinner_char, elapsed)
+            } else if elapsed > 5 {
+                format!("  {} Processing... {}s", spinner_char, elapsed)
+            } else {
+                format!("  {} Generating...", spinner_char)
+            };
+            let wait_color = if elapsed > 60 {
+                Color::Yellow
+            } else {
+                Color::Cyan
+            };
             lines.push(Line::styled(
-                "  ...",
+                wait_msg,
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(wait_color)
                     .add_modifier(Modifier::ITALIC),
             ));
         } else {
             for line in state.streaming_text.lines() {
                 lines.push(Line::from(format!("  {}", line)));
+            }
+            // Show live elapsed + tok/s during streaming
+            if elapsed > 2 {
+                let info = if let Some(tps) = state.tokens_per_second {
+                    format!("  ~{:.1} tok/s · {}s", tps, elapsed)
+                } else {
+                    format!("  {}s", elapsed)
+                };
+                lines.push(Line::styled(
+                    info,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                ));
             }
         }
         lines.push(Line::from(""));
@@ -522,9 +559,15 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
 
     if let Some(ref msg) = state.status_message {
         lines.push(Line::from(""));
+        let color = if state.status_is_error {
+            Color::Red
+        } else {
+            Color::Green
+        };
+        let prefix = if state.status_is_error { "[!]" } else { "[✓]" };
         lines.push(Line::styled(
-            format!(" [!] {}", msg),
-            Style::default().fg(Color::Red),
+            format!(" {} {}", prefix, msg),
+            Style::default().fg(color),
         ));
     }
 
