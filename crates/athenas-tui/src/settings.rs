@@ -15,6 +15,9 @@ pub enum SettingsField {
     Streaming,
     Reasoning,
     ReasoningBudget,
+    RamReserve,
+    CpuReserve,
+    AutoResourceLimits,
     ServerHost,
     ServerPort,
     ServerApiKey,
@@ -36,6 +39,9 @@ impl SettingsField {
             SettingsField::Streaming,
             SettingsField::Reasoning,
             SettingsField::ReasoningBudget,
+            SettingsField::RamReserve,
+            SettingsField::CpuReserve,
+            SettingsField::AutoResourceLimits,
             SettingsField::ServerHost,
             SettingsField::ServerPort,
             SettingsField::ServerApiKey,
@@ -57,6 +63,9 @@ impl SettingsField {
             SettingsField::Streaming => "Streaming",
             SettingsField::Reasoning => "Reasoning/Thinking",
             SettingsField::ReasoningBudget => "Reasoning Budget",
+            SettingsField::RamReserve => "RAM Reserve (MB)",
+            SettingsField::CpuReserve => "CPU Reserve (cores)",
+            SettingsField::AutoResourceLimits => "Auto Resource Limits",
             SettingsField::ServerHost => "Server Host",
             SettingsField::ServerPort => "Server Port",
             SettingsField::ServerApiKey => "Server API Key",
@@ -77,7 +86,10 @@ impl SettingsField {
             | SettingsField::FlashAttention
             | SettingsField::Streaming
             | SettingsField::Reasoning
-            | SettingsField::ReasoningBudget => "Inference",
+            | SettingsField::ReasoningBudget
+            | SettingsField::RamReserve
+            | SettingsField::CpuReserve
+            | SettingsField::AutoResourceLimits => "Inference",
             SettingsField::ServerHost | SettingsField::ServerPort | SettingsField::ServerApiKey => {
                 "Server"
             }
@@ -209,6 +221,19 @@ impl SettingsState {
                     .parse()
                     .map_err(|_| "-1 = unlimited, 0 = disabled, N = token budget".to_string())?;
             }
+            SettingsField::RamReserve => {
+                self.config.inference.ram_reserve_mb = value
+                    .parse()
+                    .map_err(|_| "Must be a number (MB to reserve for OS)".to_string())?;
+            }
+            SettingsField::CpuReserve => {
+                self.config.inference.cpu_reserve_cores = value
+                    .parse()
+                    .map_err(|_| "Must be a number (cores to leave free)".to_string())?;
+            }
+            SettingsField::AutoResourceLimits => {
+                self.config.inference.auto_resource_limits = value == "true" || value == "1";
+            }
             SettingsField::ServerHost => {
                 self.config.server.default_host = value;
             }
@@ -271,6 +296,15 @@ impl SettingsState {
                 }
             }
             SettingsField::ReasoningBudget => self.config.inference.reasoning_budget.to_string(),
+            SettingsField::RamReserve => self.config.inference.ram_reserve_mb.to_string(),
+            SettingsField::CpuReserve => self.config.inference.cpu_reserve_cores.to_string(),
+            SettingsField::AutoResourceLimits => {
+                if self.config.inference.auto_resource_limits {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
             SettingsField::ServerHost => self.config.server.default_host.clone(),
             SettingsField::ServerPort => self.config.server.default_port.to_string(),
             SettingsField::ServerApiKey => {
@@ -298,6 +332,11 @@ impl SettingsState {
             SettingsField::Streaming => "true | false (show text as it generates)",
             SettingsField::Reasoning => "true | false (disable for Qwen3.5 to avoid hangs)",
             SettingsField::ReasoningBudget => "-1 = unlimited, 0 = off, N = token limit",
+            SettingsField::RamReserve => "MB reserved for OS (e.g. 2048)",
+            SettingsField::CpuReserve => "Cores to leave free (e.g. 1)",
+            SettingsField::AutoResourceLimits => {
+                "true = auto-cap threads/ctx/batch | false = use as-is"
+            }
             SettingsField::ServerHost => "e.g. 127.0.0.1",
             SettingsField::ServerPort => "e.g. 8080",
             SettingsField::ServerApiKey => "Leave empty to disable auth",

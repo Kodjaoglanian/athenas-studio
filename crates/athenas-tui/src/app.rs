@@ -269,24 +269,26 @@ impl TuiApp {
 
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
         // Ctrl+R toggles reasoning expansion on the last assistant message
-        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let Some(msg) = self
-                .chat_state
-                .messages
-                .iter_mut()
-                .rev()
-                .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
-            {
-                msg.reasoning_expanded = !msg.reasoning_expanded;
+        if let KeyCode::Char(c) = key.code {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'r') {
+                if let Some(msg) = self
+                    .chat_state
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
+                {
+                    msg.reasoning_expanded = !msg.reasoning_expanded;
+                }
+                return;
             }
-            return;
         }
 
         match key.code {
             KeyCode::Enter => {
                 self.send_message().await;
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.chat_state.input_text.push(c);
                 // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
@@ -296,6 +298,7 @@ impl TuiApp {
             }
             KeyCode::PageDown => {
                 self.chat_state.auto_scroll = true;
+                self.chat_state.scroll = 0;
             }
             KeyCode::PageUp => {
                 self.chat_state.auto_scroll = false;
@@ -850,6 +853,9 @@ impl TuiApp {
 
         // === Resource protections ===
 
+        // Skip auto-capping if user disabled it
+        let auto_limits = self.config.inference.auto_resource_limits;
+
         // 1. Check model file size vs available RAM
         let model_size_mb = std::fs::metadata(path)
             .map(|m| m.len() / (1024 * 1024))
@@ -863,7 +869,7 @@ impl TuiApp {
         let estimated_needed_mb =
             model_size_mb + ((self.config.inference.default_context_size as u64 / 1024) * 64);
 
-        if avail_mb > 0 && estimated_needed_mb > avail_mb {
+        if auto_limits && avail_mb > 0 && estimated_needed_mb > avail_mb {
             self.chat_state.add_message(
                 "system",
                 &format!(
@@ -876,27 +882,34 @@ impl TuiApp {
             return;
         }
 
-        // 2. Cap threads to leave at least 1 core free for the system
+        // 2. Cap threads based on cpu_reserve_cores
         let mut threads = self.config.inference.default_threads;
-        let max_threads = self.hardware.cpus.saturating_sub(1).max(1);
-        if threads > max_threads {
-            threads = max_threads;
+        if auto_limits {
+            let max_threads = self
+                .hardware
+                .cpus
+                .saturating_sub(self.config.inference.cpu_reserve_cores)
+                .max(1);
+            if threads > max_threads {
+                threads = max_threads;
+            }
         }
 
         // 3. Cap context size based on available memory
-        // Each 1K context ≈ 64MB for a 9B model, scale roughly
         let mut context_size = self.config.inference.default_context_size;
-        let max_ctx_by_mem = if total_mb > 0 {
-            // Reserve model size + 512MB overhead, allow up to 50% of remaining for context
-            let reserved = model_size_mb + 512;
-            let usable = total_mb.saturating_sub(reserved);
-            // Rough: ctx_mb = usable * 0.4, ctx = ctx_mb / 64 * 1024
-            ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024
-        } else {
-            8192
-        };
-        if context_size > max_ctx_by_mem && max_ctx_by_mem > 0 {
-            context_size = max_ctx_by_mem.max(512);
+        if auto_limits {
+            let max_ctx_by_mem = if total_mb > 0 {
+                // Reserve model size + ram_reserve_mb, allow up to 50% of remaining for context
+                let reserved = model_size_mb + self.config.inference.ram_reserve_mb;
+                let usable = total_mb.saturating_sub(reserved);
+                // Rough: ctx_mb = usable * 0.4, ctx = ctx_mb / 64 * 1024
+                ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024
+            } else {
+                8192
+            };
+            if context_size > max_ctx_by_mem && max_ctx_by_mem > 0 {
+                context_size = max_ctx_by_mem.max(512);
+            }
         }
 
         // 4. Cap batch size — large batches consume more memory

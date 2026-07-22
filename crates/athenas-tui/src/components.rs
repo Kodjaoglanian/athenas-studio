@@ -244,7 +244,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &ChatState) {
 
     f.render_widget(input, area);
 
-    let cursor_x = area.x + 1 + state.input_text.len() as u16;
+    let cursor_x = area.x + 1 + state.input_text.chars().count() as u16;
     let cursor_y = area.y + 1;
     f.set_cursor_position((cursor_x, cursor_y));
 }

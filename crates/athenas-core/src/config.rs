@@ -39,6 +39,16 @@ pub struct InferenceConfig {
     /// Token budget for thinking: -1 for unrestricted, 0 for disabled, N>0 for specific budget
     #[serde(default = "default_reasoning_budget")]
     pub reasoning_budget: i32,
+    /// MB of RAM to reserve for the OS/other apps. Model loading will not use more than (total - reserve).
+    #[serde(default = "default_ram_reserve")]
+    pub ram_reserve_mb: u64,
+    /// Number of CPU cores to leave free for the system (0 = use all but 1)
+    #[serde(default = "default_cpu_reserve")]
+    pub cpu_reserve_cores: u32,
+    /// When true, automatically cap threads/context/batch based on available hardware.
+    /// When false, use the configured values as-is without auto-capping.
+    #[serde(default = "default_true")]
+    pub auto_resource_limits: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +88,12 @@ fn default_true() -> bool {
 }
 fn default_reasoning_budget() -> i32 {
     -1
+}
+fn default_ram_reserve() -> u64 {
+    2048
+}
+fn default_cpu_reserve() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,6 +152,9 @@ impl Default for AppConfig {
                 streaming_enabled: true,
                 reasoning_enabled: true,
                 reasoning_budget: -1,
+                ram_reserve_mb: 2048,
+                cpu_reserve_cores: 1,
+                auto_resource_limits: true,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),

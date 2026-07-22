@@ -33,6 +33,16 @@ pub enum ConfigField {
     BatchSize,
     Threads,
     FlashAttention,
+    // Generation params
+    MaxTokens,
+    Temperature,
+    TopP,
+    Reasoning,
+    ReasoningBudget,
+    // Hardware protection
+    RamReserve,
+    CpuReserve,
+    AutoResourceLimits,
     // Actions
     StartServer,
     StopServer,
@@ -58,6 +68,14 @@ impl ConfigField {
             ConfigField::BatchSize,
             ConfigField::Threads,
             ConfigField::FlashAttention,
+            ConfigField::MaxTokens,
+            ConfigField::Temperature,
+            ConfigField::TopP,
+            ConfigField::Reasoning,
+            ConfigField::ReasoningBudget,
+            ConfigField::RamReserve,
+            ConfigField::CpuReserve,
+            ConfigField::AutoResourceLimits,
             ConfigField::StartServer,
             ConfigField::StopServer,
         ]
@@ -82,6 +100,14 @@ impl ConfigField {
             ConfigField::BatchSize => "Batch Size",
             ConfigField::Threads => "Threads",
             ConfigField::FlashAttention => "Flash Attention",
+            ConfigField::MaxTokens => "Max Tokens",
+            ConfigField::Temperature => "Temperature",
+            ConfigField::TopP => "Top P",
+            ConfigField::Reasoning => "Reasoning/Thinking",
+            ConfigField::ReasoningBudget => "Reasoning Budget",
+            ConfigField::RamReserve => "RAM Reserve (MB)",
+            ConfigField::CpuReserve => "CPU Reserve (cores)",
+            ConfigField::AutoResourceLimits => "Auto Resource Limits",
             ConfigField::StartServer => "Start Server",
             ConfigField::StopServer => "Stop Server",
         }
@@ -105,7 +131,15 @@ impl ConfigField {
             | ConfigField::ContextSize
             | ConfigField::BatchSize
             | ConfigField::Threads
-            | ConfigField::FlashAttention => "OPTIMIZATION",
+            | ConfigField::FlashAttention
+            | ConfigField::MaxTokens
+            | ConfigField::Temperature
+            | ConfigField::TopP
+            | ConfigField::Reasoning
+            | ConfigField::ReasoningBudget
+            | ConfigField::RamReserve
+            | ConfigField::CpuReserve
+            | ConfigField::AutoResourceLimits => "OPTIMIZATION",
             ConfigField::StartServer | ConfigField::StopServer => "ACTION",
         }
     }
@@ -124,6 +158,8 @@ impl ConfigField {
                 | ConfigField::MetricsEnabled
                 | ConfigField::CompressionEnabled
                 | ConfigField::FlashAttention
+                | ConfigField::Reasoning
+                | ConfigField::AutoResourceLimits
         )
     }
 
@@ -161,6 +197,18 @@ pub struct ServerPanelState {
     pub batch_size: u32,
     pub threads: u32,
     pub flash_attention: bool,
+
+    // Generation params
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub reasoning_enabled: bool,
+    pub reasoning_budget: i32,
+
+    // Hardware protection
+    pub ram_reserve_mb: u64,
+    pub cpu_reserve_cores: u32,
+    pub auto_resource_limits: bool,
 
     // Runtime state
     pub phase: ServerPhase,
@@ -201,6 +249,14 @@ impl ServerPanelState {
             batch_size: config.inference.default_batch_size,
             threads: config.inference.default_threads,
             flash_attention: config.inference.flash_attention,
+            max_tokens: config.inference.default_max_tokens,
+            temperature: config.inference.default_temperature,
+            top_p: config.inference.default_top_p,
+            reasoning_enabled: config.inference.reasoning_enabled,
+            reasoning_budget: config.inference.reasoning_budget,
+            ram_reserve_mb: config.inference.ram_reserve_mb,
+            cpu_reserve_cores: config.inference.cpu_reserve_cores,
+            auto_resource_limits: config.inference.auto_resource_limits,
             phase: ServerPhase::Configuring,
             status_message: None,
             server_url: None,
@@ -282,6 +338,14 @@ impl ServerPanelState {
             ConfigField::BatchSize => self.batch_size.to_string(),
             ConfigField::Threads => self.threads.to_string(),
             ConfigField::FlashAttention => on_off(self.flash_attention),
+            ConfigField::MaxTokens => self.max_tokens.to_string(),
+            ConfigField::Temperature => self.temperature.to_string(),
+            ConfigField::TopP => self.top_p.to_string(),
+            ConfigField::Reasoning => on_off(self.reasoning_enabled),
+            ConfigField::ReasoningBudget => self.reasoning_budget.to_string(),
+            ConfigField::RamReserve => self.ram_reserve_mb.to_string(),
+            ConfigField::CpuReserve => self.cpu_reserve_cores.to_string(),
+            ConfigField::AutoResourceLimits => on_off(self.auto_resource_limits),
             ConfigField::StartServer => {
                 if self.phase == ServerPhase::Running {
                     "Server is running".to_string()
@@ -312,6 +376,14 @@ impl ServerPanelState {
             ConfigField::BatchSize => "Prompt processing batch size",
             ConfigField::Threads => "CPU threads (0 = auto)",
             ConfigField::FlashAttention => "Enable flash attention if supported",
+            ConfigField::MaxTokens => "Max tokens to generate (e.g. 2048)",
+            ConfigField::Temperature => "0.0 - 2.0 (creativity)",
+            ConfigField::TopP => "0.0 - 1.0 (nucleus sampling)",
+            ConfigField::Reasoning => "Enable thinking mode (Qwen3.5, DeepSeek R1)",
+            ConfigField::ReasoningBudget => "-1 = unlimited, 0 = off, N = token limit",
+            ConfigField::RamReserve => "MB reserved for OS (e.g. 2048)",
+            ConfigField::CpuReserve => "Cores to leave free (e.g. 1)",
+            ConfigField::AutoResourceLimits => "Auto-cap threads/ctx/batch based on hardware",
             ConfigField::StartServer => "Loads model and starts the API server",
             ConfigField::StopServer => "Stops the running server",
         }
@@ -411,6 +483,34 @@ impl ServerPanelState {
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
             }
+            ConfigField::MaxTokens => {
+                self.max_tokens = value
+                    .parse::<u32>()
+                    .map_err(|_| "Must be a positive number")?;
+            }
+            ConfigField::Temperature => {
+                self.temperature = value
+                    .parse::<f32>()
+                    .map_err(|_| "Must be a float (0.0-2.0)")?;
+            }
+            ConfigField::TopP => {
+                self.top_p = value
+                    .parse::<f32>()
+                    .map_err(|_| "Must be a float (0.0-1.0)")?;
+            }
+            ConfigField::ReasoningBudget => {
+                self.reasoning_budget = value
+                    .parse::<i32>()
+                    .map_err(|_| "-1 = unlimited, 0 = off, N = token limit")?;
+            }
+            ConfigField::RamReserve => {
+                self.ram_reserve_mb = value.parse::<u64>().map_err(|_| "Must be a number (MB)")?;
+            }
+            ConfigField::CpuReserve => {
+                self.cpu_reserve_cores = value
+                    .parse::<u32>()
+                    .map_err(|_| "Must be a number (cores)")?;
+            }
             _ => {}
         }
 
@@ -428,6 +528,10 @@ impl ServerPanelState {
                 self.compression_enabled = !self.compression_enabled;
             }
             ConfigField::FlashAttention => self.flash_attention = !self.flash_attention,
+            ConfigField::Reasoning => self.reasoning_enabled = !self.reasoning_enabled,
+            ConfigField::AutoResourceLimits => {
+                self.auto_resource_limits = !self.auto_resource_limits;
+            }
             _ => {}
         }
     }
@@ -464,8 +568,8 @@ impl ServerPanelState {
             flash_attention: self.flash_attention,
             use_mmap: true,
             use_mlock: false,
-            reasoning_enabled: true,
-            reasoning_budget: -1,
+            reasoning_enabled: self.reasoning_enabled,
+            reasoning_budget: self.reasoning_budget,
         }
     }
 
@@ -491,6 +595,14 @@ impl ServerPanelState {
         config.inference.default_batch_size = self.batch_size;
         config.inference.default_threads = self.threads;
         config.inference.flash_attention = self.flash_attention;
+        config.inference.default_max_tokens = self.max_tokens;
+        config.inference.default_temperature = self.temperature;
+        config.inference.default_top_p = self.top_p;
+        config.inference.reasoning_enabled = self.reasoning_enabled;
+        config.inference.reasoning_budget = self.reasoning_budget;
+        config.inference.ram_reserve_mb = self.ram_reserve_mb;
+        config.inference.cpu_reserve_cores = self.cpu_reserve_cores;
+        config.inference.auto_resource_limits = self.auto_resource_limits;
         config
     }
 
