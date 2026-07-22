@@ -609,7 +609,10 @@ impl Backend for LlamaCppBackend {
                 }
                 Err(e) => {
                     tracing::warn!("Stream chunk error (graceful handling): {}", e);
-                    if !full_text.is_empty() {
+                    // If we received ANY tokens (content or reasoning), finalize
+                    // gracefully instead of returning an error. Small models
+                    // may only produce reasoning before the connection drops.
+                    if token_count > 0 {
                         let elapsed = start_time.elapsed().as_secs_f32();
                         let tps = if elapsed > 0.0 {
                             token_count as f32 / elapsed

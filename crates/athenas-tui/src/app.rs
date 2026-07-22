@@ -268,27 +268,39 @@ impl TuiApp {
     }
 
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
-        // Ctrl+R toggles reasoning expansion on the last assistant message
-        if let KeyCode::Char(c) = key.code {
-            if key.modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'r') {
-                if let Some(msg) = self
-                    .chat_state
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
-                {
-                    msg.reasoning_expanded = !msg.reasoning_expanded;
-                }
-                return;
+        // Ctrl+R toggles reasoning expansion on the last assistant message.
+        // Some terminals send Ctrl+R as \x12 (control char) without CONTROL
+        // modifier, so we check both representations.
+        let is_ctrl_r = match key.code {
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && c.eq_ignore_ascii_case(&'r') =>
+            {
+                true
             }
+            // Some terminals send the raw control character \x12 for Ctrl+R
+            // with or without the CONTROL modifier flag
+            KeyCode::Char('\x12') => true,
+            _ => false,
+        };
+        if is_ctrl_r {
+            if let Some(msg) = self
+                .chat_state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
+            {
+                msg.reasoning_expanded = !msg.reasoning_expanded;
+            }
+            return;
         }
 
         match key.code {
             KeyCode::Enter => {
                 self.send_message().await;
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
                 self.chat_state.input_text.push(c);
                 // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
