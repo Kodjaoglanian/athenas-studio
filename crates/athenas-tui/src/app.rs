@@ -59,6 +59,7 @@ pub struct TuiApp {
     >,
     // Background server state
     server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
+    shared_model_manager: Option<athenas_server::SharedModelManager>,
     // Background model loading state
     is_loading_model: bool,
     model_load_task: Option<
@@ -93,6 +94,7 @@ impl TuiApp {
             download_progress_rx: None,
             download_task: None,
             server_handle: None,
+            shared_model_manager: None,
             is_loading_model: false,
             model_load_task: None,
             loading_spinner: 0,
@@ -1059,16 +1061,30 @@ impl TuiApp {
                     self.server_panel_state.previous();
                     self.server_panel_state.status_message = None;
                 }
-                KeyCode::Left | KeyCode::Char('h') => {
-                    if field == ConfigField::ModelSelection {
+                KeyCode::Left | KeyCode::Char('h') => match field {
+                    ConfigField::ModelSelection => {
                         self.server_panel_state.select_model_prev();
                     }
-                }
-                KeyCode::Right | KeyCode::Char('l') => {
-                    if field == ConfigField::ModelSelection {
+                    ConfigField::UnloadModel => {
+                        self.server_panel_state.unload_select_prev();
+                    }
+                    ConfigField::SetDefaultModel => {
+                        self.server_panel_state.default_select_prev();
+                    }
+                    _ => {}
+                },
+                KeyCode::Right | KeyCode::Char('l') => match field {
+                    ConfigField::ModelSelection => {
                         self.server_panel_state.select_model_next();
                     }
-                }
+                    ConfigField::UnloadModel => {
+                        self.server_panel_state.unload_select_next();
+                    }
+                    ConfigField::SetDefaultModel => {
+                        self.server_panel_state.default_select_next();
+                    }
+                    _ => {}
+                },
                 KeyCode::Enter => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
@@ -1078,6 +1094,12 @@ impl TuiApp {
                         self.start_server().await;
                     } else if field == ConfigField::StopServer {
                         self.stop_server();
+                    } else if field == ConfigField::LoadAdditionalModel {
+                        self.load_additional_model().await;
+                    } else if field == ConfigField::UnloadModel {
+                        self.unload_model_action().await;
+                    } else if field == ConfigField::SetDefaultModel {
+                        self.set_default_model_action().await;
                     }
                 }
                 KeyCode::Esc => {
@@ -1140,6 +1162,23 @@ impl TuiApp {
         let port = self.server_panel_state.port;
 
         let api_server = athenas_server::ApiServer::new(server_config, backend);
+        let model_mgr = api_server.model_manager();
+
+        // Populate loaded models list
+        {
+            let mgr = model_mgr.lock().await;
+            self.server_panel_state.loaded_models = mgr
+                .list()
+                .iter()
+                .map(|m| crate::server_panel::LoadedModelInfo {
+                    id: m.id.clone(),
+                    name: m.model_info.name.clone(),
+                    backend: m.backend_name.clone(),
+                    is_default: mgr.default_id() == Some(m.id.as_str()),
+                })
+                .collect();
+        }
+        self.shared_model_manager = Some(model_mgr);
 
         self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
         self.server_panel_state.phase = ServerPhase::Running;
@@ -1164,7 +1203,173 @@ impl TuiApp {
         self.server_panel_state.server_url = None;
         self.server_panel_state.loaded_model_name = None;
         self.server_panel_state.loaded_backend_name = None;
+        self.server_panel_state.loaded_models.clear();
+        self.server_panel_state.unload_model_selected = 0;
+        self.server_panel_state.default_model_selected = 0;
+        self.shared_model_manager = None;
         self.server_panel_state.status_message = Some("Server stopped".to_string());
+    }
+
+    async fn load_additional_model(&mut self) {
+        if self.server_panel_state.phase != ServerPhase::Running {
+            self.server_panel_state.status_message = Some("Start the server first".to_string());
+            return;
+        }
+
+        let model_path = match self.server_panel_state.selected_model_path() {
+            Some(p) => p,
+            None => {
+                self.server_panel_state.status_message =
+                    Some("No model selected. Use Left/Right to pick a model.".to_string());
+                return;
+            }
+        };
+
+        self.server_panel_state.phase = ServerPhase::LoadingModel;
+        self.server_panel_state.status_message =
+            Some(format!("Loading additional model: {}...", model_path));
+
+        let mut backend = match self.server_panel_state.create_backend() {
+            Ok(b) => b,
+            Err(e) => {
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                return;
+            }
+        };
+
+        let load_config = self.server_panel_state.build_load_config(&model_path);
+
+        if let Err(e) = backend.load_model(load_config).await {
+            self.server_panel_state.phase = ServerPhase::Running;
+            self.server_panel_state.status_message = Some(format!("Failed to load model: {}", e));
+            return;
+        }
+
+        let model_name = backend
+            .model_info()
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        let backend_name = backend.name().to_string();
+
+        if let Some(mgr) = &self.shared_model_manager {
+            let mut m = mgr.lock().await;
+            let model_id = m.add(backend);
+
+            self.server_panel_state.loaded_models = m
+                .list()
+                .iter()
+                .map(|lm| crate::server_panel::LoadedModelInfo {
+                    id: lm.id.clone(),
+                    name: lm.model_info.name.clone(),
+                    backend: lm.backend_name.clone(),
+                    is_default: m.default_id() == Some(lm.id.as_str()),
+                })
+                .collect();
+
+            self.server_panel_state.status_message = Some(format!(
+                "Loaded '{}' on {} (id: {})",
+                model_name, backend_name, model_id
+            ));
+        }
+
+        self.server_panel_state.phase = ServerPhase::Running;
+    }
+
+    async fn unload_model_action(&mut self) {
+        if self.server_panel_state.loaded_models.is_empty() {
+            self.server_panel_state.status_message = Some("No models to unload".to_string());
+            return;
+        }
+
+        let model_id = match self.server_panel_state.selected_unload_model_id() {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(mgr) = &self.shared_model_manager {
+            let mut m = mgr.lock().await;
+
+            // Don't allow unloading if it's the only model
+            if m.count() <= 1 {
+                self.server_panel_state.status_message =
+                    Some("Cannot unload the only model. Load another first.".to_string());
+                return;
+            }
+
+            match m.remove(&model_id).await {
+                Ok(()) => {
+                    self.server_panel_state.loaded_models = m
+                        .list()
+                        .iter()
+                        .map(|lm| crate::server_panel::LoadedModelInfo {
+                            id: lm.id.clone(),
+                            name: lm.model_info.name.clone(),
+                            backend: lm.backend_name.clone(),
+                            is_default: m.default_id() == Some(lm.id.as_str()),
+                        })
+                        .collect();
+
+                    // Fix selection indices
+                    if !self.server_panel_state.loaded_models.is_empty() {
+                        if self.server_panel_state.unload_model_selected
+                            >= self.server_panel_state.loaded_models.len()
+                        {
+                            self.server_panel_state.unload_model_selected =
+                                self.server_panel_state.loaded_models.len() - 1;
+                        }
+                        if self.server_panel_state.default_model_selected
+                            >= self.server_panel_state.loaded_models.len()
+                        {
+                            self.server_panel_state.default_model_selected =
+                                self.server_panel_state.loaded_models.len() - 1;
+                        }
+                    }
+
+                    self.server_panel_state.status_message =
+                        Some(format!("Unloaded model: {}", model_id));
+                }
+                Err(e) => {
+                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                }
+            }
+        }
+    }
+
+    async fn set_default_model_action(&mut self) {
+        if self.server_panel_state.loaded_models.is_empty() {
+            self.server_panel_state.status_message = Some("No models loaded".to_string());
+            return;
+        }
+
+        let model_id = match self.server_panel_state.selected_default_model_id() {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(mgr) = &self.shared_model_manager {
+            let mut m = mgr.lock().await;
+            match m.set_default(&model_id) {
+                Ok(()) => {
+                    self.server_panel_state.loaded_models = m
+                        .list()
+                        .iter()
+                        .map(|lm| crate::server_panel::LoadedModelInfo {
+                            id: lm.id.clone(),
+                            name: lm.model_info.name.clone(),
+                            backend: lm.backend_name.clone(),
+                            is_default: m.default_id() == Some(lm.id.as_str()),
+                        })
+                        .collect();
+
+                    self.server_panel_state.status_message =
+                        Some(format!("Default model set to: {}", model_id));
+                }
+                Err(e) => {
+                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                }
+            }
+        }
     }
 
     async fn poll_server_status(&mut self) {
@@ -1177,11 +1382,15 @@ impl TuiApp {
                     Ok(Ok(())) => {
                         self.server_panel_state.phase = ServerPhase::Configuring;
                         self.server_panel_state.server_url = None;
+                        self.server_panel_state.loaded_models.clear();
+                        self.shared_model_manager = None;
                         self.server_panel_state.status_message = Some("Server stopped".to_string());
                     }
                     Ok(Err(e)) => {
                         self.server_panel_state.phase = ServerPhase::Error;
                         self.server_panel_state.server_url = None;
+                        self.server_panel_state.loaded_models.clear();
+                        self.shared_model_manager = None;
                         self.server_panel_state.status_message =
                             Some(format!("Server error: {}", e));
                     }

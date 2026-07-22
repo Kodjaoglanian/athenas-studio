@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer, trace::TraceLayer,
@@ -19,18 +19,17 @@ use tower_http::{
 
 use athenas_core::ServerConfig;
 use athenas_inference::{
-    Backend, ChatMessage, ChatRequest, CompletionRequest, ContentPart, MessageContent, Role,
-    StreamChunk,
+    BackendFactory, ChatMessage, ChatRequest, CompletionRequest, ContentPart, MessageContent,
+    ModelLoadConfig, Role, StreamChunk,
 };
 
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
-
-type SharedBackend = Arc<Mutex<Box<dyn Backend>>>;
+use crate::model_manager::SharedModelManager;
 
 #[derive(Clone)]
 struct AppState {
-    backend: SharedBackend,
+    model_manager: SharedModelManager,
     api_key: Option<String>,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
@@ -38,14 +37,14 @@ struct AppState {
 }
 
 pub fn create_router(
-    backend: SharedBackend,
+    model_manager: SharedModelManager,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     rate_limiter: SharedRateLimiter,
     config: &ServerConfig,
 ) -> Router {
     let state = AppState {
-        backend,
+        model_manager,
         api_key: config.api_key.clone(),
         metrics: metrics.clone(),
         semaphore,
@@ -56,6 +55,8 @@ pub fn create_router(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/load", post(load_model_endpoint))
+        .route("/v1/models/unload", post(unload_model_endpoint))
         .route("/v1/files", post(upload_file))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
@@ -104,34 +105,38 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let backend = state.backend.lock().await;
-    let model_info = backend.model_info();
+    let mgr = state.model_manager.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
+    let models = mgr.list();
 
     let mut json = serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime,
-        "backend": backend.name(),
-        "model_loaded": backend.is_loaded(),
+        "models_loaded": mgr.count(),
+        "default_model": mgr.default_id(),
     });
 
-    if let Some(info) = model_info {
-        json["model"] = serde_json::json!({
-            "name": info.name,
-            "context_size": info.context_size,
-            "gpu_layers": info.gpu_layers,
-            "backend": info.backend_name,
-        });
+    if !models.is_empty() {
+        json["models"] = serde_json::json!(models
+            .iter()
+            .map(|m| serde_json::json!({
+                "id": m.id,
+                "name": m.model_info.name,
+                "context_size": m.model_info.context_size,
+                "gpu_layers": m.model_info.gpu_layers,
+                "backend": m.backend_name,
+            }))
+            .collect::<Vec<_>>());
     }
 
     Json(json)
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
-    let backend = state.backend.lock().await;
-    if backend.is_loaded() {
-        Json(serde_json::json!({"status": "ready"})).into_response()
+    let mgr = state.model_manager.lock().await;
+    if mgr.has_models() {
+        Json(serde_json::json!({"status": "ready", "models_loaded": mgr.count()})).into_response()
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -155,25 +160,28 @@ async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Respo
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let backend = state.backend.lock().await;
-    if let Some(info) = backend.model_info() {
-        Json(serde_json::json!({
-            "object": "list",
-            "data": [{
-                "id": info.name,
+    let mgr = state.model_manager.lock().await;
+    let models = mgr.list();
+    let data: Vec<_> = models
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
                 "object": "model",
                 "created": chrono::Utc::now().timestamp(),
                 "owned_by": "athenas-studio",
-            }]
-        }))
-        .into_response()
-    } else {
-        Json(serde_json::json!({
-            "object": "list",
-            "data": []
-        }))
-        .into_response()
-    }
+                "backend": m.backend_name,
+                "context_size": m.model_info.context_size,
+                "gpu_layers": m.model_info.gpu_layers,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "object": "list",
+        "data": data
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +277,23 @@ async fn chat_completions(
         seed: req.seed,
     };
 
-    let backend = state.backend.lock().await;
+    let model_id = chat_req.model.clone();
+
+    let mgr = state.model_manager.lock().await;
+    let backend = match mgr.get(Some(model_id.as_str())) {
+        Some(b) => b,
+        None => {
+            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Model '{}' not loaded. Available models: {:?}",
+                        model_id, available)
+                })),
+            )
+                .into_response();
+        }
+    };
 
     if chat_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
@@ -277,14 +301,17 @@ async fn chat_completions(
             .model_info()
             .map(|i| i.name.clone())
             .unwrap_or_default();
-        drop(backend);
+        drop(mgr);
 
-        let backend2 = state.backend.clone();
+        let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
+        let model_id_clone = model_id.clone();
         tokio::spawn(async move {
-            let b = backend2.lock().await;
-            if let Err(e) = b.chat_stream(chat_req, tx).await {
-                tracing::error!("Stream error: {}", e);
+            let m = mgr2.lock().await;
+            if let Some(b) = m.get(Some(model_id_clone.as_str())) {
+                if let Err(e) = b.chat_stream(chat_req, tx).await {
+                    tracing::error!("Stream error: {}", e);
+                }
             }
         });
 
@@ -423,7 +450,23 @@ async fn completions(
         seed: req.seed,
     };
 
-    let backend = state.backend.lock().await;
+    let model_id = comp_req.model.clone();
+
+    let mgr = state.model_manager.lock().await;
+    let backend = match mgr.get(Some(model_id.as_str())) {
+        Some(b) => b,
+        None => {
+            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Model '{}' not loaded. Available models: {:?}",
+                        model_id, available)
+                })),
+            )
+                .into_response();
+        }
+    };
 
     if comp_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
@@ -431,14 +474,17 @@ async fn completions(
             .model_info()
             .map(|i| i.name.clone())
             .unwrap_or_default();
-        drop(backend);
+        drop(mgr);
 
-        let backend2 = state.backend.clone();
+        let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
+        let model_id_clone = model_id.clone();
         tokio::spawn(async move {
-            let b = backend2.lock().await;
-            if let Err(e) = b.complete_stream(comp_req, tx).await {
-                tracing::error!("Stream error: {}", e);
+            let m = mgr2.lock().await;
+            if let Some(b) = m.get(Some(model_id_clone.as_str())) {
+                if let Err(e) = b.complete_stream(comp_req, tx).await {
+                    tracing::error!("Stream error: {}", e);
+                }
             }
         });
 
@@ -611,4 +657,137 @@ async fn upload_file(
     });
 
     Json(response).into_response()
+}
+
+// ── Multi-model management endpoints ──────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct LoadModelRequest {
+    model_path: String,
+    backend: Option<String>,
+    gpu_layers: Option<i32>,
+    context_size: Option<u32>,
+    batch_size: Option<u32>,
+    threads: Option<u32>,
+    flash_attention: Option<bool>,
+    reasoning_enabled: Option<bool>,
+    reasoning_budget: Option<i32>,
+    set_default: Option<bool>,
+}
+
+async fn load_model_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<LoadModelRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let backend_type = match req.backend.as_deref() {
+        Some("llama.cpp") | Some("llamacpp") | Some("llama") => athenas_core::BackendType::LlamaCpp,
+        Some("vllm") => athenas_core::BackendType::Vllm,
+        _ => athenas_core::BackendType::Auto,
+    };
+
+    let hardware = match athenas_core::HardwareDetector::detect() {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Hardware detection failed: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut backend = match BackendFactory::create(backend_type, &hardware) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to create backend: {}", e)})),
+            )
+                .into_response();
+        }
+    };
+
+    let load_config = ModelLoadConfig {
+        model_path: req.model_path.clone(),
+        gpu_layers: req.gpu_layers.unwrap_or(-1),
+        context_size: req.context_size.unwrap_or(4096),
+        batch_size: req.batch_size.unwrap_or(512),
+        threads: req.threads.unwrap_or(0),
+        flash_attention: req.flash_attention.unwrap_or(true),
+        use_mmap: true,
+        use_mlock: false,
+        reasoning_enabled: req.reasoning_enabled.unwrap_or(false),
+        reasoning_budget: req.reasoning_budget.unwrap_or(-1),
+    };
+
+    if let Err(e) = backend.load_model(load_config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to load model: {}", e)})),
+        )
+            .into_response();
+    }
+
+    let model_info = backend.model_info();
+    let model_name = model_info
+        .as_ref()
+        .map(|i| i.name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    let backend_name = backend.name().to_string();
+
+    let mut mgr = state.model_manager.lock().await;
+    let model_id = mgr.add(backend);
+
+    if req.set_default.unwrap_or(true) {
+        let _ = mgr.set_default(&model_id);
+    }
+
+    let count = mgr.count();
+
+    Json(serde_json::json!({
+        "status": "loaded",
+        "model_id": model_id,
+        "model_name": model_name,
+        "backend": backend_name,
+        "models_loaded": count,
+        "is_default": mgr.default_id() == Some(&model_id),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct UnloadModelRequest {
+    model_id: String,
+}
+
+async fn unload_model_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UnloadModelRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut mgr = state.model_manager.lock().await;
+
+    match mgr.remove(&req.model_id).await {
+        Ok(()) => {
+            let count = mgr.count();
+            let default = mgr.default_id().map(|s| s.to_string());
+            Json(serde_json::json!({
+                "status": "unloaded",
+                "model_id": req.model_id,
+                "models_loaded": count,
+                "default_model": default,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+    }
 }

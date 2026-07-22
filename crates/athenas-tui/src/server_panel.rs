@@ -11,6 +11,14 @@ pub enum ServerPhase {
     Error,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedModelInfo {
+    pub id: String,
+    pub name: String,
+    pub backend: String,
+    pub is_default: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigField {
     // Model selection
@@ -46,6 +54,9 @@ pub enum ConfigField {
     // Actions
     StartServer,
     StopServer,
+    LoadAdditionalModel,
+    UnloadModel,
+    SetDefaultModel,
 }
 
 impl ConfigField {
@@ -78,6 +89,9 @@ impl ConfigField {
             ConfigField::AutoResourceLimits,
             ConfigField::StartServer,
             ConfigField::StopServer,
+            ConfigField::LoadAdditionalModel,
+            ConfigField::UnloadModel,
+            ConfigField::SetDefaultModel,
         ]
     }
 
@@ -110,6 +124,9 @@ impl ConfigField {
             ConfigField::AutoResourceLimits => "Auto Resource Limits",
             ConfigField::StartServer => "Start Server",
             ConfigField::StopServer => "Stop Server",
+            ConfigField::LoadAdditionalModel => "Load Additional Model",
+            ConfigField::UnloadModel => "Unload Model",
+            ConfigField::SetDefaultModel => "Set Default Model",
         }
     }
 
@@ -140,14 +157,23 @@ impl ConfigField {
             | ConfigField::RamReserve
             | ConfigField::CpuReserve
             | ConfigField::AutoResourceLimits => "OPTIMIZATION",
-            ConfigField::StartServer | ConfigField::StopServer => "ACTION",
+            ConfigField::StartServer
+            | ConfigField::StopServer
+            | ConfigField::LoadAdditionalModel
+            | ConfigField::UnloadModel
+            | ConfigField::SetDefaultModel => "ACTION",
         }
     }
 
     pub fn is_editable(&self) -> bool {
         !matches!(
             self,
-            ConfigField::ModelSelection | ConfigField::StartServer | ConfigField::StopServer
+            ConfigField::ModelSelection
+                | ConfigField::StartServer
+                | ConfigField::StopServer
+                | ConfigField::LoadAdditionalModel
+                | ConfigField::UnloadModel
+                | ConfigField::SetDefaultModel
         )
     }
 
@@ -164,7 +190,14 @@ impl ConfigField {
     }
 
     pub fn is_action(&self) -> bool {
-        matches!(self, ConfigField::StartServer | ConfigField::StopServer)
+        matches!(
+            self,
+            ConfigField::StartServer
+                | ConfigField::StopServer
+                | ConfigField::LoadAdditionalModel
+                | ConfigField::UnloadModel
+                | ConfigField::SetDefaultModel
+        )
     }
 }
 
@@ -216,6 +249,9 @@ pub struct ServerPanelState {
     pub server_url: Option<String>,
     pub loaded_model_name: Option<String>,
     pub loaded_backend_name: Option<String>,
+    pub loaded_models: Vec<LoadedModelInfo>,
+    pub unload_model_selected: usize,
+    pub default_model_selected: usize,
 
     // Hardware info for display
     pub hardware: HardwareInfo,
@@ -262,6 +298,9 @@ impl ServerPanelState {
             server_url: None,
             loaded_model_name: None,
             loaded_backend_name: None,
+            loaded_models: Vec::new(),
+            unload_model_selected: 0,
+            default_model_selected: 0,
             hardware,
         }
     }
@@ -354,6 +393,36 @@ impl ServerPanelState {
                 }
             }
             ConfigField::StopServer => "Press Enter to stop".to_string(),
+            ConfigField::LoadAdditionalModel => {
+                if self.phase == ServerPhase::Running {
+                    "Press Enter to load another model".to_string()
+                } else {
+                    "Start server first".to_string()
+                }
+            }
+            ConfigField::UnloadModel => {
+                if self.loaded_models.is_empty() {
+                    "No models loaded".to_string()
+                } else {
+                    let m = &self.loaded_models
+                        [self.unload_model_selected.min(self.loaded_models.len() - 1)];
+                    format!(
+                        "{}{} (Left/Right to select)",
+                        m.name,
+                        if m.is_default { " [default]" } else { "" }
+                    )
+                }
+            }
+            ConfigField::SetDefaultModel => {
+                if self.loaded_models.is_empty() {
+                    "No models loaded".to_string()
+                } else {
+                    let m = &self.loaded_models[self
+                        .default_model_selected
+                        .min(self.loaded_models.len() - 1)];
+                    format!("{} (Left/Right to select)", m.name)
+                }
+            }
         }
     }
 
@@ -386,6 +455,9 @@ impl ServerPanelState {
             ConfigField::AutoResourceLimits => "Auto-cap threads/ctx/batch based on hardware",
             ConfigField::StartServer => "Loads model and starts the API server",
             ConfigField::StopServer => "Stops the running server",
+            ConfigField::LoadAdditionalModel => "Load another model while server is running",
+            ConfigField::UnloadModel => "Unload a model from memory (Left/Right to pick)",
+            ConfigField::SetDefaultModel => "Set which model handles requests without model field",
         }
     }
 
@@ -609,6 +681,58 @@ impl ServerPanelState {
     pub fn create_backend(&self) -> Result<Box<dyn Backend>, String> {
         BackendFactory::create(self.backend, &self.hardware)
             .map_err(|e| format!("Failed to create backend: {}", e))
+    }
+
+    pub fn unload_select_next(&mut self) {
+        if !self.loaded_models.is_empty() {
+            self.unload_model_selected =
+                (self.unload_model_selected + 1) % self.loaded_models.len();
+        }
+    }
+
+    pub fn unload_select_prev(&mut self) {
+        if !self.loaded_models.is_empty() {
+            if self.unload_model_selected == 0 {
+                self.unload_model_selected = self.loaded_models.len() - 1;
+            } else {
+                self.unload_model_selected -= 1;
+            }
+        }
+    }
+
+    pub fn default_select_next(&mut self) {
+        if !self.loaded_models.is_empty() {
+            self.default_model_selected =
+                (self.default_model_selected + 1) % self.loaded_models.len();
+        }
+    }
+
+    pub fn default_select_prev(&mut self) {
+        if !self.loaded_models.is_empty() {
+            if self.default_model_selected == 0 {
+                self.default_model_selected = self.loaded_models.len() - 1;
+            } else {
+                self.default_model_selected -= 1;
+            }
+        }
+    }
+
+    pub fn selected_unload_model_id(&self) -> Option<String> {
+        self.loaded_models
+            .get(
+                self.unload_model_selected
+                    .min(self.loaded_models.len().saturating_sub(1)),
+            )
+            .map(|m| m.id.clone())
+    }
+
+    pub fn selected_default_model_id(&self) -> Option<String> {
+        self.loaded_models
+            .get(
+                self.default_model_selected
+                    .min(self.loaded_models.len().saturating_sub(1)),
+            )
+            .map(|m| m.id.clone())
     }
 }
 

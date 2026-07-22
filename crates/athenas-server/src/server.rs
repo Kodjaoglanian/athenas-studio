@@ -9,10 +9,11 @@ use athenas_inference::Backend;
 
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::middleware::{RateLimiter, SharedRateLimiter};
+use crate::model_manager::{ModelManager, SharedModelManager};
 
 pub struct ApiServer {
     config: AppConfig,
-    backend: Arc<Mutex<Box<dyn Backend>>>,
+    model_manager: SharedModelManager,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     rate_limiter: SharedRateLimiter,
@@ -29,18 +30,45 @@ impl ApiServer {
             config.server.rate_limit_per_second,
         ));
 
+        let model_manager = Arc::new(Mutex::new(ModelManager::with_default(backend)));
+
         Self {
             config,
-            backend: Arc::new(Mutex::new(backend)),
+            model_manager,
             metrics,
             semaphore,
             rate_limiter,
         }
     }
 
+    /// Create an ApiServer with an existing shared model manager.
+    pub fn with_manager(config: AppConfig, manager: SharedModelManager) -> Self {
+        let metrics = Arc::new(Metrics::new());
+        let semaphore = Arc::new(Semaphore::new(
+            config.server.max_concurrent_requests as usize,
+        ));
+        let rate_limiter = Arc::new(RateLimiter::new(
+            config.server.rate_limit_per_second,
+            config.server.rate_limit_per_second,
+        ));
+
+        Self {
+            config,
+            model_manager: manager,
+            metrics,
+            semaphore,
+            rate_limiter,
+        }
+    }
+
+    /// Get the shared model manager (for loading/unloading models at runtime).
+    pub fn model_manager(&self) -> SharedModelManager {
+        self.model_manager.clone()
+    }
+
     pub async fn start(&self, host: &str, port: u16) -> Result<()> {
         let app = crate::routes::create_router(
-            self.backend.clone(),
+            self.model_manager.clone(),
             self.metrics.clone(),
             self.semaphore.clone(),
             self.rate_limiter.clone(),
