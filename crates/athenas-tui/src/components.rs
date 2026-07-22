@@ -68,7 +68,7 @@ fn render_messages(
         if msg.role == "assistant" && !msg.reasoning.is_empty() {
             if msg.reasoning_expanded {
                 lines.push(Line::styled(
-                    "  [Thinking] ▼ (press 'r' to collapse)",
+                    "  [Thinking] ▼ (Ctrl+R to collapse)",
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::DIM),
@@ -96,7 +96,7 @@ fn render_messages(
                     ""
                 };
                 lines.push(Line::styled(
-                    format!("  [Thinking] ▶ {}{} (press 'r' to expand)", preview, suffix),
+                    format!("  [Thinking] ▶ {}{} (Ctrl+R to expand)", preview, suffix),
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::DIM),
@@ -279,7 +279,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     }
 
     status_parts.push(Span::raw(
-        " | Enter: Send | PgUp/Dn: Scroll | r: Toggle Thinking | Ctrl+C: Quit ",
+        " | Enter: Send | PgUp/Dn: Scroll | Ctrl+R: Thinking | Ctrl+C: Quit ",
     ));
 
     let line = Line::from(status_parts);

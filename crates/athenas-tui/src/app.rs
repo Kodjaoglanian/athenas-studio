@@ -268,28 +268,26 @@ impl TuiApp {
     }
 
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
+        // Ctrl+R toggles reasoning expansion on the last assistant message
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(msg) = self
+                .chat_state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
+            {
+                msg.reasoning_expanded = !msg.reasoning_expanded;
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Enter => {
                 self.send_message().await;
             }
             KeyCode::Char(c) => {
-                // 'r' toggles reasoning expansion on the last assistant message
-                if c == 'r' && !self.chat_state.input_text.is_empty() {
-                    self.chat_state.input_text.push(c);
-                } else if c == 'r' {
-                    // Toggle reasoning_expanded on the last assistant message
-                    if let Some(msg) = self
-                        .chat_state
-                        .messages
-                        .iter_mut()
-                        .rev()
-                        .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
-                    {
-                        msg.reasoning_expanded = !msg.reasoning_expanded;
-                    }
-                } else {
-                    self.chat_state.input_text.push(c);
-                }
+                self.chat_state.input_text.push(c);
                 // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
             }
@@ -302,13 +300,6 @@ impl TuiApp {
             KeyCode::PageUp => {
                 self.chat_state.auto_scroll = false;
                 self.chat_state.scroll = self.chat_state.scroll.saturating_add(10);
-            }
-            KeyCode::Down if self.chat_state.input_text.is_empty() => {
-                self.chat_state.auto_scroll = true;
-            }
-            KeyCode::Up if self.chat_state.input_text.is_empty() => {
-                self.chat_state.auto_scroll = false;
-                self.chat_state.scroll = self.chat_state.scroll.saturating_add(3);
             }
             KeyCode::Esc if self.chat_state.is_generating => {}
             _ => {}
@@ -761,14 +752,17 @@ impl TuiApp {
             return;
         }
 
-        // Timeout check: if generating for over 90s with no response, abort
+        // Timeout check: only abort if NO tokens received within 120s.
+        // If the model is actively generating (reasoning or content), keep waiting.
         if let Some(start) = self.chat_state.generation_start {
             let elapsed = start.elapsed().as_secs();
-            if elapsed > 90 {
+            let has_output = !self.chat_state.streaming_text.is_empty()
+                || !self.chat_state.streaming_reasoning.is_empty();
+            if elapsed > 120 && !has_output {
                 self.chat_state.add_message(
                     "system",
-                    "Request timed out (90s). The model may not be responding. \
-                     Try a smaller model, reduce context size, or check server resources.",
+                    "Request timed out (120s with no output). The model may not be responding. \
+                     Try a smaller model, reduce context size, or disable reasoning in Settings.",
                 );
                 self.chat_state.finalize_streaming();
                 self.chat_stream_rx = None;
