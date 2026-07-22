@@ -12,6 +12,8 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input_text: String,
     pub scroll: usize,
+    /// Maximum scroll position (set by render, used by key handler)
+    pub max_scroll: usize,
     pub is_generating: bool,
     pub current_model: Option<String>,
     pub current_backend: Option<String>,
@@ -34,6 +36,7 @@ impl Default for ChatState {
             }],
             input_text: String::new(),
             scroll: 0,
+            max_scroll: 0,
             is_generating: false,
             current_model: None,
             current_backend: None,

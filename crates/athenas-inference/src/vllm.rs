@@ -8,7 +8,7 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
-    ModelLoadConfig, StreamChunk,
+    MessageContent, ModelLoadConfig, StreamChunk,
 };
 
 /// vLLM backend — manages a vLLM Python subprocess for high-throughput inference
@@ -179,9 +179,15 @@ impl Backend for VllmBackend {
             .messages
             .iter()
             .map(|m| {
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        serde_json::to_value(parts).unwrap_or(serde_json::Value::Null)
+                    }
+                };
                 serde_json::json!({
                     "role": m.role.to_string(),
-                    "content": m.content,
+                    "content": content,
                 })
             })
             .collect();
@@ -255,9 +261,15 @@ impl Backend for VllmBackend {
             .messages
             .iter()
             .map(|m| {
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        serde_json::to_value(parts).unwrap_or(serde_json::Value::Null)
+                    }
+                };
                 serde_json::json!({
                     "role": m.role.to_string(),
-                    "content": m.content,
+                    "content": content,
                 })
             })
             .collect();

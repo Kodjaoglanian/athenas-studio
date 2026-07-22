@@ -7,7 +7,7 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
-    ModelLoadConfig, Role, StreamChunk,
+    MessageContent, ModelLoadConfig, Role, StreamChunk,
 };
 
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
@@ -453,7 +453,13 @@ impl Backend for LlamaCppBackend {
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 };
-                serde_json::json!({"role": role, "content": m.content})
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        serde_json::to_value(parts).unwrap_or(serde_json::Value::Null)
+                    }
+                };
+                serde_json::json!({"role": role, "content": content})
             })
             .collect();
 
@@ -558,7 +564,13 @@ impl Backend for LlamaCppBackend {
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 };
-                serde_json::json!({"role": role, "content": m.content})
+                let content = match &m.content {
+                    MessageContent::Text(s) => serde_json::Value::String(s.clone()),
+                    MessageContent::Parts(parts) => {
+                        serde_json::to_value(parts).unwrap_or(serde_json::Value::Null)
+                    }
+                };
+                serde_json::json!({"role": role, "content": content})
             })
             .collect();
 

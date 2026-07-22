@@ -46,7 +46,7 @@ pub async fn run(
 
     let response = backend.chat(req).await?;
 
-    println!("{}", response.message.content);
+    println!("{}", response.message.content.as_text());
     eprintln!(
         "\n--- {} tokens in {:.1} tok/s ---",
         response.stats.tokens_generated, response.stats.tokens_per_second

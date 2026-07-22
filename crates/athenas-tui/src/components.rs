@@ -14,7 +14,7 @@ use crate::settings::SettingsState;
 pub fn render_chat_area(
     f: &mut Frame,
     area: Rect,
-    state: &ChatState,
+    state: &mut ChatState,
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
@@ -35,7 +35,7 @@ pub fn render_chat_area(
 fn render_messages(
     f: &mut Frame,
     area: Rect,
-    state: &ChatState,
+    state: &mut ChatState,
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
@@ -208,6 +208,14 @@ fn render_messages(
     let total_lines = lines.len();
     let max_scroll = total_lines.saturating_sub(inner_height);
 
+    // Save max_scroll so key handler can detect bottom
+    state.max_scroll = max_scroll;
+
+    // If not auto-scrolling and user scrolled past bottom, re-enable auto-scroll
+    if !state.auto_scroll && state.scroll >= max_scroll {
+        state.auto_scroll = true;
+    }
+
     // Auto-scroll to bottom when enabled; clamp manual scroll to max
     let scroll = if state.auto_scroll {
         max_scroll
@@ -218,7 +226,7 @@ fn render_messages(
     // Show scroll indicator in title when content overflows
     let title = if total_lines > inner_height {
         if state.auto_scroll {
-            " Athenas Studio — Chat [↓ auto] ".to_string()
+            " Athenas Studio — Chat ".to_string()
         } else {
             let pct = if max_scroll > 0 {
                 ((scroll as f32 / max_scroll as f32) * 100.0) as u32
@@ -296,7 +304,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     }
 
     status_parts.push(Span::raw(
-        " | Enter: Send | ↑↓: Scroll | PgUp/Dn: Jump | Tab: Thinking | Ctrl+C: Quit ",
+        " | Enter: Send | Up/Down: Scroll | Tab: Thinking | Ctrl+C: Quit ",
     ));
 
     let line = Line::from(status_parts);

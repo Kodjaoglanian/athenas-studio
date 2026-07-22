@@ -8,7 +8,8 @@ use std::io::stdout;
 
 use athenas_core::{AppConfig, HardwareInfo, ModelRegistry, Result};
 use athenas_inference::{
-    Backend, BackendFactory, ChatMessage, ChatRequest, ModelLoadConfig, Role, StreamChunk,
+    Backend, BackendFactory, ChatMessage, ChatRequest, MessageContent, ModelLoadConfig, Role,
+    StreamChunk,
 };
 
 use crate::chat::ChatState;
@@ -229,7 +230,7 @@ impl TuiApp {
         self.model_list_state.set_models(models);
     }
 
-    fn render(&self, f: &mut ratatui::Frame) {
+    fn render(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
 
         // Split off tab bar (1 line) + content
@@ -249,7 +250,7 @@ impl TuiApp {
                 components::render_chat_area(
                     f,
                     content,
-                    &self.chat_state,
+                    &mut self.chat_state,
                     self.is_loading_model,
                     self.loading_spinner,
                 );
@@ -286,24 +287,20 @@ impl TuiApp {
                     msg.reasoning_expanded = !msg.reasoning_expanded;
                 }
             }
-            // Up arrow: scroll up (toward beginning) — decrease scroll offset
+            // Up: scroll up one line (toward older messages)
             KeyCode::Up => {
-                if self.chat_state.auto_scroll {
-                    // Switch from auto-scroll: we're at the bottom, go up 1 line
-                    self.chat_state.auto_scroll = false;
-                    // Set a large value; render clamps to max_scroll, then
-                    // next press subtracts 1 from there
-                    self.chat_state.scroll = usize::MAX;
-                } else {
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
-                }
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
             }
-            // Down arrow: scroll down (toward end) — increase scroll offset
+            // Down: scroll down one line (toward newer messages)
+            // If we reach the bottom, re-enable auto-scroll
             KeyCode::Down => {
                 if self.chat_state.auto_scroll {
-                    // Already at bottom, nothing to do
+                    // Already following, nothing to do
                 } else {
                     self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
+                    // Render will clamp; if we hit bottom, auto-scroll re-enables
+                    // We use a flag to detect this in render via a large scroll value
                 }
             }
             KeyCode::Char(c)
@@ -315,22 +312,6 @@ impl TuiApp {
             }
             KeyCode::Backspace => {
                 self.chat_state.input_text.pop();
-            }
-            KeyCode::PageDown => {
-                // Jump toward end (increase scroll by 10)
-                if self.chat_state.auto_scroll {
-                    // Already at bottom, nothing to do
-                } else {
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(10);
-                }
-            }
-            KeyCode::PageUp => {
-                // Jump toward beginning (decrease scroll by 10)
-                if self.chat_state.auto_scroll {
-                    self.chat_state.auto_scroll = false;
-                    self.chat_state.scroll = usize::MAX;
-                }
-                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(10);
             }
             KeyCode::Esc if self.chat_state.is_generating => {}
             _ => {}
@@ -712,7 +693,7 @@ impl TuiApp {
                 };
                 ChatMessage {
                     role,
-                    content: m.content.clone(),
+                    content: MessageContent::Text(m.content.clone()),
                 }
             })
             .collect();
@@ -738,7 +719,7 @@ impl TuiApp {
                         Ok(resp) => {
                             let _ = tx
                                 .send(StreamChunk {
-                                    text: resp.message.content,
+                                    text: resp.message.content.as_text(),
                                     done: false,
                                     is_reasoning: false,
                                     stats: None,
@@ -840,6 +821,32 @@ impl TuiApp {
             "/clear" => {
                 self.chat_state.clear();
             }
+            "/unload" => {
+                if let Some(mut backend) = self.backend.take() {
+                    let model_name = backend
+                        .model_info()
+                        .map(|i| i.name.clone())
+                        .unwrap_or_default();
+                    match backend.unload_model().await {
+                        Ok(()) => {
+                            self.chat_state.current_model = None;
+                            self.chat_state.current_backend = None;
+                            self.chat_state.add_message(
+                                "system",
+                                &format!("Model '{}' unloaded from memory.", model_name),
+                            );
+                        }
+                        Err(e) => {
+                            self.chat_state
+                                .add_message("system", &format!("Failed to unload model: {}", e));
+                            self.backend = Some(backend);
+                        }
+                    }
+                } else {
+                    self.chat_state
+                        .add_message("system", "No model is currently loaded.");
+                }
+            }
             "/model" | "/models" => {
                 self.mode = AppMode::ModelList;
                 self.refresh_models();
@@ -857,7 +864,7 @@ impl TuiApp {
             "/help" => {
                 self.chat_state.add_message(
                     "system",
-                    "Commands: /clear, /model, /models, /browser, /server, /settings, /help, /quit\n\
+                    "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /help, /quit\n\
                      F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | Ctrl+C: Quit",
                 );
             }

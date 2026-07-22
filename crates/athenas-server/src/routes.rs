@@ -18,7 +18,10 @@ use tower_http::{
 };
 
 use athenas_core::ServerConfig;
-use athenas_inference::{Backend, ChatMessage, ChatRequest, CompletionRequest, Role, StreamChunk};
+use athenas_inference::{
+    Backend, ChatMessage, ChatRequest, CompletionRequest, ContentPart, MessageContent, Role,
+    StreamChunk,
+};
 
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
@@ -53,6 +56,7 @@ pub fn create_router(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/models", get(list_models))
+        .route("/v1/files", post(upload_file))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/health", get(health))
@@ -188,7 +192,27 @@ struct ChatCompletionRequest {
 #[derive(Debug, Deserialize, Serialize)]
 struct ChatCompletionMessage {
     role: String,
-    content: String,
+    #[serde(deserialize_with = "deserialize_content")]
+    content: MessageContent,
+}
+
+/// Deserialize content that can be either a string or an array of content parts
+fn deserialize_content<'de, D>(deserializer: D) -> Result<MessageContent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_string() {
+        Ok(MessageContent::Text(
+            value.as_str().unwrap_or("").to_string(),
+        ))
+    } else if value.is_array() {
+        let parts: Vec<ContentPart> =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(MessageContent::Parts(parts))
+    } else {
+        Ok(MessageContent::Text(String::new()))
+    }
 }
 
 async fn chat_completions(
@@ -325,7 +349,7 @@ async fn chat_completions(
                         "index": 0,
                         "message": {
                             "role": "assistant",
-                            "content": resp.message.content,
+                            "content": resp.message.content.as_text(),
                         },
                         "finish_reason": "stop",
                     }],
@@ -499,4 +523,92 @@ async fn completions(
             }
         }
     }
+}
+
+/// Upload an image file for use in multimodal chat completions.
+/// Returns a data URI that can be used as image_url in chat messages.
+async fn upload_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut filename: Option<String> = None;
+    let mut content_type: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        if name == "file" {
+            filename = field.file_name().map(|s| s.to_string());
+            content_type = field.content_type().map(|s| s.to_string());
+            match field.bytes().await {
+                Ok(bytes) => {
+                    file_data = Some(bytes.to_vec());
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to read file: {}", e)})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
+    let data = match file_data {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No file uploaded. Use multipart form with 'file' field."})),
+            )
+                .into_response();
+        }
+    };
+
+    let mime = content_type.unwrap_or_else(|| {
+        let name = filename.as_deref().unwrap_or("");
+        if name.ends_with(".png") {
+            "image/png".to_string()
+        } else if name.ends_with(".jpg") || name.ends_with(".jpeg") {
+            "image/jpeg".to_string()
+        } else if name.ends_with(".gif") {
+            "image/gif".to_string()
+        } else if name.ends_with(".webp") {
+            "image/webp".to_string()
+        } else if name.ends_with(".bmp") {
+            "image/bmp".to_string()
+        } else {
+            "application/octet-stream".to_string()
+        }
+    });
+
+    if !mime.starts_with("image/") {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({"error": format!("Only image files are supported, got: {}", mime)})),
+        )
+            .into_response();
+    }
+
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data);
+    let data_uri = format!("data:{};base64,{}", mime, b64);
+
+    let file_id = uuid::Uuid::new_v4().to_string();
+    let response = serde_json::json!({
+        "id": file_id,
+        "object": "file",
+        "bytes": data.len(),
+        "created_at": chrono::Utc::now().timestamp(),
+        "filename": filename.unwrap_or_else(|| "upload".to_string()),
+        "purpose": "vision",
+        "url": data_uri,
+    });
+
+    Json(response).into_response()
 }

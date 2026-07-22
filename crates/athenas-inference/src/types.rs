@@ -20,29 +20,105 @@ impl std::fmt::Display for Role {
     }
 }
 
+/// A single content part in a multimodal message (OpenAI vision format).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrl {
+    /// Either a data URI (data:image/png;base64,...) or a remote URL
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Message content: either plain text or an array of content parts (multimodal).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+impl MessageContent {
+    pub fn as_text(&self) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        }
+    }
+
+    pub fn has_images(&self) -> bool {
+        match self {
+            MessageContent::Text(_) => false,
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageUrl { .. })),
+        }
+    }
+}
+
+impl Default for MessageContent {
+    fn default() -> Self {
+        MessageContent::Text(String::new())
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(s: String) -> Self {
+        MessageContent::Text(s)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(s: &str) -> Self {
+        MessageContent::Text(s.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
-    pub content: String,
+    pub content: MessageContent,
 }
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: Role::System,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
-            content: content.into(),
+            content: MessageContent::Text(content.into()),
+        }
+    }
+    /// Create a user message with multimodal content (text + images)
+    pub fn user_multimodal(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: Role::User,
+            content: MessageContent::Parts(parts),
         }
     }
 }
