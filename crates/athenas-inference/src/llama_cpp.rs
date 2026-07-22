@@ -233,7 +233,7 @@ impl LlamaCppBackend {
                                     self.server_handle = None;
                                     // Retry the spawn by returning a special error
                                     // that the caller can retry, or just retry inline
-                                    return self.retry_start_server(&config).await;
+                                    return self.retry_start_server(config).await;
                                 }
                             }
                             msg.push_str(
