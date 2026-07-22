@@ -896,22 +896,53 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             let is_start = *field == ConfigField::StartServer;
             let is_stop = *field == ConfigField::StopServer;
 
-            let (action_color, action_text) = if is_start {
+            let (action_color, action_text): (Color, String) = if is_start {
                 if state.phase == ServerPhase::Running {
-                    (Color::DarkGray, "● Server is running")
+                    (Color::DarkGray, "● Server is running".to_string())
                 } else if state.phase == ServerPhase::LoadingModel {
-                    (Color::Cyan, "⟳ Loading model...")
+                    (Color::Cyan, "⟳ Loading model...".to_string())
                 } else {
-                    (Color::Green, "▶ Start Server")
+                    (Color::Green, "▶ Start Server".to_string())
                 }
             } else if is_stop {
                 if state.phase == ServerPhase::Running {
-                    (Color::Red, "■ Stop Server")
+                    (Color::Red, "■ Stop Server".to_string())
                 } else {
-                    (Color::DarkGray, "■ Server not running")
+                    (Color::DarkGray, "■ Server not running".to_string())
+                }
+            } else if *field == ConfigField::LoadAdditionalModel {
+                if state.phase == ServerPhase::Running {
+                    (Color::Green, "▶ Load Additional Model".to_string())
+                } else {
+                    (Color::DarkGray, "○ Start server first".to_string())
+                }
+            } else if *field == ConfigField::UnloadModel {
+                if state.loaded_models.is_empty() {
+                    (Color::DarkGray, "○ No models loaded".to_string())
+                } else {
+                    let m = &state.loaded_models[state
+                        .unload_model_selected
+                        .min(state.loaded_models.len() - 1)];
+                    (
+                        Color::Yellow,
+                        format!(
+                            "■ Unload: {}{}",
+                            m.name,
+                            if m.is_default { " [default]" } else { "" }
+                        ),
+                    )
+                }
+            } else if *field == ConfigField::SetDefaultModel {
+                if state.loaded_models.is_empty() {
+                    (Color::DarkGray, "○ No models loaded".to_string())
+                } else {
+                    let m = &state.loaded_models[state
+                        .default_model_selected
+                        .min(state.loaded_models.len() - 1)];
+                    (Color::Cyan, format!("★ Default: {}", m.name))
                 }
             } else {
-                (Color::Gray, "")
+                (Color::Gray, String::new())
             };
 
             let style = if is_selected {
@@ -923,6 +954,26 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             };
 
             lines.push(Line::styled(format!("{}  {}", prefix, action_text), style));
+
+            // Show hint for multi-model actions when selected
+            if is_selected && !state.editing {
+                let hint = match field {
+                    ConfigField::LoadAdditionalModel => {
+                        "Select model above with Left/Right, then press Enter here"
+                    }
+                    ConfigField::UnloadModel => "Left/Right to pick model, Enter to unload",
+                    ConfigField::SetDefaultModel => {
+                        "Left/Right to pick model, Enter to set default"
+                    }
+                    _ => "",
+                };
+                if !hint.is_empty() {
+                    lines.push(Line::styled(
+                        format!("     hint: {}", hint),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
             continue;
         }
 
@@ -964,8 +1015,45 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         }
     }
 
-    // Show endpoints when running
+    // Show loaded models and endpoints when running
     if state.phase == ServerPhase::Running {
+        // Loaded models list
+        if !state.loaded_models.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                " LOADED MODELS",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                " ─────────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            ));
+            for m in &state.loaded_models {
+                let default_marker = if m.is_default { " ★" } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("   {}  ", m.id),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        m.name.clone(),
+                        Style::default().fg(if m.is_default {
+                            Color::Green
+                        } else {
+                            Color::White
+                        }),
+                    ),
+                    Span::styled(
+                        format!("  [{}]", m.backend),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(default_marker, Style::default().fg(Color::Yellow)),
+                ]));
+            }
+        }
+
         lines.push(Line::from(""));
         lines.push(Line::styled(
             " ENDPOINTS",
