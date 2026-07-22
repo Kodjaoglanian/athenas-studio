@@ -210,6 +210,16 @@ impl LlamaCppBackend {
             cmd.arg("--mlock");
         }
 
+        // Multimodal projector (mmproj) for vision models
+        let mmproj_path = config
+            .mmproj_path
+            .clone()
+            .or_else(|| auto_detect_mmproj(&config.model_path));
+        if let Some(mmproj) = mmproj_path {
+            info!("Using mmproj: {}", mmproj);
+            cmd.arg("--mmproj").arg(mmproj);
+        }
+
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -951,6 +961,34 @@ impl Drop for LlamaCppBackend {
             let _ = child.start_kill();
         }
     }
+}
+
+/// Auto-detect a multimodal projector (mmproj) file in the same directory as the model.
+/// Searches for files containing "mmproj" in the name with common extensions (.gguf, .bin, .safetensors).
+fn auto_detect_mmproj(model_path: &str) -> Option<String> {
+    let path = std::path::Path::new(model_path);
+    let dir = path.parent()?;
+
+    let entries = std::fs::read_dir(dir).ok()?;
+
+    // Look for files with "mmproj" in the name
+    let mut candidates: Vec<(String, u64)> = Vec::new();
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_file() {
+            if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
+                let lower = name.to_lowercase();
+                if lower.contains("mmproj") {
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    candidates.push((entry_path.to_string_lossy().to_string(), size));
+                }
+            }
+        }
+    }
+
+    // Pick the largest mmproj file (most likely the correct one)
+    candidates.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+    candidates.first().map(|(p, _)| p.clone())
 }
 
 fn find_free_port() -> u16 {

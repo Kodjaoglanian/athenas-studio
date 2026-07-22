@@ -672,6 +672,7 @@ struct LoadModelRequest {
     flash_attention: Option<bool>,
     reasoning_enabled: Option<bool>,
     reasoning_budget: Option<i32>,
+    mmproj_path: Option<String>,
     set_default: Option<bool>,
 }
 
@@ -723,6 +724,7 @@ async fn load_model_endpoint(
         use_mlock: false,
         reasoning_enabled: req.reasoning_enabled.unwrap_or(false),
         reasoning_budget: req.reasoning_budget.unwrap_or(-1),
+        mmproj_path: req.mmproj_path,
     };
 
     if let Err(e) = backend.load_model(load_config).await {

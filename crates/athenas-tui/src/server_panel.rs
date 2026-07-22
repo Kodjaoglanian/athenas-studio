@@ -642,6 +642,7 @@ impl ServerPanelState {
             use_mlock: false,
             reasoning_enabled: self.reasoning_enabled,
             reasoning_budget: self.reasoning_budget,
+            mmproj_path: None,
         }
     }
 

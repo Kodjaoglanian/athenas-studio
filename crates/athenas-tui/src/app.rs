@@ -585,10 +585,48 @@ impl TuiApp {
         let repo_id_owned = repo_id.to_string();
         let filename_owned = filename.to_string();
 
+        // Also fetch mmproj files for multimodal support
+        let client_for_mmproj = client.clone();
+        let downloader_clone = athenas_hub::ModelDownloader::new(
+            client_for_mmproj.clone(),
+            self.config.paths.models_dir.clone(),
+        );
+        let tx_clone = tx.clone();
+
         let download_task = tokio::spawn(async move {
-            downloader
+            let result = downloader
                 .download_model(&repo_id_owned, &filename_owned, "main", Some(tx))
-                .await
+                .await;
+
+            if result.is_ok() {
+                // Auto-download mmproj files if present
+                if let Ok(files) = client_for_mmproj
+                    .get_model_files(&repo_id_owned, "main")
+                    .await
+                {
+                    let mmproj_files: Vec<_> = files
+                        .iter()
+                        .filter(|f| {
+                            f.r#type == "file"
+                                && f.path.to_lowercase().contains("mmproj")
+                                && (f.path.ends_with(".gguf") || f.path.ends_with(".bin"))
+                        })
+                        .collect();
+
+                    for mmproj in &mmproj_files {
+                        let _ = downloader_clone
+                            .download_model(
+                                &repo_id_owned,
+                                &mmproj.path,
+                                "main",
+                                Some(tx_clone.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            result
         });
 
         self.download_progress_rx = Some(rx);
@@ -979,6 +1017,7 @@ impl TuiApp {
             use_mlock: false,
             reasoning_enabled: self.config.inference.reasoning_enabled,
             reasoning_budget: self.config.inference.reasoning_budget,
+            mmproj_path: None,
         };
 
         let task = tokio::spawn(async move {

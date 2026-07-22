@@ -49,6 +49,7 @@ pub async fn run(
         use_mlock: false,
         reasoning_enabled: config.inference.reasoning_enabled,
         reasoning_budget: config.inference.reasoning_budget,
+        mmproj_path: None,
     };
 
     backend.load_model(load_config).await?;

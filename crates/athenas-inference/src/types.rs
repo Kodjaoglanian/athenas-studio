@@ -206,6 +206,9 @@ pub struct ModelLoadConfig {
     pub use_mlock: bool,
     pub reasoning_enabled: bool,
     pub reasoning_budget: i32,
+    /// Path to multimodal projector file (mmproj) for vision models.
+    /// If None, auto-detection will be attempted in the model's directory.
+    pub mmproj_path: Option<String>,
 }
 
 impl Default for ModelLoadConfig {
@@ -225,6 +228,7 @@ impl Default for ModelLoadConfig {
             use_mlock: false,
             reasoning_enabled: true,
             reasoning_budget: -1,
+            mmproj_path: None,
         }
     }
 }

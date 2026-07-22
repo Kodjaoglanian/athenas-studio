@@ -132,6 +132,7 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             use_mlock: false,
             reasoning_enabled: config.inference.reasoning_enabled,
             reasoning_budget: config.inference.reasoning_budget,
+            mmproj_path: None,
         })
         .await?;
     let load_time = load_start.elapsed();

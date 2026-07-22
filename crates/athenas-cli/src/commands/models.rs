@@ -183,6 +183,70 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
     progress_task.await.ok();
 
     println!("\nModel saved to: {}", path.display());
+
+    // Auto-download mmproj file if present in the repo (for multimodal models)
+    let mmproj_files: Vec<_> = files
+        .iter()
+        .filter(|f| {
+            f.r#type == "file"
+                && f.path.to_lowercase().contains("mmproj")
+                && (f.path.ends_with(".gguf") || f.path.ends_with(".bin"))
+        })
+        .collect();
+
+    if !mmproj_files.is_empty() {
+        for mmproj in &mmproj_files {
+            // Check if already downloaded
+            let safe_repo = repo_id.replace('/', "__");
+            let mmproj_dir = config.paths.models_dir.join(&safe_repo);
+            let mmproj_local = mmproj_dir.join(&mmproj.path);
+
+            if mmproj_local.exists() {
+                println!("mmproj already present: {}", mmproj.path);
+                continue;
+            }
+
+            println!("\nDownloading multimodal projector: {}", mmproj.path);
+
+            let (tx2, mut rx2) = tokio::sync::mpsc::channel::<athenas_hub::DownloadProgress>(10);
+            let pb2 = if let Some(size) = mmproj.size.or(mmproj.lfs.as_ref().and_then(|l| l.size)) {
+                ProgressBar::new(size)
+            } else {
+                ProgressBar::new_spinner()
+            };
+            pb2.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}) {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            let pb2_clone = pb2.clone();
+            let progress_task2 = tokio::spawn(async move {
+                while let Some(progress) = rx2.recv().await {
+                    pb2_clone.set_position(progress.downloaded_bytes);
+                    if let Some(speed) = Some(progress.speed_mbps) {
+                        pb2_clone.set_message(format!("{:.1} MB/s", speed));
+                    }
+                }
+                pb2_clone.finish_with_message("mmproj download complete");
+            });
+
+            if let Err(e) = downloader
+                .download_model(repo_id, &mmproj.path, revision, Some(tx2))
+                .await
+            {
+                println!(
+                    "\nWarning: failed to download mmproj ({}): {}",
+                    mmproj.path, e
+                );
+            } else {
+                println!("\nmmproj saved alongside model — vision support enabled.");
+            }
+            progress_task2.await.ok();
+        }
+    }
+
     println!("You can now use it with: athenas chat {}", filename);
 
     Ok(())
