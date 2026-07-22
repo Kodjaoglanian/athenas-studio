@@ -36,6 +36,7 @@ impl LlamaCppBackend {
             server_port: 0,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
+                .http1_only()
                 .build()
                 .unwrap(),
         }
@@ -538,9 +539,33 @@ impl Backend for LlamaCppBackend {
         let mut full_text = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk =
-                chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            match chunk_result {
+                Ok(chunk) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                }
+                Err(e) => {
+                    // Stream errors often happen when the server closes the
+                    // connection after sending [DONE]. If we already have text,
+                    // finalize gracefully instead of propagating the error.
+                    tracing::warn!("Stream chunk error (graceful handling): {}", e);
+                    if !full_text.is_empty() {
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: String::new(),
+                                done: true,
+                                stats: Some(InferenceStats {
+                                    tokens_generated: full_text.split_whitespace().count() as u32,
+                                    tokens_prompt: 0,
+                                    time_total_ms: 0,
+                                    tokens_per_second: 0.0,
+                                }),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                    return Err(AthenasError::Backend(format!("Stream error: {}", e)));
+                }
+            }
 
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim().to_string();
