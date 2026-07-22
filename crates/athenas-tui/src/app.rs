@@ -605,16 +605,19 @@ impl TuiApp {
         self.chat_state.is_generating = true;
 
         // Build chat request from current messages
+        // Filter out ALL system messages — they are TUI informational messages
+        // (welcome, model loaded, errors) not meant for the model's context.
+        // Many model chat templates (e.g. Qwen) require system messages only
+        // at the beginning and reject them if placed after user/assistant turns.
         let messages: Vec<ChatMessage> = self
             .chat_state
             .messages
             .iter()
-            .filter(|m| m.role != "system" || !m.content.contains("Welcome"))
+            .filter(|m| m.role != "system")
             .map(|m| {
                 let role = match m.role.as_str() {
                     "user" => Role::User,
                     "assistant" => Role::Assistant,
-                    "system" => Role::System,
                     _ => Role::User,
                 };
                 ChatMessage {
