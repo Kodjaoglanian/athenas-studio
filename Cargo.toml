@@ -36,7 +36,7 @@ futures = "0.3"
 axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "timeout", "limit", "request-id", "util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "macos-system-configuration"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "charset", "http2", "macos-system-configuration", "gzip"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
