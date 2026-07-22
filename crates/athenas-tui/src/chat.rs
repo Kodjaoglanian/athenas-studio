@@ -83,9 +83,17 @@ impl ChatState {
 
     pub fn finalize_streaming(&mut self) {
         if !self.streaming_text.is_empty() || !self.streaming_reasoning.is_empty() {
+            let content = if self.streaming_text.is_empty() && !self.streaming_reasoning.is_empty()
+            {
+                "(Model produced only thinking/reasoning but no response. \
+                 Try rephrasing, increasing max_tokens, or disabling reasoning in Settings.)"
+                    .to_string()
+            } else {
+                self.streaming_text.clone()
+            };
             self.messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: self.streaming_text.clone(),
+                content,
                 reasoning: self.streaming_reasoning.clone(),
                 reasoning_expanded: false,
             });

@@ -6,10 +6,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use prometheus::{
-    register_histogram_vec, register_int_counter_vec, register_int_gauge, HistogramVec,
-    IntCounterVec, IntGauge, TextEncoder,
-};
+use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, IntGauge, Opts, TextEncoder};
 
 pub struct Metrics {
     pub requests_total: IntCounterVec,
@@ -22,43 +19,77 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn new() -> Self {
-        Self {
-            requests_total: register_int_counter_vec!(
-                "athenas_requests_total",
-                "Total number of requests",
-                &["endpoint", "method"]
-            )
-            .unwrap(),
-            requests_active: register_int_gauge!(
-                "athenas_requests_active",
-                "Number of active in-flight requests"
-            )
-            .unwrap(),
-            request_duration: register_histogram_vec!(
+        // Use the global registry to avoid "AlreadyReg" panics when
+        // Metrics::new() is called more than once (e.g. server restart in TUI).
+        let registry = prometheus::default_registry();
+
+        let requests_total = IntCounterVec::new(
+            Opts::new("athenas_requests_total", "Total number of requests")
+                .variable_labels(vec!["endpoint".into(), "method".into()]),
+            &["endpoint", "method"],
+        )
+        .expect("create counter");
+        registry.register(Box::new(requests_total.clone())).ok(); // ignore AlreadyReg
+
+        let requests_active = IntGauge::new(
+            "athenas_requests_active",
+            "Number of active in-flight requests",
+        )
+        .expect("create gauge");
+        registry.register(Box::new(requests_active.clone())).ok();
+
+        let request_duration = HistogramVec::new(
+            HistogramOpts::new(
                 "athenas_request_duration_seconds",
                 "Request duration in seconds",
-                &["endpoint"],
-                vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,]
             )
-            .unwrap(),
-            tokens_prompt_total: register_int_counter_vec!(
+            .variable_labels(vec!["endpoint".into()])
+            .buckets(vec![
+                0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+            ]),
+            &["endpoint"],
+        )
+        .expect("create histogram");
+        registry.register(Box::new(request_duration.clone())).ok();
+
+        let tokens_prompt_total = IntCounterVec::new(
+            Opts::new(
                 "athenas_tokens_prompt_total",
                 "Total prompt tokens processed",
-                &["model"]
             )
-            .unwrap(),
-            tokens_generated_total: register_int_counter_vec!(
-                "athenas_tokens_generated_total",
-                "Total tokens generated",
-                &["model"]
-            )
-            .unwrap(),
-            errors_total: register_int_counter_vec!(
-                "athenas_errors_total",
-                "Total number of errors",
-                &["endpoint", "type"]
-            )
-            .unwrap(),
+            .variable_labels(vec!["model".into()]),
+            &["model"],
+        )
+        .expect("create counter");
+        registry
+            .register(Box::new(tokens_prompt_total.clone()))
+            .ok();
+
+        let tokens_generated_total = IntCounterVec::new(
+            Opts::new("athenas_tokens_generated_total", "Total tokens generated")
+                .variable_labels(vec!["model".into()]),
+            &["model"],
+        )
+        .expect("create counter");
+        registry
+            .register(Box::new(tokens_generated_total.clone()))
+            .ok();
+
+        let errors_total = IntCounterVec::new(
+            Opts::new("athenas_errors_total", "Total number of errors")
+                .variable_labels(vec!["endpoint".into(), "type".into()]),
+            &["endpoint", "type"],
+        )
+        .expect("create counter");
+        registry.register(Box::new(errors_total.clone())).ok();
+
+        Self {
+            requests_total,
+            requests_active,
+            request_duration,
+            tokens_prompt_total,
+            tokens_generated_total,
+            errors_total,
         }
     }
 
