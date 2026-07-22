@@ -491,26 +491,11 @@ impl TuiApp {
                     .collect();
 
                 if gguf_files.is_empty() {
-                    let st_files: Vec<(String, Option<u64>)> = files
-                        .iter()
-                        .filter(|f| f.path.ends_with(".safetensors"))
-                        .map(|f| {
-                            (
-                                f.path.clone(),
-                                f.size.or(f.lfs.as_ref().and_then(|l| l.size)),
-                            )
-                        })
-                        .collect();
-
-                    if st_files.is_empty() {
-                        self.browser_state.status_message =
-                            Some("No model files found in this repo".to_string());
-                    } else {
-                        self.browser_state.file_options = st_files;
-                        self.browser_state.file_selected = 0;
-                        self.browser_state.phase = BrowserPhase::SelectFile;
-                        self.browser_state.status_message = None;
-                    }
+                    self.browser_state.status_message = Some(
+                        "No GGUF files found in this repo. llama-server requires GGUF format. \
+                         Try searching for GGUF-quantized versions."
+                            .to_string(),
+                    );
                 } else {
                     self.browser_state.file_options = gguf_files;
                     self.browser_state.file_selected = 0;

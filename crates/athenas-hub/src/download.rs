@@ -60,13 +60,26 @@ impl ModelDownloader {
                 "Server supports range requests, using parallel download ({} chunks)",
                 PARALLEL_CHUNKS
             );
-            self.parallel_download(&download_url, &file_path, progress_tx)
+            match self
+                .parallel_download(&download_url, &file_path, progress_tx.clone())
                 .await
-        } else {
-            info!("Server does not support range requests, using single-stream download");
-            self.single_stream_download(&download_url, &file_path, progress_tx)
-                .await
+            {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    warn!(
+                        "Parallel download failed ({}), falling back to single-stream",
+                        e
+                    );
+                    // Clean up any partial files
+                    let temp_path = file_path.with_extension("part");
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                }
+            }
         }
+
+        info!("Using single-stream download");
+        self.single_stream_download(&download_url, &file_path, progress_tx)
+            .await
     }
 
     async fn check_range_support(&self, url: &str) -> Result<bool> {
