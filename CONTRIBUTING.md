@@ -8,7 +8,7 @@ Thank you for your interest in contributing to Athenas Studio! This document out
 2. Clone the repository:
    ```bash
    git clone https://github.com/Kodjaoglanian/athenas-studio.git
-   cd athenas
+   cd athenas-studio
    ```
 3. Build:
    ```bash
@@ -21,12 +21,19 @@ The project is organized as a Cargo workspace with 6 crates:
 
 | Crate | Description |
 |-------|-------------|
-| `athenas-core` | Config, storage, hardware detection, model registry |
-| `athenas-inference` | Backend trait, llama.cpp & vLLM implementations |
-| `athenas-hub` | HuggingFace API client, download manager |
-| `athenas-server` | OpenAI-compatible API server (axum) |
-| `athenas-tui` | Terminal UI (ratatui + crossterm) |
+| `athenas-core` | Config, storage, hardware detection, model registry, resource limits |
+| `athenas-inference` | Backend trait, llama.cpp & vLLM implementations, mmproj auto-detection |
+| `athenas-hub` | HuggingFace API client, download manager, mmproj auto-download |
+| `athenas-server` | OpenAI-compatible API server (axum), multi-model manager, file upload |
+| `athenas-tui` | Terminal UI (ratatui + crossterm), server panel with multi-model management |
 | `athenas-cli` | CLI entry point (clap) |
+
+## Key Features
+
+- **Multi-Model Management** — Load/unload multiple models simultaneously via TUI or API
+- **Multimodal Support** — Automatic mmproj detection and download for vision models
+- **Reasoning Mode** — Configurable thinking budget for reasoning models (Qwen3.5, DeepSeek R1)
+- **Auto Resource Limits** — Hardware-aware capping of threads, context, and batch size
 
 ## Coding Guidelines
 
