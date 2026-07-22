@@ -9,6 +9,7 @@ pub enum SettingsField {
     Temperature,
     MaxTokens,
     FlashAttention,
+    Streaming,
     ServerHost,
     ServerPort,
     ServerApiKey,
@@ -24,6 +25,7 @@ impl SettingsField {
             SettingsField::Temperature,
             SettingsField::MaxTokens,
             SettingsField::FlashAttention,
+            SettingsField::Streaming,
             SettingsField::ServerHost,
             SettingsField::ServerPort,
             SettingsField::ServerApiKey,
@@ -39,6 +41,7 @@ impl SettingsField {
             SettingsField::Temperature => "Temperature",
             SettingsField::MaxTokens => "Max Tokens",
             SettingsField::FlashAttention => "Flash Attention",
+            SettingsField::Streaming => "Streaming",
             SettingsField::ServerHost => "Server Host",
             SettingsField::ServerPort => "Server Port",
             SettingsField::ServerApiKey => "Server API Key",
@@ -53,7 +56,8 @@ impl SettingsField {
             | SettingsField::ContextSize
             | SettingsField::Temperature
             | SettingsField::MaxTokens
-            | SettingsField::FlashAttention => "Inference",
+            | SettingsField::FlashAttention
+            | SettingsField::Streaming => "Inference",
             SettingsField::ServerHost | SettingsField::ServerPort | SettingsField::ServerApiKey => {
                 "Server"
             }
@@ -160,6 +164,9 @@ impl SettingsState {
             SettingsField::FlashAttention => {
                 self.config.inference.flash_attention = value == "true" || value == "1";
             }
+            SettingsField::Streaming => {
+                self.config.inference.streaming_enabled = value == "true" || value == "1";
+            }
             SettingsField::ServerHost => {
                 self.config.server.default_host = value;
             }
@@ -204,6 +211,13 @@ impl SettingsState {
                     "false".to_string()
                 }
             }
+            SettingsField::Streaming => {
+                if self.config.inference.streaming_enabled {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
             SettingsField::ServerHost => self.config.server.default_host.clone(),
             SettingsField::ServerPort => self.config.server.default_port.to_string(),
             SettingsField::ServerApiKey => {
@@ -225,6 +239,7 @@ impl SettingsState {
             SettingsField::Temperature => "0.0 - 2.0",
             SettingsField::MaxTokens => "e.g. 2048",
             SettingsField::FlashAttention => "true | false",
+            SettingsField::Streaming => "true | false (show text as it generates)",
             SettingsField::ServerHost => "e.g. 127.0.0.1",
             SettingsField::ServerPort => "e.g. 8080",
             SettingsField::ServerApiKey => "Leave empty to disable auth",

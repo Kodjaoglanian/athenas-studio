@@ -136,11 +136,10 @@ impl ModelDownloader {
             .await
             .map_err(|e| AthenasError::Download(format!("Range probe failed: {}", e)))?;
 
-        // Extract the final URL after redirects (HuggingFace LFS redirects to CDN)
-        let cdn_url = probe_resp.url().to_string();
-        if cdn_url != url {
-            info!("Resolved CDN URL: {}", cdn_url);
-        }
+        // Note: We intentionally do NOT use the CDN URL from the redirect for chunk
+        // downloads. HuggingFace LFS CDN signed URLs reject arbitrary range requests
+        // with 403 "invalid range". Instead, each chunk request goes to the original
+        // URL and gets a fresh redirect with a signed URL for that specific range.
 
         let total_bytes = probe_resp
             .headers()
@@ -248,7 +247,7 @@ impl ModelDownloader {
             let chunk_path = temp_dir.join(format!(".athenas_chunk_{}", i));
             chunk_paths.push(chunk_path.clone());
 
-            let cdn_url = cdn_url.clone();
+            let chunk_url = url.to_string();
             let client = client.clone();
             let downloaded = downloaded.clone();
             let token = token.clone();
@@ -256,7 +255,7 @@ impl ModelDownloader {
             tasks.push(tokio::spawn(async move {
                 download_chunk_to_file(
                     &client,
-                    &cdn_url,
+                    &chunk_url,
                     token.as_deref(),
                     start,
                     end,

@@ -31,6 +31,8 @@ pub struct InferenceConfig {
     pub default_temperature: f32,
     pub default_top_p: f32,
     pub default_max_tokens: u32,
+    #[serde(default = "default_true")]
+    pub streaming_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,6 +124,7 @@ impl Default for AppConfig {
                 default_temperature: 0.7,
                 default_top_p: 0.9,
                 default_max_tokens: 2048,
+                streaming_enabled: true,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),

@@ -270,20 +270,6 @@ impl LlamaCppBackend {
     fn server_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.server_port)
     }
-
-    fn build_chat_prompt(&self, request: &ChatRequest) -> String {
-        let mut prompt = String::new();
-        for msg in &request.messages {
-            match msg.role {
-                Role::System => prompt.push_str(&format!("<|system|>\n{}\n", msg.content)),
-                Role::User => prompt.push_str(&format!("<|user|>\n{}\n", msg.content)),
-                Role::Assistant => prompt.push_str(&format!("<|assistant|>\n{}\n", msg.content)),
-                Role::Tool => prompt.push_str(&format!("<|tool|>\n{}\n", msg.content)),
-            }
-        }
-        prompt.push_str("<|assistant|>\n");
-        prompt
-    }
 }
 
 #[async_trait]
@@ -324,18 +310,31 @@ impl Backend for LlamaCppBackend {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let prompt = self.build_chat_prompt(&request);
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                };
+                serde_json::json!({"role": role, "content": m.content})
+            })
+            .collect();
 
         let body = serde_json::json!({
-            "prompt": prompt,
+            "model": self.model_name,
+            "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
             "top_p": request.top_p.unwrap_or(0.9),
-            "n_predict": request.max_tokens.unwrap_or(2048),
+            "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": false,
             "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
-        let url = format!("{}/completion", self.server_url());
+        let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
             .client
             .post(&url)
@@ -359,33 +358,33 @@ impl Backend for LlamaCppBackend {
             .map_err(|e| AthenasError::Backend(format!("Invalid response: {}", e)))?;
 
         let content = result
-            .get("content")
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
 
-        let tokens_predicted = result
-            .get("tokens_predicted")
+        let usage = result.get("usage");
+        let tokens_prompt = usage
+            .and_then(|u| u.get("prompt_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let tokens_decoded = result
-            .get("tokens_decoded")
+        let tokens_generated = usage
+            .and_then(|u| u.get("completion_tokens"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let timings = result.get("timings");
-        let time_total_ms = timings
-            .and_then(|t| t.get("predicted_ms"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let tps = timings
+        let tps = result
+            .get("timings")
             .and_then(|t| t.get("tokens_per_second"))
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
 
         let stats = InferenceStats {
-            tokens_generated: tokens_decoded,
-            tokens_prompt: tokens_predicted,
-            time_total_ms,
+            tokens_generated,
+            tokens_prompt,
+            time_total_ms: 0,
             tokens_per_second: tps,
         };
 
@@ -401,18 +400,31 @@ impl Backend for LlamaCppBackend {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let prompt = self.build_chat_prompt(&request);
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                    Role::Tool => "tool",
+                };
+                serde_json::json!({"role": role, "content": m.content})
+            })
+            .collect();
 
         let body = serde_json::json!({
-            "prompt": prompt,
+            "model": self.model_name,
+            "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
             "top_p": request.top_p.unwrap_or(0.9),
-            "n_predict": request.max_tokens.unwrap_or(2048),
+            "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": true,
             "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
-        let url = format!("{}/completion", self.server_url());
+        let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
             .client
             .post(&url)
@@ -466,7 +478,14 @@ impl Backend for LlamaCppBackend {
                 }
 
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                    let content = json.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    // OpenAI format: choices[0].delta.content
+                    let content = json
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("delta"))
+                        .and_then(|d| d.get("content"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if !content.is_empty() {
                         full_text.push_str(content);
                         let _ = tx
@@ -478,26 +497,44 @@ impl Backend for LlamaCppBackend {
                             .await;
                     }
 
-                    let stop = json.get("stop").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if stop {
-                        let timings = json.get("timings");
-                        let tps = timings
-                            .and_then(|t| t.get("tokens_per_second"))
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0) as f32;
-                        let _ = tx
-                            .send(StreamChunk {
-                                text: String::new(),
-                                done: true,
-                                stats: Some(InferenceStats {
-                                    tokens_generated: full_text.split_whitespace().count() as u32,
-                                    tokens_prompt: 0,
-                                    time_total_ms: 0,
-                                    tokens_per_second: tps,
-                                }),
-                            })
-                            .await;
-                        return Ok(());
+                    // Check finish_reason
+                    let finish = json
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("finish_reason"))
+                        .and_then(|v| v.as_str());
+                    if let Some(reason) = finish {
+                        if !reason.is_empty() && reason != "null" {
+                            let usage = json.get("usage");
+                            let tps = usage
+                                .and_then(|u| u.get("timings"))
+                                .and_then(|t| t.get("tokens_per_second"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0) as f32;
+                            let tokens_generated = usage
+                                .and_then(|u| u.get("completion_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(full_text.split_whitespace().count() as u64)
+                                as u32;
+                            let tokens_prompt = usage
+                                .and_then(|u| u.get("prompt_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32;
+                            let _ = tx
+                                .send(StreamChunk {
+                                    text: String::new(),
+                                    done: true,
+                                    stats: Some(InferenceStats {
+                                        tokens_generated,
+                                        tokens_prompt,
+                                        time_total_ms: 0,
+                                        tokens_per_second: tps,
+                                    }),
+                                })
+                                .await;
+                            return Ok(());
+                        }
                     }
                 }
             }

@@ -72,11 +72,24 @@ fn render_messages(
 
     if state.is_generating {
         lines.push(Line::styled(
-            " AI is typing...",
+            " AI",
             Style::default()
                 .fg(Color::Cyan)
-                .add_modifier(Modifier::ITALIC),
+                .add_modifier(Modifier::BOLD),
         ));
+        if state.streaming_text.is_empty() {
+            lines.push(Line::styled(
+                "  ...",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        } else {
+            for line in state.streaming_text.lines() {
+                lines.push(Line::from(format!("  {}", line)));
+            }
+        }
+        lines.push(Line::from(""));
     }
 
     if is_loading_model {

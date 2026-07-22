@@ -630,10 +630,43 @@ impl TuiApp {
             temperature: Some(self.config.inference.default_temperature),
             top_p: Some(self.config.inference.default_top_p),
             max_tokens: Some(self.config.inference.default_max_tokens),
-            stream: true,
+            stream: self.config.inference.streaming_enabled,
             stop: None,
             seed: None,
         };
+
+        if !self.config.inference.streaming_enabled {
+            // Non-streaming: spawn chat() in background, show result when done
+            if let Some(backend) = &self.backend {
+                let backend_clone = backend.boxed_clone();
+                let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+                tokio::spawn(async move {
+                    match backend_clone.chat(req).await {
+                        Ok(resp) => {
+                            let _ = tx
+                                .send(StreamChunk {
+                                    text: resp.message.content,
+                                    done: false,
+                                    stats: None,
+                                })
+                                .await;
+                            let _ = tx
+                                .send(StreamChunk {
+                                    text: String::new(),
+                                    done: true,
+                                    stats: Some(resp.stats),
+                                })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Chat error: {}", e);
+                        }
+                    }
+                });
+                self.chat_stream_rx = Some(rx);
+            }
+            return;
+        }
 
         // Start streaming in background — store receiver for polling
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
