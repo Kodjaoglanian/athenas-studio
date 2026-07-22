@@ -218,14 +218,14 @@ fn render_messages(
     // Show scroll indicator in title when content overflows
     let title = if total_lines > inner_height {
         if state.auto_scroll {
-            " Athenas Studio — Chat [↓] ".to_string()
+            " Athenas Studio — Chat [↓ auto] ".to_string()
         } else {
             let pct = if max_scroll > 0 {
                 ((scroll as f32 / max_scroll as f32) * 100.0) as u32
             } else {
                 0
             };
-            format!(" Athenas Studio — Chat [↑ {}%] ", pct)
+            format!(" Athenas Studio — Chat [{}%] ", pct)
         }
     } else {
         " Athenas Studio — Chat ".to_string()

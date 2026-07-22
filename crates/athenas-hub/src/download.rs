@@ -11,6 +11,8 @@ use crate::client::HuggingFaceClient;
 const WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB write buffer
 const PARALLEL_CHUNKS: u64 = 8; // Number of parallel download connections
 const MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MB minimum chunk size
+const MAX_RETRIES: usize = 3; // Max retries per chunk on stream error
+const RETRY_BASE_DELAY_MS: u64 = 500; // Base delay for exponential backoff
 
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
@@ -247,13 +249,26 @@ impl ModelDownloader {
             let chunk_path = temp_dir.join(format!(".athenas_chunk_{}", i));
             chunk_paths.push(chunk_path.clone());
 
+            // Resume support: if chunk file exists with correct size, skip download
+            let expected_size = end - start;
+            if let Ok(meta) = std::fs::metadata(&chunk_path) {
+                if meta.len() == expected_size {
+                    info!(
+                        "Chunk {} already complete ({} bytes), skipping",
+                        i, expected_size
+                    );
+                    downloaded.fetch_add(expected_size, Ordering::Relaxed);
+                    continue;
+                }
+            }
+
             let chunk_url = url.to_string();
             let client = client.clone();
             let downloaded = downloaded.clone();
             let token = token.clone();
 
             tasks.push(tokio::spawn(async move {
-                download_chunk_to_file(
+                download_chunk_with_retry(
                     &client,
                     &chunk_url,
                     token.as_deref(),
@@ -282,11 +297,21 @@ impl ModelDownloader {
         }
 
         if !errors.is_empty() {
-            for p in &chunk_paths {
-                let _ = tokio::fs::remove_file(p).await;
+            // Keep completed chunk files for resume on next attempt.
+            // Only delete incomplete ones.
+            for (i, p) in chunk_paths.iter().enumerate() {
+                let expected = if i as u64 == num_chunks - 1 {
+                    last_chunk_size
+                } else {
+                    chunk_size
+                };
+                let actual = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                if actual != expected {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
             }
             return Err(AthenasError::Download(format!(
-                "Parallel download failed: {}",
+                "Parallel download failed (re-run to resume): {}",
                 errors.join("; ")
             )));
         }
@@ -294,11 +319,20 @@ impl ModelDownloader {
         // Verify size
         let final_downloaded = downloaded.load(Ordering::Relaxed);
         if final_downloaded != total_bytes {
-            for p in &chunk_paths {
-                let _ = tokio::fs::remove_file(p).await;
+            // Keep completed chunks for resume
+            for (i, p) in chunk_paths.iter().enumerate() {
+                let expected = if i as u64 == num_chunks - 1 {
+                    last_chunk_size
+                } else {
+                    chunk_size
+                };
+                let actual = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                if actual != expected {
+                    let _ = tokio::fs::remove_file(p).await;
+                }
             }
             return Err(AthenasError::Download(format!(
-                "Download incomplete: {} / {} bytes",
+                "Download incomplete: {} / {} bytes (re-run to resume)",
                 final_downloaded, total_bytes
             )));
         }
@@ -369,16 +403,35 @@ impl ModelDownloader {
         progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
     ) -> Result<PathBuf> {
         let client = self.client.client().clone();
+        let temp_path = file_path.with_extension("part");
+
+        // Resume support: check if .part file exists and get its size
+        let existing_bytes = match tokio::fs::metadata(&temp_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => 0,
+        };
+
         let mut req = client.get(url);
         if let Some(token) = self.client.token() {
             req = req.bearer_auth(token);
+        }
+        // If we have a partial file, request the remaining bytes
+        if existing_bytes > 0 {
+            info!(
+                "Resuming download from byte {} ({:.1} MB already downloaded)",
+                existing_bytes,
+                existing_bytes as f64 / (1024.0 * 1024.0)
+            );
+            req = req.header("Range", format!("bytes={}-", existing_bytes));
         }
         let resp = req
             .send()
             .await
             .map_err(|e| AthenasError::Download(format!("Download request failed: {}", e)))?;
 
-        if !resp.status().is_success() {
+        // Accept both 200 (full content) and 206 (partial content for resume)
+        let is_resume = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             return Err(AthenasError::Download(format!(
@@ -387,15 +440,37 @@ impl ModelDownloader {
             )));
         }
 
-        let total_bytes = resp.content_length();
-        let temp_path = file_path.with_extension("part");
-        let mut file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(|e| AthenasError::Download(format!("Failed to create file: {}", e)))?;
+        // If server ignored Range and sent 200, start from scratch
+        let (initial_bytes, mut file) = if is_resume {
+            let file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&temp_path)
+                .await
+                .map_err(|e| {
+                    AthenasError::Download(format!("Failed to open partial file: {}", e))
+                })?;
+            (existing_bytes, file)
+        } else {
+            let file = tokio::fs::File::create(&temp_path)
+                .await
+                .map_err(|e| AthenasError::Download(format!("Failed to create file: {}", e)))?;
+            (0u64, file)
+        };
+
+        let total_bytes = if is_resume {
+            // Content-Range: bytes start-end/total
+            resp.headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split('/').nth(1))
+                .and_then(|s| s.parse::<u64>().ok())
+        } else {
+            resp.content_length()
+        };
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut downloaded: u64 = 0;
+        let mut downloaded: u64 = initial_bytes;
         let start_time = std::time::Instant::now();
         let mut last_update = std::time::Instant::now();
 
@@ -526,9 +601,9 @@ impl ModelDownloader {
     }
 }
 
-/// Download a single chunk using HTTP Range request and write it to a dedicated temp file.
-/// Each chunk gets its own file — no Mutex or seeking needed, enabling true parallel I/O.
-async fn download_chunk_to_file(
+/// Download a chunk with automatic retry on failure.
+/// On each retry, resumes from the partial chunk file if it exists.
+async fn download_chunk_with_retry(
     client: &reqwest::Client,
     url: &str,
     token: Option<&str>,
@@ -537,72 +612,201 @@ async fn download_chunk_to_file(
     chunk_path: &PathBuf,
     downloaded: Arc<AtomicU64>,
 ) -> Result<()> {
-    let chunk_start_time = std::time::Instant::now();
-    let range = format!("bytes={}-{}", start, end - 1);
-    let mut req = client.get(url).header("Range", &range);
-    if let Some(t) = token {
-        req = req.bearer_auth(t);
-    }
+    let expected_size = end - start;
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AthenasError::Download(format!("Chunk request failed: {}", e)))?;
-
-    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(AthenasError::Download(format!(
-            "Chunk download failed: {} - {}",
-            status, text
-        )));
-    }
-
-    use futures::StreamExt;
-    let mut stream = resp.bytes_stream();
-
-    // Write to our own dedicated file — no lock contention
-    let mut writer = tokio::fs::File::create(chunk_path)
-        .await
-        .map_err(|e| AthenasError::Download(format!("Failed to create chunk file: {}", e)))?;
-
-    let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk =
-            chunk_result.map_err(|e| AthenasError::Download(format!("Stream error: {}", e)))?;
-
-        write_buf.extend_from_slice(&chunk);
-        downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-
-        if write_buf.len() >= WRITE_BUFFER_SIZE {
-            writer
-                .write_all(&write_buf)
-                .await
-                .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
-            write_buf.clear();
+    for attempt in 0..=MAX_RETRIES {
+        // Check if chunk is already complete from a previous run
+        if let Ok(meta) = std::fs::metadata(chunk_path) {
+            if meta.len() == expected_size {
+                info!("Chunk {}-{} already complete, skipping", start, end);
+                return Ok(());
+            }
         }
+
+        // Calculate resume offset within this chunk
+        let chunk_have = std::fs::metadata(chunk_path).map(|m| m.len()).unwrap_or(0);
+        let resume_from = start + chunk_have;
+        let range = if chunk_have > 0 && resume_from < end {
+            info!(
+                "Retrying chunk {}-{} from byte {} (attempt {}/{})",
+                start,
+                end,
+                resume_from,
+                attempt + 1,
+                MAX_RETRIES + 1
+            );
+            format!("bytes={}-{}", resume_from, end - 1)
+        } else {
+            if attempt > 0 {
+                info!(
+                    "Retrying chunk {}-{} from scratch (attempt {}/{})",
+                    start,
+                    end,
+                    attempt + 1,
+                    MAX_RETRIES + 1
+                );
+            }
+            format!("bytes={}-{}", start, end - 1)
+        };
+
+        let mut req = client.get(url).header("Range", &range);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Chunk {}-{} attempt {} request failed: {}",
+                    start,
+                    end,
+                    attempt + 1,
+                    e
+                );
+                if attempt < MAX_RETRIES {
+                    let delay = RETRY_BASE_DELAY_MS * (1 << attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
+                return Err(AthenasError::Download(format!(
+                    "Chunk request failed after {} retries: {}",
+                    MAX_RETRIES, e
+                )));
+            }
+        };
+
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            warn!(
+                "Chunk {}-{} attempt {} bad status: {} {}",
+                start,
+                end,
+                attempt + 1,
+                status,
+                text
+            );
+            if attempt < MAX_RETRIES {
+                let delay = RETRY_BASE_DELAY_MS * (1 << attempt);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                // Delete partial file to restart clean
+                let _ = tokio::fs::remove_file(chunk_path).await;
+                continue;
+            }
+            return Err(AthenasError::Download(format!(
+                "Chunk download failed after {} retries: {} - {}",
+                MAX_RETRIES, status, text
+            )));
+        }
+
+        // Open file for append if resuming, otherwise create fresh
+        let mut writer = if chunk_have > 0 && resume_from < end {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(chunk_path)
+                .await
+                .map_err(|e| {
+                    AthenasError::Download(format!("Failed to open chunk file for resume: {}", e))
+                })?
+        } else {
+            tokio::fs::File::create(chunk_path).await.map_err(|e| {
+                AthenasError::Download(format!("Failed to create chunk file: {}", e))
+            })?
+        };
+
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut write_buf: Vec<u8> = Vec::with_capacity(WRITE_BUFFER_SIZE);
+        let mut stream_error: Option<String> = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    write_buf.extend_from_slice(&chunk);
+                    downloaded.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+
+                    if write_buf.len() >= WRITE_BUFFER_SIZE {
+                        if let Err(e) = writer.write_all(&write_buf).await {
+                            stream_error = Some(format!("Write error: {}", e));
+                            break;
+                        }
+                        write_buf.clear();
+                    }
+                }
+                Err(e) => {
+                    stream_error = Some(format!("Stream error: {}", e));
+                    break;
+                }
+            }
+        }
+
+        // Flush whatever we have so far (important for resume)
+        if !write_buf.is_empty() {
+            if let Err(e) = writer.write_all(&write_buf).await {
+                if stream_error.is_none() {
+                    stream_error = Some(format!("Write error: {}", e));
+                }
+            }
+        }
+        let _ = writer.flush().await;
+
+        if let Some(err) = stream_error {
+            warn!(
+                "Chunk {}-{} attempt {} stream error: {} (saved partial for resume)",
+                start,
+                end,
+                attempt + 1,
+                err
+            );
+            if attempt < MAX_RETRIES {
+                let delay = RETRY_BASE_DELAY_MS * (1 << attempt);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                continue;
+            }
+            // Final attempt failed — check if we got enough by chance
+            let final_size = std::fs::metadata(chunk_path).map(|m| m.len()).unwrap_or(0);
+            if final_size == expected_size {
+                return Ok(());
+            }
+            return Err(AthenasError::Download(format!(
+                "Chunk {}-{} failed after {} retries: {} (got {}/{} bytes)",
+                start, end, MAX_RETRIES, err, final_size, expected_size
+            )));
+        }
+
+        // Verify chunk size
+        let final_size = std::fs::metadata(chunk_path).map(|m| m.len()).unwrap_or(0);
+        if final_size != expected_size {
+            warn!(
+                "Chunk {}-{} size mismatch: got {} expected {} (attempt {})",
+                start,
+                end,
+                final_size,
+                expected_size,
+                attempt + 1
+            );
+            if attempt < MAX_RETRIES {
+                let delay = RETRY_BASE_DELAY_MS * (1 << attempt);
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                // Delete partial file to restart clean
+                let _ = tokio::fs::remove_file(chunk_path).await;
+                continue;
+            }
+            return Err(AthenasError::Download(format!(
+                "Chunk {}-{} size mismatch after {} retries: got {} expected {}",
+                start, end, MAX_RETRIES, final_size, expected_size
+            )));
+        }
+
+        debug!(
+            "Chunk bytes={}..{} ({} MB) complete",
+            start,
+            end,
+            (end - start) / (1024 * 1024),
+        );
+        return Ok(());
     }
 
-    if !write_buf.is_empty() {
-        writer
-            .write_all(&write_buf)
-            .await
-            .map_err(|e| AthenasError::Download(format!("Write error: {}", e)))?;
-    }
-
-    writer
-        .flush()
-        .await
-        .map_err(|e| AthenasError::Download(format!("Flush error: {}", e)))?;
-
-    debug!(
-        "Chunk bytes={}..{} ({} MB) in {:.1}s ({:.1} MB/s)",
-        start,
-        end,
-        (end - start) / (1024 * 1024),
-        chunk_start_time.elapsed().as_secs_f64(),
-        (end - start) as f64 / (1024.0 * 1024.0) / chunk_start_time.elapsed().as_secs_f64()
-    );
     Ok(())
 }

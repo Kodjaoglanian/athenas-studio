@@ -286,16 +286,24 @@ impl TuiApp {
                     msg.reasoning_expanded = !msg.reasoning_expanded;
                 }
             }
-            // Up/Down arrows scroll line-by-line (only when not generating)
+            // Up arrow: scroll up (toward beginning) — decrease scroll offset
             KeyCode::Up => {
-                self.chat_state.auto_scroll = false;
-                self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
-            }
-            KeyCode::Down => {
-                if self.chat_state.scroll > 0 {
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                if self.chat_state.auto_scroll {
+                    // Switch from auto-scroll: we're at the bottom, go up 1 line
+                    self.chat_state.auto_scroll = false;
+                    // Set a large value; render clamps to max_scroll, then
+                    // next press subtracts 1 from there
+                    self.chat_state.scroll = usize::MAX;
                 } else {
-                    self.chat_state.auto_scroll = true;
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                }
+            }
+            // Down arrow: scroll down (toward end) — increase scroll offset
+            KeyCode::Down => {
+                if self.chat_state.auto_scroll {
+                    // Already at bottom, nothing to do
+                } else {
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
                 }
             }
             KeyCode::Char(c)
@@ -309,12 +317,20 @@ impl TuiApp {
                 self.chat_state.input_text.pop();
             }
             KeyCode::PageDown => {
-                self.chat_state.auto_scroll = true;
-                self.chat_state.scroll = 0;
+                // Jump toward end (increase scroll by 10)
+                if self.chat_state.auto_scroll {
+                    // Already at bottom, nothing to do
+                } else {
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(10);
+                }
             }
             KeyCode::PageUp => {
-                self.chat_state.auto_scroll = false;
-                self.chat_state.scroll = self.chat_state.scroll.saturating_add(10);
+                // Jump toward beginning (decrease scroll by 10)
+                if self.chat_state.auto_scroll {
+                    self.chat_state.auto_scroll = false;
+                    self.chat_state.scroll = usize::MAX;
+                }
+                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(10);
             }
             KeyCode::Esc if self.chat_state.is_generating => {}
             _ => {}
