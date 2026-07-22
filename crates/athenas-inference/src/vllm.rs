@@ -559,6 +559,19 @@ impl Backend for VllmBackend {
             None
         }
     }
+
+    fn boxed_clone(&self) -> Box<dyn Backend> {
+        Box::new(VllmBackend {
+            hardware: self.hardware.clone(),
+            loaded: self.loaded,
+            model_path: self.model_path.clone(),
+            model_name: self.model_name.clone(),
+            context_size: self.context_size,
+            server_handle: None,
+            server_port: self.server_port,
+            client: self.client.clone(),
+        })
+    }
 }
 
 impl Drop for VllmBackend {

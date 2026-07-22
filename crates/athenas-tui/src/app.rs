@@ -639,7 +639,12 @@ impl TuiApp {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
 
         if let Some(backend) = &self.backend {
-            let _ = backend.chat_stream(req, tx).await;
+            let backend_clone = backend.boxed_clone();
+            tokio::spawn(async move {
+                if let Err(e) = backend_clone.chat_stream(req, tx).await {
+                    tracing::error!("Chat stream error: {}", e);
+                }
+            });
         }
 
         self.chat_stream_rx = Some(rx);

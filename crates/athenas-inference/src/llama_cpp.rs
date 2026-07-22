@@ -616,6 +616,20 @@ impl Backend for LlamaCppBackend {
             None
         }
     }
+
+    fn boxed_clone(&self) -> Box<dyn Backend> {
+        Box::new(LlamaCppBackend {
+            hardware: self.hardware.clone(),
+            loaded: self.loaded,
+            model_path: self.model_path.clone(),
+            model_name: self.model_name.clone(),
+            context_size: self.context_size,
+            gpu_layers: self.gpu_layers,
+            server_handle: None, // Child is not Clone; not needed for streaming
+            server_port: self.server_port,
+            client: self.client.clone(),
+        })
+    }
 }
 
 impl Drop for LlamaCppBackend {

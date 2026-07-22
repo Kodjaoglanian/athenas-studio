@@ -26,6 +26,10 @@ pub trait Backend: Send + Sync {
     ) -> Result<()>;
 
     fn model_info(&self) -> Option<ModelInfo>;
+
+    /// Clone into a boxed trait object (for spawning background tasks).
+    /// Only needs to support read-only operations (chat, complete, stream).
+    fn boxed_clone(&self) -> Box<dyn Backend>;
 }
 
 #[derive(Debug, Clone)]
