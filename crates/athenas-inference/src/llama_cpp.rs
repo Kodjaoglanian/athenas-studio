@@ -219,6 +219,24 @@ impl LlamaCppBackend {
                             msg.push_str(&format!("\nstderr: {}", stderr_msg));
                         }
                         if status.code() == Some(127) {
+                            // Check if it's libgomp missing — try to auto-install
+                            if stderr_msg.contains("libgomp.so.1") {
+                                info!("libgomp.so.1 missing, attempting auto-install...");
+                                let installed = try_install_libgomp().await;
+                                if installed {
+                                    info!(
+                                        "libgomp1 installed successfully, retrying server start..."
+                                    );
+                                    // Kill the failed child and retry
+                                    if let Some(ref mut child) = self.server_handle {
+                                        let _ = child.kill().await;
+                                    }
+                                    self.server_handle = None;
+                                    // Retry the spawn by returning a special error
+                                    // that the caller can retry, or just retry inline
+                                    return self.retry_start_server(&config).await;
+                                }
+                            }
                             msg.push_str(
                                 "\n\nHint: exit code 127 usually means the binary has missing \
                                  shared libraries. Try running 'ldd <path>' to check.\n\
@@ -258,6 +276,13 @@ impl LlamaCppBackend {
         ))
     }
 
+    async fn retry_start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
+        // Wait a moment for the package manager to settle
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        // Re-run start_server with the same config (boxed to allow async recursion)
+        Box::pin(self.start_server(config)).await
+    }
+
     async fn stop_server(&mut self) -> Result<()> {
         if let Some(mut child) = self.server_handle.take() {
             child.kill().await.map_err(|e| {
@@ -271,6 +296,70 @@ impl LlamaCppBackend {
     fn server_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.server_port)
     }
+}
+
+/// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems
+async fn try_install_libgomp() -> bool {
+    // Detect package manager and install
+    let managers = [
+        ("apt-get", vec!["apt-get", "install", "-y", "libgomp1"]),
+        ("dnf", vec!["dnf", "install", "-y", "libgomp"]),
+        ("yum", vec!["yum", "install", "-y", "libgomp"]),
+        ("pacman", vec!["pacman", "-S", "--noconfirm", "gcc-libs"]),
+        ("apk", vec!["apk", "add", "libgomp"]),
+    ];
+
+    for (name, args) in &managers {
+        // Check if the package manager exists
+        let check = tokio::process::Command::new("which")
+            .arg(name)
+            .output()
+            .await;
+
+        if let Ok(check_output) = check {
+            if !check_output.status.success() {
+                continue;
+            }
+
+            info!("Installing libgomp via {}...", name);
+            // For apt-get, run update first
+            if *name == "apt-get" {
+                let _ = tokio::process::Command::new("apt-get")
+                    .arg("update")
+                    .arg("-qq")
+                    .output()
+                    .await;
+            }
+
+            let result = tokio::process::Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .await;
+
+            return match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("libgomp installed successfully via {}", name);
+                        true
+                    } else {
+                        tracing::warn!(
+                            "Failed to install libgomp via {}: {}",
+                            name,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to run {}: {}", name, e);
+                    false
+                }
+            };
+        }
+    }
+
+    tracing::warn!("No supported package manager found to install libgomp");
+    false
 }
 
 #[async_trait]
