@@ -187,7 +187,8 @@ impl LlamaCppBackend {
                 cmd.arg("--reasoning").arg("off");
                 cmd.arg("--reasoning-budget").arg("0");
             } else if config.reasoning_budget >= 0 {
-                cmd.arg("--reasoning-budget").arg(config.reasoning_budget.to_string());
+                cmd.arg("--reasoning-budget")
+                    .arg(config.reasoning_budget.to_string());
             }
         }
 
@@ -619,6 +620,7 @@ impl Backend for LlamaCppBackend {
                             .send(StreamChunk {
                                 text: String::new(),
                                 done: true,
+                                is_reasoning: false,
                                 stats: Some(InferenceStats {
                                     tokens_generated: token_count,
                                     tokens_prompt: 0,
@@ -653,6 +655,7 @@ impl Backend for LlamaCppBackend {
                         .send(StreamChunk {
                             text: String::new(),
                             done: true,
+                            is_reasoning: false,
                             stats: Some(InferenceStats {
                                 tokens_generated: token_count,
                                 tokens_prompt: 0,
@@ -695,6 +698,7 @@ impl Backend for LlamaCppBackend {
                             .send(StreamChunk {
                                 text: reasoning.to_string(),
                                 done: false,
+                                is_reasoning: true,
                                 stats: Some(InferenceStats {
                                     tokens_generated: token_count,
                                     tokens_prompt: 0,
@@ -719,6 +723,7 @@ impl Backend for LlamaCppBackend {
                             .send(StreamChunk {
                                 text: content.to_string(),
                                 done: false,
+                                is_reasoning: false,
                                 stats: Some(InferenceStats {
                                     tokens_generated: token_count,
                                     tokens_prompt: 0,
@@ -766,6 +771,7 @@ impl Backend for LlamaCppBackend {
                                 .send(StreamChunk {
                                     text: String::new(),
                                     done: true,
+                                    is_reasoning: false,
                                     stats: Some(InferenceStats {
                                         tokens_generated,
                                         tokens_prompt,
@@ -791,6 +797,7 @@ impl Backend for LlamaCppBackend {
             .send(StreamChunk {
                 text: String::new(),
                 done: true,
+                is_reasoning: false,
                 stats: Some(InferenceStats {
                     tokens_generated: token_count,
                     tokens_prompt: 0,

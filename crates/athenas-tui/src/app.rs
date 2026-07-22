@@ -273,10 +273,42 @@ impl TuiApp {
                 self.send_message().await;
             }
             KeyCode::Char(c) => {
-                self.chat_state.input_text.push(c);
+                // 'r' toggles reasoning expansion on the last assistant message
+                if c == 'r' && !self.chat_state.input_text.is_empty() {
+                    self.chat_state.input_text.push(c);
+                } else if c == 'r' {
+                    // Toggle reasoning_expanded on the last assistant message
+                    if let Some(msg) = self
+                        .chat_state
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
+                    {
+                        msg.reasoning_expanded = !msg.reasoning_expanded;
+                    }
+                } else {
+                    self.chat_state.input_text.push(c);
+                }
+                // Any typing re-enables auto-scroll
+                self.chat_state.auto_scroll = true;
             }
             KeyCode::Backspace => {
                 self.chat_state.input_text.pop();
+            }
+            KeyCode::PageDown => {
+                self.chat_state.auto_scroll = true;
+            }
+            KeyCode::PageUp => {
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = self.chat_state.scroll.saturating_add(10);
+            }
+            KeyCode::Down if self.chat_state.input_text.is_empty() => {
+                self.chat_state.auto_scroll = true;
+            }
+            KeyCode::Up if self.chat_state.input_text.is_empty() => {
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = self.chat_state.scroll.saturating_add(3);
             }
             KeyCode::Esc if self.chat_state.is_generating => {}
             _ => {}
@@ -615,6 +647,10 @@ impl TuiApp {
             return;
         }
 
+        // Re-enable auto-scroll for new messages
+        self.chat_state.auto_scroll = true;
+        self.chat_state.scroll = 0;
+
         // Handle commands
         if text.starts_with('/') {
             self.handle_command(&text).await;
@@ -682,6 +718,7 @@ impl TuiApp {
                                 .send(StreamChunk {
                                     text: resp.message.content,
                                     done: false,
+                                    is_reasoning: false,
                                     stats: None,
                                 })
                                 .await;
@@ -689,6 +726,7 @@ impl TuiApp {
                                 .send(StreamChunk {
                                     text: String::new(),
                                     done: true,
+                                    is_reasoning: false,
                                     stats: Some(resp.stats),
                                 })
                                 .await;
@@ -749,7 +787,11 @@ impl TuiApp {
                     self.chat_stream_rx = None;
                     return;
                 } else {
-                    self.chat_state.append_streaming(&chunk.text);
+                    if chunk.is_reasoning {
+                        self.chat_state.append_reasoning(&chunk.text);
+                    } else {
+                        self.chat_state.append_streaming(&chunk.text);
+                    }
                     // Update tok/s live during streaming
                     if let Some(stats) = &chunk.stats {
                         self.chat_state.tokens_per_second = Some(stats.tokens_per_second);

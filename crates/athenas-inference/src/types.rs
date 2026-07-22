@@ -113,6 +113,9 @@ pub struct StreamChunk {
     pub text: String,
     pub done: bool,
     pub stats: Option<InferenceStats>,
+    /// True if this chunk is reasoning/thinking content (not regular response)
+    #[serde(default)]
+    pub is_reasoning: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

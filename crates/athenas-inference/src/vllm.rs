@@ -313,6 +313,7 @@ impl Backend for VllmBackend {
                         .send(StreamChunk {
                             text: String::new(),
                             done: true,
+                            is_reasoning: false,
                             stats: None,
                         })
                         .await;
@@ -330,6 +331,7 @@ impl Backend for VllmBackend {
                             .send(StreamChunk {
                                 text: content.to_string(),
                                 done: false,
+                                is_reasoning: false,
                                 stats: None,
                             })
                             .await;
@@ -359,6 +361,7 @@ impl Backend for VllmBackend {
                                 .send(StreamChunk {
                                     text: String::new(),
                                     done: true,
+                                    is_reasoning: false,
                                     stats,
                                 })
                                 .await;
@@ -373,6 +376,7 @@ impl Backend for VllmBackend {
             .send(StreamChunk {
                 text: String::new(),
                 done: true,
+                is_reasoning: false,
                 stats: None,
             })
             .await;
@@ -503,6 +507,7 @@ impl Backend for VllmBackend {
                         .send(StreamChunk {
                             text: String::new(),
                             done: true,
+                            is_reasoning: false,
                             stats: None,
                         })
                         .await;
@@ -520,6 +525,7 @@ impl Backend for VllmBackend {
                             .send(StreamChunk {
                                 text: text.to_string(),
                                 done: false,
+                                is_reasoning: false,
                                 stats: None,
                             })
                             .await;
@@ -534,6 +540,7 @@ impl Backend for VllmBackend {
                                 .send(StreamChunk {
                                     text: String::new(),
                                     done: true,
+                                    is_reasoning: false,
                                     stats: None,
                                 })
                                 .await;

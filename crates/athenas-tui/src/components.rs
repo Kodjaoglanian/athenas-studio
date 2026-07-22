@@ -64,6 +64,46 @@ fn render_messages(
             Style::default().fg(role_color).add_modifier(Modifier::BOLD),
         ));
 
+        // Render collapsible reasoning section for assistant messages
+        if msg.role == "assistant" && !msg.reasoning.is_empty() {
+            if msg.reasoning_expanded {
+                lines.push(Line::styled(
+                    "  [Thinking] ▼ (press 'r' to collapse)",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ));
+                for line in msg.reasoning.lines() {
+                    lines.push(Line::styled(
+                        format!("    {}", line),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                lines.push(Line::styled(
+                    "  [/Thinking]",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ));
+            } else {
+                let preview_len = 60;
+                let preview: String = msg.reasoning.chars().take(preview_len).collect();
+                let suffix = if msg.reasoning.chars().count() > preview_len {
+                    "..."
+                } else {
+                    ""
+                };
+                lines.push(Line::styled(
+                    format!("  [Thinking] ▶ {}{} (press 'r' to expand)", preview, suffix),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+
         for line in msg.content.lines() {
             lines.push(Line::from(format!("  {}", line)));
         }
@@ -71,7 +111,10 @@ fn render_messages(
     }
 
     if state.is_generating {
-        let elapsed = state.generation_start.map(|s| s.elapsed().as_secs()).unwrap_or(0);
+        let elapsed = state
+            .generation_start
+            .map(|s| s.elapsed().as_secs())
+            .unwrap_or(0);
 
         lines.push(Line::styled(
             " AI",
@@ -79,7 +122,7 @@ fn render_messages(
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
-        if state.streaming_text.is_empty() {
+        if state.streaming_text.is_empty() && state.streaming_reasoning.is_empty() {
             // Show animated spinner + elapsed time while waiting for first token
             let spinner_char = match elapsed % 4 {
                 0 => "|",
@@ -88,7 +131,10 @@ fn render_messages(
                 _ => "\\",
             };
             let wait_msg = if elapsed > 60 {
-                format!("  {} Still waiting... {}s (model may be thinking or stuck)", spinner_char, elapsed)
+                format!(
+                    "  {} Still waiting... {}s (model may be thinking or stuck)",
+                    spinner_char, elapsed
+                )
             } else if elapsed > 30 {
                 format!("  {} Waiting for response... {}s", spinner_char, elapsed)
             } else if elapsed > 5 {
@@ -108,6 +154,29 @@ fn render_messages(
                     .add_modifier(Modifier::ITALIC),
             ));
         } else {
+            // Show live reasoning if present
+            if !state.streaming_reasoning.is_empty() {
+                lines.push(Line::styled(
+                    "  [Thinking] ▼ (live...)",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ));
+                for line in state.streaming_reasoning.lines() {
+                    lines.push(Line::styled(
+                        format!("    {}", line),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                lines.push(Line::styled(
+                    "  [/Thinking]",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
             for line in state.streaming_text.lines() {
                 lines.push(Line::from(format!("  {}", line)));
             }
@@ -144,10 +213,21 @@ fn render_messages(
         ));
     }
 
+    // Calculate visible area height (inside borders)
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    // Auto-scroll to bottom when enabled
+    let scroll = if state.auto_scroll {
+        let total_lines = lines.len();
+        total_lines.saturating_sub(inner_height)
+    } else {
+        state.scroll
+    };
+
     let paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((state.scroll as u16, 0));
+        .scroll((scroll as u16, 0));
 
     f.render_widget(paragraph, area);
 }
@@ -198,7 +278,9 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
         ));
     }
 
-    status_parts.push(Span::raw(" | Enter: Send | Ctrl+C: Quit | Tab: Switch "));
+    status_parts.push(Span::raw(
+        " | Enter: Send | PgUp/Dn: Scroll | r: Toggle Thinking | Ctrl+C: Quit ",
+    ));
 
     let line = Line::from(status_parts);
     let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
@@ -564,7 +646,11 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
         } else {
             Color::Green
         };
-        let prefix = if state.status_is_error { "[!]" } else { "[✓]" };
+        let prefix = if state.status_is_error {
+            "[!]"
+        } else {
+            "[✓]"
+        };
         lines.push(Line::styled(
             format!(" {} {}", prefix, msg),
             Style::default().fg(color),

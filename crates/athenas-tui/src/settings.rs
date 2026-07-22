@@ -177,8 +177,9 @@ impl SettingsState {
                     value.parse().map_err(|_| "Must be a number".to_string())?;
             }
             SettingsField::Threads => {
-                self.config.inference.default_threads =
-                    value.parse().map_err(|_| "Must be a number (0 = auto)".to_string())?;
+                self.config.inference.default_threads = value
+                    .parse()
+                    .map_err(|_| "Must be a number (0 = auto)".to_string())?;
             }
             SettingsField::Temperature => {
                 self.config.inference.default_temperature = value
