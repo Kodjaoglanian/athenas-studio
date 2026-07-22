@@ -39,16 +39,6 @@ fn render_messages(
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Athenas Studio — Chat ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::DarkGray));
-
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &state.messages {
@@ -68,7 +58,7 @@ fn render_messages(
         if msg.role == "assistant" && !msg.reasoning.is_empty() {
             if msg.reasoning_expanded {
                 lines.push(Line::styled(
-                    "  [Thinking] ▼ (Ctrl+R to collapse)",
+                    "  [Thinking] ▼ (Tab to collapse)",
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::DIM),
@@ -96,7 +86,7 @@ fn render_messages(
                     ""
                 };
                 lines.push(Line::styled(
-                    format!("  [Thinking] ▶ {}{} (Ctrl+R to expand)", preview, suffix),
+                    format!("  [Thinking] ▶ {}{} (Tab to expand)", preview, suffix),
                     Style::default()
                         .fg(Color::Magenta)
                         .add_modifier(Modifier::DIM),
@@ -215,14 +205,41 @@ fn render_messages(
 
     // Calculate visible area height (inside borders)
     let inner_height = area.height.saturating_sub(2) as usize;
+    let total_lines = lines.len();
+    let max_scroll = total_lines.saturating_sub(inner_height);
 
-    // Auto-scroll to bottom when enabled
+    // Auto-scroll to bottom when enabled; clamp manual scroll to max
     let scroll = if state.auto_scroll {
-        let total_lines = lines.len();
-        total_lines.saturating_sub(inner_height)
+        max_scroll
     } else {
-        state.scroll
+        state.scroll.min(max_scroll)
     };
+
+    // Show scroll indicator in title when content overflows
+    let title = if total_lines > inner_height {
+        if state.auto_scroll {
+            " Athenas Studio — Chat [↓] ".to_string()
+        } else {
+            let pct = if max_scroll > 0 {
+                ((scroll as f32 / max_scroll as f32) * 100.0) as u32
+            } else {
+                0
+            };
+            format!(" Athenas Studio — Chat [↑ {}%] ", pct)
+        }
+    } else {
+        " Athenas Studio — Chat ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::DarkGray));
 
     let paragraph = Paragraph::new(lines)
         .block(block)
@@ -279,7 +296,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     }
 
     status_parts.push(Span::raw(
-        " | Enter: Send | PgUp/Dn: Scroll | Ctrl+R: Thinking | Ctrl+C: Quit ",
+        " | Enter: Send | ↑↓: Scroll | PgUp/Dn: Jump | Tab: Thinking | Ctrl+C: Quit ",
     ));
 
     let line = Line::from(status_parts);

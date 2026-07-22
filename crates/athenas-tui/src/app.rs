@@ -186,8 +186,10 @@ impl TuiApp {
                         continue;
                     }
 
-                    // Global Tab cycling (skip when editing)
+                    // Global Tab cycling (skip when editing or in chat mode
+                    // where Tab is used for thinking toggle)
                     if key.code == KeyCode::Tab
+                        && self.mode != AppMode::Chat
                         && !(self.mode == AppMode::Settings && self.settings_state.editing)
                         && !(self.mode == AppMode::Server && self.server_panel_state.editing)
                     {
@@ -268,37 +270,33 @@ impl TuiApp {
     }
 
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
-        // Ctrl+R toggles reasoning expansion on the last assistant message.
-        // Some terminals send Ctrl+R as \x12 (control char) without CONTROL
-        // modifier, so we check both representations.
-        let is_ctrl_r = match key.code {
-            KeyCode::Char(c)
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && c.eq_ignore_ascii_case(&'r') =>
-            {
-                true
-            }
-            // Some terminals send the raw control character \x12 for Ctrl+R
-            // with or without the CONTROL modifier flag
-            KeyCode::Char('\x12') => true,
-            _ => false,
-        };
-        if is_ctrl_r {
-            if let Some(msg) = self
-                .chat_state
-                .messages
-                .iter_mut()
-                .rev()
-                .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
-            {
-                msg.reasoning_expanded = !msg.reasoning_expanded;
-            }
-            return;
-        }
-
         match key.code {
             KeyCode::Enter => {
                 self.send_message().await;
+            }
+            // Tab toggles reasoning/thinking expansion on last assistant message
+            KeyCode::Tab => {
+                if let Some(msg) = self
+                    .chat_state
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
+                {
+                    msg.reasoning_expanded = !msg.reasoning_expanded;
+                }
+            }
+            // Up/Down arrows scroll line-by-line (only when not generating)
+            KeyCode::Up => {
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
+            }
+            KeyCode::Down => {
+                if self.chat_state.scroll > 0 {
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                } else {
+                    self.chat_state.auto_scroll = true;
+                }
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
