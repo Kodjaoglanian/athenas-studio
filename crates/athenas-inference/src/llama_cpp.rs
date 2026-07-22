@@ -42,17 +42,23 @@ impl LlamaCppBackend {
     }
 
     fn find_llama_server(&self) -> Option<String> {
-        // 1. Check PATH
+        let home = std::env::var("HOME").unwrap_or_default();
+
+        // 1. Check ~/.athenas/bin first (our auto-installed version)
+        let athenas_path = format!("{}/.athenas/bin/llama-server", home);
+        if std::path::Path::new(&athenas_path).exists() {
+            return Some(athenas_path);
+        }
+
+        // 2. Check PATH
         for cmd in &["llama-server", "llama_server", "server"] {
             if which::which(cmd).is_ok() {
                 return Some(cmd.to_string());
             }
         }
 
-        // 2. Check common install locations
-        let home = std::env::var("HOME").unwrap_or_default();
+        // 3. Check common install locations
         let candidates = [
-            format!("{}/.athenas/bin/llama-server", home),
             format!("{}/.local/bin/llama-server", home),
             "/usr/local/bin/llama-server".to_string(),
             "/usr/bin/llama-server".to_string(),
@@ -70,15 +76,46 @@ impl LlamaCppBackend {
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
         let server_bin = if let Some(path) = self.find_llama_server() {
-            // Validate: if it's in ~/.athenas/bin, check for shared libs
+            // Validate: check for shared libs next to the binary on Linux/macOS
             let p = std::path::Path::new(&path);
             if let Some(parent) = p.parent() {
                 let needs_lib = std::env::consts::OS == "linux" || std::env::consts::OS == "macos";
-                let has_lib = parent.join("libllama-server-impl.so").exists()
-                    || parent.join("libllama-server-impl.dylib").exists();
-                if needs_lib && !has_lib && path.contains(".athenas") {
+                let has_lib = if std::env::consts::OS == "linux" {
+                    std::fs::read_dir(parent)
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .any(|e| e.file_name().to_string_lossy().starts_with("libllama"))
+                        })
+                        .unwrap_or(false)
+                } else if std::env::consts::OS == "macos" {
+                    std::fs::read_dir(parent)
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
+                        })
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+
+                if needs_lib && !has_lib {
+                    // Binary exists but shared libs are missing — force re-download
                     info!("llama-server found but shared libs missing, re-downloading...");
-                    let _ = std::fs::remove_file(&path);
+                    // Only delete if it's in our bin dir (don't touch system installs)
+                    if path.contains(".athenas") {
+                        let _ = std::fs::remove_file(&path);
+                        // Also clean up old .so files
+                        if let Ok(entries) = std::fs::read_dir(parent) {
+                            for entry in entries.flatten() {
+                                let name = entry.file_name().to_string_lossy().to_string();
+                                if name.starts_with("libllama") || name.starts_with("libggml") {
+                                    let _ = std::fs::remove_file(entry.path());
+                                }
+                            }
+                        }
+                    }
                     let new_path = crate::backend_setup::ensure_llama_server().await?;
                     new_path.to_string_lossy().to_string()
                 } else {
