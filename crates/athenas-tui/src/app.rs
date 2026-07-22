@@ -300,7 +300,9 @@ impl TuiApp {
             KeyCode::Enter => {
                 self.send_message().await;
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() => {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
+            {
                 self.chat_state.input_text.push(c);
                 // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
