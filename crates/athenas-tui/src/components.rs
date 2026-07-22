@@ -172,7 +172,7 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " Models ",
+            " Models (Enter: Load | Del: Delete) ",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

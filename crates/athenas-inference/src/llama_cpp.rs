@@ -161,7 +161,13 @@ impl LlamaCppBackend {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--parallel")
-            .arg("1");
+            .arg("1")
+            // Enterprise performance flags
+            .arg("--cont-batching")
+            .arg("--cache-prompt")
+            .arg("--warmup")
+            .arg("--jinja")
+            .arg("--metrics");
 
         if config.gpu_layers >= 0 {
             cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
@@ -511,6 +517,8 @@ impl Backend for LlamaCppBackend {
             "top_p": request.top_p.unwrap_or(0.9),
             "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": true,
+            "stream_options": {"include_usage": true},
+            "timings_per_token": true,
             "stop": request.stop.as_deref().unwrap_or(&[]),
         });
 
@@ -537,6 +545,8 @@ impl Backend for LlamaCppBackend {
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut full_text = String::new();
+        let start_time = std::time::Instant::now();
+        let mut token_count: u32 = 0;
 
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
@@ -544,20 +554,23 @@ impl Backend for LlamaCppBackend {
                     buffer.push_str(&String::from_utf8_lossy(&chunk));
                 }
                 Err(e) => {
-                    // Stream errors often happen when the server closes the
-                    // connection after sending [DONE]. If we already have text,
-                    // finalize gracefully instead of propagating the error.
                     tracing::warn!("Stream chunk error (graceful handling): {}", e);
                     if !full_text.is_empty() {
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        let tps = if elapsed > 0.0 {
+                            token_count as f32 / elapsed
+                        } else {
+                            0.0
+                        };
                         let _ = tx
                             .send(StreamChunk {
                                 text: String::new(),
                                 done: true,
                                 stats: Some(InferenceStats {
-                                    tokens_generated: full_text.split_whitespace().count() as u32,
+                                    tokens_generated: token_count,
                                     tokens_prompt: 0,
-                                    time_total_ms: 0,
-                                    tokens_per_second: 0.0,
+                                    time_total_ms: (elapsed * 1000.0) as u64,
+                                    tokens_per_second: tps,
                                 }),
                             })
                             .await;
@@ -577,15 +590,21 @@ impl Backend for LlamaCppBackend {
 
                 let data = &line[6..];
                 if data == "[DONE]" {
+                    let elapsed = start_time.elapsed().as_secs_f32();
+                    let tps = if elapsed > 0.0 {
+                        token_count as f32 / elapsed
+                    } else {
+                        0.0
+                    };
                     let _ = tx
                         .send(StreamChunk {
                             text: String::new(),
                             done: true,
                             stats: Some(InferenceStats {
-                                tokens_generated: full_text.split_whitespace().count() as u32,
+                                tokens_generated: token_count,
                                 tokens_prompt: 0,
-                                time_total_ms: 0,
-                                tokens_per_second: 0.0,
+                                time_total_ms: (elapsed * 1000.0) as u64,
+                                tokens_per_second: tps,
                             }),
                         })
                         .await;
@@ -603,11 +622,23 @@ impl Backend for LlamaCppBackend {
                         .unwrap_or("");
                     if !content.is_empty() {
                         full_text.push_str(content);
+                        token_count += 1;
+                        let elapsed = start_time.elapsed().as_secs_f32();
+                        let tps = if elapsed > 0.0 {
+                            token_count as f32 / elapsed
+                        } else {
+                            0.0
+                        };
                         let _ = tx
                             .send(StreamChunk {
                                 text: content.to_string(),
                                 done: false,
-                                stats: None,
+                                stats: Some(InferenceStats {
+                                    tokens_generated: token_count,
+                                    tokens_prompt: 0,
+                                    time_total_ms: (elapsed * 1000.0) as u64,
+                                    tokens_per_second: tps,
+                                }),
                             })
                             .await;
                     }
@@ -621,15 +652,24 @@ impl Backend for LlamaCppBackend {
                     if let Some(reason) = finish {
                         if !reason.is_empty() && reason != "null" {
                             let usage = json.get("usage");
+                            let elapsed = start_time.elapsed().as_secs_f32();
+                            // Try server-reported tps first, fallback to our calculation
                             let tps = usage
                                 .and_then(|u| u.get("timings"))
                                 .and_then(|t| t.get("tokens_per_second"))
                                 .and_then(|v| v.as_f64())
-                                .unwrap_or(0.0) as f32;
+                                .map(|v| v as f32)
+                                .unwrap_or_else(|| {
+                                    if elapsed > 0.0 {
+                                        token_count as f32 / elapsed
+                                    } else {
+                                        0.0
+                                    }
+                                });
                             let tokens_generated = usage
                                 .and_then(|u| u.get("completion_tokens"))
                                 .and_then(|v| v.as_u64())
-                                .unwrap_or(full_text.split_whitespace().count() as u64)
+                                .unwrap_or(token_count as u64)
                                 as u32;
                             let tokens_prompt = usage
                                 .and_then(|u| u.get("prompt_tokens"))
@@ -643,7 +683,7 @@ impl Backend for LlamaCppBackend {
                                     stats: Some(InferenceStats {
                                         tokens_generated,
                                         tokens_prompt,
-                                        time_total_ms: 0,
+                                        time_total_ms: (elapsed * 1000.0) as u64,
                                         tokens_per_second: tps,
                                     }),
                                 })
@@ -655,11 +695,22 @@ impl Backend for LlamaCppBackend {
             }
         }
 
+        let elapsed = start_time.elapsed().as_secs_f32();
+        let tps = if elapsed > 0.0 {
+            token_count as f32 / elapsed
+        } else {
+            0.0
+        };
         let _ = tx
             .send(StreamChunk {
                 text: String::new(),
                 done: true,
-                stats: None,
+                stats: Some(InferenceStats {
+                    tokens_generated: token_count,
+                    tokens_prompt: 0,
+                    time_total_ms: (elapsed * 1000.0) as u64,
+                    tokens_per_second: tps,
+                }),
             })
             .await;
         Ok(())

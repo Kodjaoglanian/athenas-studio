@@ -301,6 +301,25 @@ impl TuiApp {
                     self.mode = AppMode::Chat;
                 }
             }
+            KeyCode::Delete | KeyCode::Char('d') => {
+                if let Some(model) = self.model_list_state.selected() {
+                    let name = model.name.clone();
+                    let registry = ModelRegistry::new(self.config.paths.models_dir.clone());
+                    match registry.remove_model(&name) {
+                        Ok(_) => {
+                            self.chat_state
+                                .add_message("system", &format!("Model '{}' deleted.", name));
+                            self.refresh_models();
+                        }
+                        Err(e) => {
+                            self.chat_state.add_message(
+                                "system",
+                                &format!("Failed to delete model '{}': {}", name, e),
+                            );
+                        }
+                    }
+                }
+            }
             KeyCode::Esc => {
                 self.mode = AppMode::Chat;
             }
@@ -703,6 +722,10 @@ impl TuiApp {
                     return;
                 } else {
                     self.chat_state.append_streaming(&chunk.text);
+                    // Update tok/s live during streaming
+                    if let Some(stats) = &chunk.stats {
+                        self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+                    }
                 }
             }
 
