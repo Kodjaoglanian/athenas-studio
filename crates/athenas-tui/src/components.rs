@@ -911,7 +911,9 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                     (Color::DarkGray, "■ Server not running".to_string())
                 }
             } else if *field == ConfigField::LoadAdditionalModel {
-                if state.phase == ServerPhase::Running {
+                if state.phase == ServerPhase::LoadingModel {
+                    (Color::Cyan, "⟳ Loading model...".to_string())
+                } else if state.phase == ServerPhase::Running {
                     (Color::Green, "▶ Load Additional Model".to_string())
                 } else {
                     (Color::DarkGray, "○ Start server first".to_string())

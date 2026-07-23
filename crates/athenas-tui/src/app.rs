@@ -19,6 +19,11 @@ use crate::model_list::ModelListState;
 use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
+type AdditionalModelLoadResult =
+    std::result::Result<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>;
+
+type AdditionalModelLoadTask = Option<tokio::task::JoinHandle<AdditionalModelLoadResult>>;
+
 #[derive(PartialEq)]
 pub enum AppMode {
     Chat,
@@ -60,12 +65,15 @@ pub struct TuiApp {
     // Background server state
     server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
     shared_model_manager: Option<athenas_server::SharedModelManager>,
-    // Background model loading state
+    // Background model loading state (chat mode)
     is_loading_model: bool,
     model_load_task: Option<
         tokio::task::JoinHandle<std::result::Result<Box<dyn Backend>, athenas_core::AthenasError>>,
     >,
     loading_spinner: usize,
+    // Background additional model loading state (server panel)
+    additional_model_load_task: AdditionalModelLoadTask,
+    additional_model_name_hint: Option<String>,
     // Background chat streaming state
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
 }
@@ -98,6 +106,8 @@ impl TuiApp {
             is_loading_model: false,
             model_load_task: None,
             loading_spinner: 0,
+            additional_model_load_task: None,
+            additional_model_name_hint: None,
             chat_stream_rx: None,
         }
     }
@@ -134,8 +144,11 @@ impl TuiApp {
             // Poll server task status
             self.poll_server_status().await;
 
-            // Poll model loading task
+            // Poll model loading task (chat mode)
             self.poll_model_loading().await;
+
+            // Poll additional model loading task (server panel)
+            self.poll_additional_model_loading().await;
 
             // Poll chat stream
             self.poll_chat_stream().await;
@@ -1255,6 +1268,13 @@ impl TuiApp {
             return;
         }
 
+        // Don't start if already loading
+        if self.additional_model_load_task.is_some() {
+            self.server_panel_state.status_message =
+                Some("Already loading a model, please wait...".to_string());
+            return;
+        }
+
         let model_path = match self.server_panel_state.selected_model_path() {
             Some(p) => p,
             None => {
@@ -1264,55 +1284,101 @@ impl TuiApp {
             }
         };
 
+        let model_name = std::path::Path::new(&model_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("model")
+            .to_string();
+
         self.server_panel_state.phase = ServerPhase::LoadingModel;
         self.server_panel_state.status_message =
-            Some(format!("Loading additional model: {}...", model_path));
+            Some(format!("Loading additional model: {}...", model_name));
+        self.additional_model_name_hint = Some(model_name.clone());
 
-        let mut backend = match self.server_panel_state.create_backend() {
-            Ok(b) => b,
-            Err(e) => {
-                self.server_panel_state.phase = ServerPhase::Running;
-                self.server_panel_state.status_message = Some(format!("Error: {}", e));
-                return;
-            }
-        };
-
+        let backend_type = self.server_panel_state.backend;
+        let hardware = self.server_panel_state.hardware.clone();
         let load_config = self.server_panel_state.build_load_config(&model_path);
 
-        if let Err(e) = backend.load_model(load_config).await {
-            self.server_panel_state.phase = ServerPhase::Running;
-            self.server_panel_state.status_message = Some(format!("Failed to load model: {}", e));
+        let task = tokio::spawn(async move {
+            let mut backend = BackendFactory::create(backend_type, &hardware).map_err(|e| {
+                (
+                    e,
+                    std::path::Path::new(&load_config.model_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("model")
+                        .to_string(),
+                    "unknown".to_string(),
+                )
+            })?;
+            backend.load_model(load_config).await.map_err(|e| {
+                let name = backend
+                    .model_info()
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let bname = backend.name().to_string();
+                (e, name, bname)
+            })?;
+            Ok::<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>(backend)
+        });
+
+        self.additional_model_load_task = Some(task);
+    }
+
+    async fn poll_additional_model_loading(&mut self) {
+        if self.additional_model_load_task.is_none() {
             return;
         }
 
-        let model_name = backend
-            .model_info()
-            .map(|i| i.name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        let backend_name = backend.name().to_string();
-
-        if let Some(mgr) = &self.shared_model_manager {
-            let mut m = mgr.lock().await;
-            let model_id = m.add(backend);
-
-            self.server_panel_state.loaded_models = m
-                .list()
-                .iter()
-                .map(|lm| crate::server_panel::LoadedModelInfo {
-                    id: lm.id.clone(),
-                    name: lm.model_info.name.clone(),
-                    backend: lm.backend_name.clone(),
-                    is_default: m.default_id() == Some(lm.id.as_str()),
-                })
-                .collect();
-
-            self.server_panel_state.status_message = Some(format!(
-                "Loaded '{}' on {} (id: {})",
-                model_name, backend_name, model_id
-            ));
+        let task = self.additional_model_load_task.as_ref().unwrap();
+        if !task.is_finished() {
+            return;
         }
 
-        self.server_panel_state.phase = ServerPhase::Running;
+        let task = self.additional_model_load_task.take().unwrap();
+        let hint = self.additional_model_name_hint.take();
+
+        match task.await {
+            Ok(Ok(backend)) => {
+                let model_name = backend
+                    .model_info()
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| hint.unwrap_or_else(|| "unknown".to_string()));
+                let backend_name = backend.name().to_string();
+
+                if let Some(mgr) = &self.shared_model_manager {
+                    let mut m = mgr.lock().await;
+                    let model_id = m.add(backend);
+
+                    self.server_panel_state.loaded_models = m
+                        .list()
+                        .iter()
+                        .map(|lm| crate::server_panel::LoadedModelInfo {
+                            id: lm.id.clone(),
+                            name: lm.model_info.name.clone(),
+                            backend: lm.backend_name.clone(),
+                            is_default: m.default_id() == Some(lm.id.as_str()),
+                        })
+                        .collect();
+
+                    self.server_panel_state.status_message = Some(format!(
+                        "Loaded '{}' on {} (id: {})",
+                        model_name, backend_name, model_id
+                    ));
+                }
+                self.server_panel_state.phase = ServerPhase::Running;
+            }
+            Ok(Err((e, name, _))) => {
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message =
+                    Some(format!("Failed to load '{}': {}", name, e));
+            }
+            Err(e) => {
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message =
+                    Some(format!("Model loading task crashed: {}", e));
+            }
+        }
     }
 
     async fn unload_model_action(&mut self) {

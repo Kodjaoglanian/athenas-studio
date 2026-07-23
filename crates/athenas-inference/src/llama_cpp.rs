@@ -964,31 +964,68 @@ impl Drop for LlamaCppBackend {
 }
 
 /// Auto-detect a multimodal projector (mmproj) file in the same directory as the model.
-/// Searches for files containing "mmproj" in the name with common extensions (.gguf, .bin, .safetensors).
+/// Searches for files containing "mmproj", "vision", or "projector" in the name
+/// with common extensions (.gguf, .bin, .safetensors).
 fn auto_detect_mmproj(model_path: &str) -> Option<String> {
     let path = std::path::Path::new(model_path);
     let dir = path.parent()?;
 
     let entries = std::fs::read_dir(dir).ok()?;
 
-    // Look for files with "mmproj" in the name
-    let mut candidates: Vec<(String, u64)> = Vec::new();
+    let model_name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Patterns that indicate a multimodal projector file
+    let mmproj_patterns = ["mmproj", "vision", "projector"];
+
+    let mut candidates: Vec<(String, u64, usize)> = Vec::new();
     for entry in entries.flatten() {
         let entry_path = entry.path();
         if entry_path.is_file() {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let lower = name.to_lowercase();
-                if lower.contains("mmproj") {
-                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    candidates.push((entry_path.to_string_lossy().to_string(), size));
+
+                // Skip the model file itself
+                if lower == model_name {
+                    continue;
+                }
+
+                // Check for mmproj patterns
+                for (idx, pattern) in mmproj_patterns.iter().enumerate() {
+                    if lower.contains(pattern) {
+                        // Must be a supported file extension
+                        let is_valid_ext = lower.ends_with(".gguf")
+                            || lower.ends_with(".bin")
+                            || lower.ends_with(".safetensors");
+                        if !is_valid_ext {
+                            continue;
+                        }
+                        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                        // Prefer "mmproj" matches (idx=0) over "vision" (idx=1) over "projector" (idx=2)
+                        candidates.push((entry_path.to_string_lossy().to_string(), size, idx));
+                        break;
+                    }
                 }
             }
         }
     }
 
-    // Pick the largest mmproj file (most likely the correct one)
-    candidates.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
-    candidates.first().map(|(p, _)| p.clone())
+    if candidates.is_empty() {
+        tracing::debug!("No mmproj file found in {}", dir.display());
+        return None;
+    }
+
+    // Sort by pattern priority (mmproj first), then by size (largest first)
+    candidates.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| b.1.cmp(&a.1)));
+
+    let result = candidates.first().map(|(p, _, _)| p.clone());
+    if let Some(ref p) = result {
+        info!("Auto-detected mmproj: {}", p);
+    }
+    result
 }
 
 fn find_free_port() -> u16 {
