@@ -324,9 +324,10 @@ pub struct ToolFunction {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolChoice {
+    #[default]
     Auto,
     None,
     Required,
@@ -343,12 +344,6 @@ pub struct ToolChoiceSpecific {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolChoiceFunction {
     pub name: String,
-}
-
-impl Default for ToolChoice {
-    fn default() -> Self {
-        ToolChoice::Auto
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

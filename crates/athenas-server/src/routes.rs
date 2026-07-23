@@ -46,6 +46,7 @@ struct AppState {
     start_time: std::time::Instant,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_router(
     model_manager: SharedModelManager,
     metrics: SharedMetrics,
@@ -152,8 +153,8 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(auth_str) = auth.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                return Some(auth_str[7..].to_string());
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                return Some(token.to_string());
             }
         }
     }
@@ -601,13 +602,15 @@ async fn chat_completions(
                 // Record audit entry
                 record_audit(
                     &state,
-                    "/v1/chat/completions",
-                    "POST",
-                    200,
-                    &resp.model,
-                    resp.stats.tokens_prompt as u64,
-                    resp.stats.tokens_generated as u64,
-                    None,
+                    AuditParams {
+                        endpoint: "/v1/chat/completions",
+                        method: "POST",
+                        status: 200,
+                        model: &resp.model,
+                        tokens_prompt: resp.stats.tokens_prompt as u64,
+                        tokens_generated: resp.stats.tokens_generated as u64,
+                        error: None,
+                    },
                 )
                 .await;
 
@@ -723,13 +726,18 @@ async fn chat_completions(
 
                                 record_audit(
                                     &state,
-                                    "/v1/chat/completions",
-                                    "POST",
-                                    200,
-                                    &resp.model,
-                                    resp.stats.tokens_prompt as u64,
-                                    resp.stats.tokens_generated as u64,
-                                    Some(&format!("fallback from {}", resolved_model_id)),
+                                    AuditParams {
+                                        endpoint: "/v1/chat/completions",
+                                        method: "POST",
+                                        status: 200,
+                                        model: &resp.model,
+                                        tokens_prompt: resp.stats.tokens_prompt as u64,
+                                        tokens_generated: resp.stats.tokens_generated as u64,
+                                        error: Some(&format!(
+                                            "fallback from {}",
+                                            resolved_model_id
+                                        )),
+                                    },
                                 )
                                 .await;
 
@@ -2014,37 +2022,39 @@ async fn routing_health(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 // ─── Audit Logging ───
 
-/// Helper to record an audit entry if the audit logger is enabled.
-async fn record_audit(
-    state: &AppState,
-    endpoint: &str,
-    method: &str,
+/// Parameters for recording an audit entry.
+struct AuditParams<'a> {
+    endpoint: &'a str,
+    method: &'a str,
     status: u16,
-    model: &str,
+    model: &'a str,
     tokens_prompt: u64,
     tokens_generated: u64,
-    error: Option<&str>,
-) {
+    error: Option<&'a str>,
+}
+
+/// Helper to record an audit entry if the audit logger is enabled.
+async fn record_audit(state: &AppState, params: AuditParams<'_>) {
     if let Some(ref logger_arc) = state.audit_logger {
         let entry = AuditEntry {
             id: format!("audit_{}", &uuid::Uuid::new_v4().to_string()[..12]),
             timestamp: chrono::Utc::now(),
-            endpoint: endpoint.to_string(),
-            method: method.to_string(),
-            status,
+            endpoint: params.endpoint.to_string(),
+            method: params.method.to_string(),
+            status: params.status,
             key_id: None,
             key_name: None,
-            model: if model.is_empty() {
+            model: if params.model.is_empty() {
                 None
             } else {
-                Some(model.to_string())
+                Some(params.model.to_string())
             },
-            tokens_prompt,
-            tokens_generated,
+            tokens_prompt: params.tokens_prompt,
+            tokens_generated: params.tokens_generated,
             latency_ms: 0,
             client_ip: None,
             user_agent: None,
-            error: error.map(|e| e.to_string()),
+            error: params.error.map(|e| e.to_string()),
             request_id: None,
         };
         let mut logger = logger_arc.lock().await;
