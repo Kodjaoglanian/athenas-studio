@@ -58,12 +58,9 @@ impl SlotManager {
     /// Query all slots from the llama-server.
     pub async fn list_slots(&self) -> Result<Vec<SlotInfo>> {
         let url = format!("{}/slots", self.server_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| athenas_core::AthenasError::Backend(format!("Slot query failed: {}", e)))?;
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            athenas_core::AthenasError::Backend(format!("Slot query failed: {}", e))
+        })?;
 
         if !resp.status().is_success() {
             return Err(athenas_core::AthenasError::Backend(format!(
@@ -72,10 +69,9 @@ impl SlotManager {
             )));
         }
 
-        let slots: Vec<SlotInfo> = resp
-            .json()
-            .await
-            .map_err(|e| athenas_core::AthenasError::Backend(format!("Invalid slot response: {}", e)))?;
+        let slots: Vec<SlotInfo> = resp.json().await.map_err(|e| {
+            athenas_core::AthenasError::Backend(format!("Invalid slot response: {}", e))
+        })?;
 
         Ok(slots)
     }
@@ -118,7 +114,9 @@ impl SlotManager {
             .json(&body)
             .send()
             .await
-            .map_err(|e| athenas_core::AthenasError::Backend(format!("Slot restore failed: {}", e)))?;
+            .map_err(|e| {
+                athenas_core::AthenasError::Backend(format!("Slot restore failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -147,7 +145,9 @@ impl SlotManager {
             .json(&body)
             .send()
             .await
-            .map_err(|e| athenas_core::AthenasError::Backend(format!("Slot erase failed: {}", e)))?;
+            .map_err(|e| {
+                athenas_core::AthenasError::Backend(format!("Slot erase failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             let text = resp.text().await.unwrap_or_default();
@@ -179,11 +179,7 @@ impl SlotManager {
 
     /// Get the session assigned to a slot.
     pub async fn get_slot_assignment(&self, slot_id: i32) -> Option<String> {
-        self.assignments
-            .lock()
-            .await
-            .get(&slot_id)
-            .cloned()
+        self.assignments.lock().await.get(&slot_id).cloned()
     }
 
     /// Get the number of slots.

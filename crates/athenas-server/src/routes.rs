@@ -26,7 +26,7 @@ use athenas_inference::{
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
 use crate::model_manager::SharedModelManager;
-use crate::session_manager::{SharedSessionManager, SessionInfo};
+use crate::session_manager::{SessionInfo, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 
 #[derive(Clone)]
@@ -938,10 +938,7 @@ async fn create_session(
     .into_response()
 }
 
-async fn list_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -1082,10 +1079,7 @@ async fn set_session_system_prompt(
     }
 }
 
-async fn purge_expired_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -1103,10 +1097,7 @@ async fn purge_expired_sessions(
 
 // ── Slot management endpoints ────────────────────────────────────────
 
-async fn list_slots(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }

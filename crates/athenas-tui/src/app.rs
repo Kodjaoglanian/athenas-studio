@@ -770,9 +770,35 @@ impl TuiApp {
         }
 
         if self.backend.is_none() {
-            self.chat_state
-                .add_message("system", "No model loaded. Press F2 to select a model.");
-            return;
+            // Check if the server has models loaded — use those instead
+            if let Some(mgr) = &self.shared_model_manager {
+                let m = mgr.lock().await;
+                if m.has_models() {
+                    let default_name = m
+                        .default_id()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    self.chat_state.add_message(
+                        "system",
+                        &format!(
+                            "Using server model '{}' for inference. \
+                             The server is running with {} model(s) loaded.",
+                            default_name,
+                            m.count()
+                        ),
+                    );
+                } else {
+                    self.chat_state.add_message(
+                        "system",
+                        "No model loaded. Press F2 to select a model, or start the server (F4) to load one.",
+                    );
+                    return;
+                }
+            } else {
+                self.chat_state
+                    .add_message("system", "No model loaded. Press F2 to select a model.");
+                return;
+            }
         }
 
         if self.chat_state.is_generating {
@@ -818,52 +844,61 @@ impl TuiApp {
             seed: None,
         };
 
+        // Get a backend reference: prefer local backend, fall back to server's model manager
+        let backend_ref: Option<Box<dyn Backend>> = if let Some(ref b) = self.backend {
+            Some(b.boxed_clone())
+        } else if let Some(mgr) = &self.shared_model_manager {
+            let m = mgr.lock().await;
+            m.get(None).map(|b| b.boxed_clone())
+        } else {
+            None
+        };
+
+        let Some(backend) = backend_ref else {
+            self.chat_state
+                .add_message("system", "No backend available for inference.");
+            return;
+        };
+
         if !self.config.inference.streaming_enabled {
             // Non-streaming: spawn chat() in background, show result when done
-            if let Some(backend) = &self.backend {
-                let backend_clone = backend.boxed_clone();
-                let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-                tokio::spawn(async move {
-                    match backend_clone.chat(req).await {
-                        Ok(resp) => {
-                            let _ = tx
-                                .send(StreamChunk {
-                                    text: resp.message.content.as_text(),
-                                    done: false,
-                                    is_reasoning: false,
-                                    stats: None,
-                                })
-                                .await;
-                            let _ = tx
-                                .send(StreamChunk {
-                                    text: String::new(),
-                                    done: true,
-                                    is_reasoning: false,
-                                    stats: Some(resp.stats),
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            tracing::error!("Chat error: {}", e);
-                        }
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+            tokio::spawn(async move {
+                match backend.chat(req).await {
+                    Ok(resp) => {
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: resp.message.content.as_text(),
+                                done: false,
+                                is_reasoning: false,
+                                stats: None,
+                            })
+                            .await;
+                        let _ = tx
+                            .send(StreamChunk {
+                                text: String::new(),
+                                done: true,
+                                is_reasoning: false,
+                                stats: Some(resp.stats),
+                            })
+                            .await;
                     }
-                });
-                self.chat_stream_rx = Some(rx);
-            }
+                    Err(e) => {
+                        tracing::error!("Chat error: {}", e);
+                    }
+                }
+            });
+            self.chat_stream_rx = Some(rx);
             return;
         }
 
         // Start streaming in background — store receiver for polling
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-
-        if let Some(backend) = &self.backend {
-            let backend_clone = backend.boxed_clone();
-            tokio::spawn(async move {
-                if let Err(e) = backend_clone.chat_stream(req, tx).await {
-                    tracing::error!("Chat stream error: {}", e);
-                }
-            });
-        }
+        tokio::spawn(async move {
+            if let Err(e) = backend.chat_stream(req, tx).await {
+                tracing::error!("Chat stream error: {}", e);
+            }
+        });
 
         self.chat_stream_rx = Some(rx);
     }
@@ -1315,6 +1350,18 @@ impl TuiApp {
                 self.server_panel_state.status_message = None;
 
                 self.server_handle = Some(server_handle);
+
+                // Update chat state to show server model is available
+                if self.backend.is_none() {
+                    let mgr = self.shared_model_manager.as_ref().unwrap();
+                    let m = mgr.lock().await;
+                    if let Some(default_id) = m.default_id() {
+                        self.chat_state.current_model = Some(default_id.to_string());
+                        if let Some(model) = m.list().iter().find(|lm| lm.id == default_id) {
+                            self.chat_state.current_backend = Some(model.backend_name.clone());
+                        }
+                    }
+                }
             }
             Ok(Err(e)) => {
                 self.server_panel_state.phase = ServerPhase::Error;
@@ -1354,6 +1401,12 @@ impl TuiApp {
         self.server_panel_state.default_model_selected = 0;
         self.shared_model_manager = None;
         self.server_panel_state.status_message = Some("Server stopped".to_string());
+
+        // Clear chat model info if chat was using server model
+        if self.backend.is_none() {
+            self.chat_state.current_model = None;
+            self.chat_state.current_backend = None;
+        }
     }
 
     async fn load_additional_model(&mut self) {
@@ -1459,6 +1512,12 @@ impl TuiApp {
                         "Loaded '{}' on {} (id: {})",
                         model_name, backend_name, model_id
                     ));
+
+                    // Update chat state if chat has no local model
+                    if self.backend.is_none() {
+                        self.chat_state.current_model = Some(model_name);
+                        self.chat_state.current_backend = Some(backend_name);
+                    }
                 }
                 self.server_panel_state.phase = ServerPhase::Running;
             }
@@ -1577,6 +1636,10 @@ impl TuiApp {
                         self.server_panel_state.loaded_models.clear();
                         self.shared_model_manager = None;
                         self.server_panel_state.status_message = Some("Server stopped".to_string());
+                        if self.backend.is_none() {
+                            self.chat_state.current_model = None;
+                            self.chat_state.current_backend = None;
+                        }
                     }
                     Ok(Err(e)) => {
                         self.server_panel_state.phase = ServerPhase::Error;
@@ -1585,6 +1648,10 @@ impl TuiApp {
                         self.shared_model_manager = None;
                         self.server_panel_state.status_message =
                             Some(format!("Server error: {}", e));
+                        if self.backend.is_none() {
+                            self.chat_state.current_model = None;
+                            self.chat_state.current_backend = None;
+                        }
                     }
                     Err(_) => {
                         // Aborted — already handled by stop_server

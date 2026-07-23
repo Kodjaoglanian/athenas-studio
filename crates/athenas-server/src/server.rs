@@ -10,7 +10,7 @@ use athenas_inference::Backend;
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::middleware::{RateLimiter, SharedRateLimiter};
 use crate::model_manager::{ModelManager, SharedModelManager};
-use crate::session_manager::{SharedSessionManager, SessionManager};
+use crate::session_manager::{SessionManager, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 
 pub struct ApiServer {

@@ -17,6 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 3
+  GH_RELEASE_RETRIES: 3
 
 jobs:
   create-release:
@@ -62,6 +63,21 @@ jobs:
           body_path: changelog.txt
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Retry create release
+        if: steps.create-release.outcome == 'failure'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Athenas Studio ${{ steps.version.outputs.version }}
+          body_path: changelog.txt
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: Build ${{ matrix.target }}
@@ -203,12 +219,27 @@ jobs:
           "$hash  $ARCHIVE" | Out-File -Encoding ascii "$ARCHIVE.sha256"
 
       - name: Upload release asset
+        id: upload-asset
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-release.outputs.version }}
           files: |
             ${{ steps.archive.outputs.name }}
             ${{ steps.archive.outputs.name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Retry upload release asset
+        if: steps.upload-asset.outcome == 'failure'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          files: |
+            ${{ steps.archive.outputs.name }}
+            ${{ steps.archive.outputs.name }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-installers:
     name: Publish Install Scripts
