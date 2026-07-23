@@ -712,18 +712,35 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 pub fn render_server_panel(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    // When server is running, reserve space for loaded models panel
+    let loaded_count = if state.phase == ServerPhase::Running && !state.loaded_models.is_empty() {
+        state.loaded_models.len()
+    } else {
+        0
+    };
+    // loaded models panel: header(1) + separator(1) + models(loaded_count) + endpoints(4) + padding(1) + borders(2)
+    let loaded_panel_height = if loaded_count > 0 {
+        (3 + loaded_count + 5) as u16
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7), // Hardware info banner
-            Constraint::Min(3),    // Config fields
-            Constraint::Length(3), // Status bar
+            Constraint::Length(7),                   // Hardware info banner
+            Constraint::Min(10),                     // Config fields (scrollable)
+            Constraint::Length(loaded_panel_height), // Loaded models + endpoints
+            Constraint::Length(3),                   // Status bar
         ])
         .split(area);
 
     render_hardware_banner(f, chunks[0], state);
     render_config_fields(f, chunks[1], state);
-    render_server_status_bar(f, chunks[2], state);
+    if loaded_panel_height > 0 {
+        render_loaded_models_panel(f, chunks[2], state);
+    }
+    render_server_status_bar(f, chunks[3], state);
 }
 
 fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
@@ -1017,65 +1034,92 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         }
     }
 
-    // Show loaded models and endpoints when running
-    if state.phase == ServerPhase::Running {
-        // Loaded models list
-        if !state.loaded_models.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled(
-                " LOADED MODELS",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            lines.push(Line::styled(
-                " ─────────────────────────────────────────────",
-                Style::default().fg(Color::DarkGray),
-            ));
-            for m in &state.loaded_models {
-                let default_marker = if m.is_default { " ★" } else { "" };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("   {}  ", m.id),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        m.name.clone(),
-                        Style::default().fg(if m.is_default {
-                            Color::Green
-                        } else {
-                            Color::White
-                        }),
-                    ),
-                    Span::styled(
-                        format!("  [{}]", m.backend),
-                        Style::default().fg(Color::Gray),
-                    ),
-                    Span::styled(default_marker, Style::default().fg(Color::Yellow)),
-                ]));
-            }
+    // Calculate scroll offset to keep selected field visible
+    // Each field takes ~1-2 lines (field + optional hint). We estimate
+    // the position by counting lines up to the selected field.
+    let mut line_count = 0u16;
+    let mut current_section = "";
+    for (i, field) in state.fields.iter().enumerate() {
+        let section = field.section();
+        if section != current_section {
+            current_section = section;
+            line_count += 3; // blank + header + separator
         }
+        if i == state.selected {
+            break;
+        }
+        line_count += 1;
+        // Selected field shows a hint line
+        if i == state.selected.saturating_sub(1) {
+            line_count += 1;
+        }
+    }
+    // Scroll if the selected field is below the visible area
+    let visible_height = area.height.saturating_sub(2); // minus borders
+    let scroll = if line_count > visible_height {
+        line_count - visible_height + 2
+    } else {
+        0
+    };
 
-        lines.push(Line::from(""));
-        lines.push(Line::styled(
-            " ENDPOINTS",
+    let p = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn render_loaded_models_panel(f: &mut Frame, area: Rect, state: &ServerPanelState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Loaded Models & Endpoints ",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::styled(
-            "   POST /v1/chat/completions   GET /v1/models",
-            Style::default().fg(Color::Gray),
-        ));
-        lines.push(Line::styled(
-            "   POST /v1/completions        GET /v1/health",
-            Style::default().fg(Color::Gray),
-        ));
-        lines.push(Line::styled(
-            "   GET /v1/ready               GET /metrics",
-            Style::default().fg(Color::Gray),
-        ));
+        ))
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Loaded models list
+    for m in &state.loaded_models {
+        let default_marker = if m.is_default { " ★ default" } else { "" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:>2}  ", m.id),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                m.name.clone(),
+                Style::default().fg(if m.is_default {
+                    Color::Green
+                } else {
+                    Color::White
+                }),
+            ),
+            Span::styled(
+                format!("  [{}]", m.backend),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(default_marker, Style::default().fg(Color::Yellow)),
+        ]));
     }
+
+    // Endpoints
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        " Endpoints:",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::styled(
+        "   POST /v1/chat/completions   GET /v1/models",
+        Style::default().fg(Color::Gray),
+    ));
+    lines.push(Line::styled(
+        "   POST /v1/completions        GET /v1/health",
+        Style::default().fg(Color::Gray),
+    ));
 
     let p = Paragraph::new(lines)
         .block(block)
