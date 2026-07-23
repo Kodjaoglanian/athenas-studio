@@ -10,6 +10,8 @@ use athenas_inference::Backend;
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::middleware::{RateLimiter, SharedRateLimiter};
 use crate::model_manager::{ModelManager, SharedModelManager};
+use crate::session_manager::{SharedSessionManager, SessionManager};
+use crate::slot_manager::SlotManager;
 
 pub struct ApiServer {
     config: AppConfig,
@@ -17,6 +19,8 @@ pub struct ApiServer {
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     rate_limiter: SharedRateLimiter,
+    session_manager: SharedSessionManager,
+    slot_manager: Option<Arc<SlotManager>>,
 }
 
 impl ApiServer {
@@ -31,6 +35,7 @@ impl ApiServer {
         ));
 
         let model_manager = Arc::new(Mutex::new(ModelManager::with_default(backend)));
+        let session_manager = Arc::new(Mutex::new(SessionManager::new(100, 4)));
 
         Self {
             config,
@@ -38,6 +43,8 @@ impl ApiServer {
             metrics,
             semaphore,
             rate_limiter,
+            session_manager,
+            slot_manager: None,
         }
     }
 
@@ -52,18 +59,38 @@ impl ApiServer {
             config.server.rate_limit_per_second,
         ));
 
+        let session_manager = Arc::new(Mutex::new(SessionManager::new(100, 4)));
+
         Self {
             config,
             model_manager: manager,
             metrics,
             semaphore,
             rate_limiter,
+            session_manager,
+            slot_manager: None,
         }
+    }
+
+    /// Attach a slot manager (for KV cache persistence with llama-server).
+    pub fn with_slot_manager(mut self, slot_mgr: SlotManager) -> Self {
+        self.slot_manager = Some(Arc::new(slot_mgr));
+        self
     }
 
     /// Get the shared model manager (for loading/unloading models at runtime).
     pub fn model_manager(&self) -> SharedModelManager {
         self.model_manager.clone()
+    }
+
+    /// Get the shared session manager.
+    pub fn session_manager(&self) -> SharedSessionManager {
+        self.session_manager.clone()
+    }
+
+    /// Get the slot manager (if any).
+    pub fn slot_manager(&self) -> Option<Arc<SlotManager>> {
+        self.slot_manager.clone()
     }
 
     pub async fn start(&self, host: &str, port: u16) -> Result<()> {
@@ -72,6 +99,8 @@ impl ApiServer {
             self.metrics.clone(),
             self.semaphore.clone(),
             self.rate_limiter.clone(),
+            self.session_manager.clone(),
+            self.slot_manager.clone(),
             &self.config.server,
         );
 

@@ -219,13 +219,7 @@ async fn main() -> anyhow::Result<()> {
         let buffer_layer = athenas_tui::log_buffer::LogBufferLayer::new(log_buffer.clone());
 
         tracing_subscriber::registry()
-            .with(EnvFilter::new(if cli.debug {
-                "debug"
-            } else if cli.verbose {
-                "info"
-            } else {
-                "warn"
-            }))
+            .with(EnvFilter::new(if cli.debug { "debug" } else { "info" }))
             .with(buffer_layer)
             .init();
 

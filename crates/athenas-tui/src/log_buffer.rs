@@ -93,11 +93,19 @@ struct MessageVisitor {
 }
 
 impl Visit for MessageVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        } else if self.message.is_none() {
+            let val = format!("{}={}", field.name(), value);
+            self.message = Some(val);
+        }
+    }
+
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = Some(format!("{:?}", value));
         } else if self.message.is_none() {
-            // If there's no "message" field, collect all fields
             let val = format!("{}={:?}", field.name(), value);
             match &mut self.message {
                 Some(msg) => {

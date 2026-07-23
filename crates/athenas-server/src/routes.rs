@@ -26,10 +26,14 @@ use athenas_inference::{
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
 use crate::model_manager::SharedModelManager;
+use crate::session_manager::{SharedSessionManager, SessionInfo};
+use crate::slot_manager::SlotManager;
 
 #[derive(Clone)]
 struct AppState {
     model_manager: SharedModelManager,
+    session_manager: SharedSessionManager,
+    slot_manager: Option<Arc<SlotManager>>,
     api_key: Option<String>,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
@@ -41,10 +45,14 @@ pub fn create_router(
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     rate_limiter: SharedRateLimiter,
+    session_manager: SharedSessionManager,
+    slot_manager: Option<Arc<SlotManager>>,
     config: &ServerConfig,
 ) -> Router {
     let state = AppState {
         model_manager,
+        session_manager,
+        slot_manager,
         api_key: config.api_key.clone(),
         metrics: metrics.clone(),
         semaphore,
@@ -57,6 +65,17 @@ pub fn create_router(
         .route("/v1/models", get(list_models))
         .route("/v1/models/load", post(load_model_endpoint))
         .route("/v1/models/unload", post(unload_model_endpoint))
+        // Session management endpoints
+        .route("/v1/sessions", post(create_session).get(list_sessions))
+        .route("/v1/sessions/:id", get(get_session).delete(delete_session))
+        .route("/v1/sessions/:id/messages", get(get_session_messages))
+        .route("/v1/sessions/:id/system", post(set_session_system_prompt))
+        .route("/v1/sessions/purge", post(purge_expired_sessions))
+        // Slot management endpoints
+        .route("/v1/slots", get(list_slots))
+        .route("/v1/slots/:id/save", post(save_slot))
+        .route("/v1/slots/:id/restore", post(restore_slot))
+        .route("/v1/slots/:id/erase", post(erase_slot))
         .route("/v1/files", post(upload_file))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
@@ -195,6 +214,19 @@ struct ChatCompletionRequest {
     stream: Option<bool>,
     stop: Option<serde_json::Value>,
     seed: Option<u64>,
+    /// Optional session ID for server-side conversation history.
+    /// If provided, the server will prepend stored history to the messages.
+    session_id: Option<String>,
+    /// If true and session_id is provided, append the new messages to the session.
+    #[serde(default = "default_true")]
+    append_to_session: bool,
+    /// If true and session_id is provided, save the assistant response to the session.
+    #[serde(default = "default_true")]
+    save_response: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -239,7 +271,7 @@ async fn chat_completions(
         }
     };
 
-    let messages: Vec<ChatMessage> = req
+    let new_messages: Vec<ChatMessage> = req
         .messages
         .iter()
         .map(|m| {
@@ -255,6 +287,21 @@ async fn chat_completions(
             }
         })
         .collect();
+
+    // If session_id is provided, build messages from session history + new messages
+    let (messages, session_id) = if let Some(ref sid) = req.session_id {
+        let mut sm = state.session_manager.lock().await;
+        // Auto-create session if it doesn't exist
+        if sm.get(sid).is_none() {
+            sm.create(Some(sid.clone()));
+        }
+        let session = sm.get(sid).unwrap();
+        let built = session.build_messages(&new_messages);
+        drop(sm);
+        (built, Some(sid.clone()))
+    } else {
+        (new_messages.clone(), None)
+    };
 
     let stop = match req.stop {
         Some(serde_json::Value::String(s)) => Some(vec![s]),
@@ -303,9 +350,24 @@ async fn chat_completions(
             .unwrap_or_default();
         drop(mgr);
 
+        // Append new messages to session at stream start
+        if let Some(ref sid) = session_id {
+            if req.append_to_session {
+                let mut sm = state.session_manager.lock().await;
+                if let Some(session) = sm.get_mut(sid) {
+                    for msg in &new_messages {
+                        session.append(msg.clone());
+                    }
+                }
+            }
+        }
+
         let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
         let model_id_clone = model_id.clone();
+        let session_mgr_clone = state.session_manager.clone();
+        let session_id_clone = session_id.clone();
+        let should_save_response = req.save_response;
         tokio::spawn(async move {
             let m = mgr2.lock().await;
             if let Some(b) = m.get(Some(model_id_clone.as_str())) {
@@ -317,11 +379,23 @@ async fn chat_completions(
 
         let stream = async_stream::stream! {
             let mut rx = rx;
+            let mut full_text = String::new();
             while let Some(chunk) = rx.recv().await {
                 if chunk.done {
                     if let Some(stats) = &chunk.stats {
                         metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
                     }
+
+                    // Save assistant response to session
+                    if should_save_response {
+                        if let Some(ref sid) = session_id_clone {
+                            let mut sm = session_mgr_clone.lock().await;
+                            if let Some(session) = sm.get_mut(sid) {
+                                session.append(ChatMessage::assistant(full_text.clone()));
+                            }
+                        }
+                    }
+
                     let json = serde_json::json!({
                         "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                         "object": "chat.completion.chunk",
@@ -339,6 +413,7 @@ async fn chat_completions(
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
+                full_text.push_str(&chunk.text);
                 let json = serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion.chunk",
@@ -367,6 +442,25 @@ async fn chat_completions(
                     resp.stats.tokens_prompt,
                     resp.stats.tokens_generated,
                 );
+
+                // Save messages to session if session_id was provided
+                if let Some(ref sid) = session_id {
+                    if req.append_to_session {
+                        let mut sm = state.session_manager.lock().await;
+                        if let Some(session) = sm.get_mut(sid) {
+                            for msg in &new_messages {
+                                session.append(msg.clone());
+                            }
+                        }
+                    }
+                    if req.save_response {
+                        let mut sm = state.session_manager.lock().await;
+                        if let Some(session) = sm.get_mut(sid) {
+                            session.append(resp.message.clone());
+                        }
+                    }
+                }
+
                 let json = serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion",
@@ -791,5 +885,348 @@ async fn unload_model_endpoint(
             .into_response()
         }
         Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+// ── Session management endpoints ─────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateSessionRequest {
+    session_id: Option<String>,
+    system_prompt: Option<String>,
+    model: Option<String>,
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateSessionRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut sm = state.session_manager.lock().await;
+    let id = sm.create(req.session_id);
+
+    if let Some(sys) = req.system_prompt {
+        if let Some(session) = sm.get_mut(&id) {
+            session.system_prompt = Some(sys);
+        }
+    }
+    if let Some(model) = req.model {
+        if let Some(session) = sm.get_mut(&id) {
+            session.model_id = Some(model);
+        }
+    }
+
+    let info = sm.get(&id).map(|s| SessionInfo {
+        id: s.id.clone(),
+        model_id: s.model_id.clone(),
+        message_count: s.messages.len(),
+        slot_id: s.slot_id,
+        slot_cache_warm: s.slot_cache_warm,
+        created_at_secs: s.created_at.elapsed().as_secs(),
+        last_active_secs: s.last_active.elapsed().as_secs(),
+        system_prompt: s.system_prompt.clone(),
+    });
+
+    Json(serde_json::json!({
+        "status": "created",
+        "session": info,
+    }))
+    .into_response()
+}
+
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let sm = state.session_manager.lock().await;
+    let sessions: Vec<SessionInfo> = sm.list();
+
+    Json(serde_json::json!({
+        "sessions": sessions,
+        "total": sessions.len(),
+    }))
+    .into_response()
+}
+
+async fn get_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let sm = state.session_manager.lock().await;
+    match sm.get(&id) {
+        Some(session) => {
+            let info = SessionInfo {
+                id: session.id.clone(),
+                model_id: session.model_id.clone(),
+                message_count: session.messages.len(),
+                slot_id: session.slot_id,
+                slot_cache_warm: session.slot_cache_warm,
+                created_at_secs: session.created_at.elapsed().as_secs(),
+                last_active_secs: session.last_active.elapsed().as_secs(),
+                system_prompt: session.system_prompt.clone(),
+            };
+            Json(serde_json::json!({"session": info})).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Session '{}' not found", id)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut sm = state.session_manager.lock().await;
+    if sm.remove(&id) {
+        Json(serde_json::json!({"status": "deleted", "session_id": id})).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Session '{}' not found", id)})),
+        )
+            .into_response()
+    }
+}
+
+async fn get_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let sm = state.session_manager.lock().await;
+    match sm.get(&id) {
+        Some(session) => {
+            let messages: Vec<serde_json::Value> = session
+                .messages
+                .iter()
+                .map(|m| {
+                    let role = match m.role {
+                        Role::System => "system",
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                    };
+                    serde_json::json!({
+                        "role": role,
+                        "content": m.content.as_text(),
+                    })
+                })
+                .collect();
+
+            Json(serde_json::json!({
+                "session_id": id,
+                "messages": messages,
+                "count": messages.len(),
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Session '{}' not found", id)})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetSystemPromptRequest {
+    system_prompt: String,
+}
+
+async fn set_session_system_prompt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<SetSystemPromptRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut sm = state.session_manager.lock().await;
+    match sm.get_mut(&id) {
+        Some(session) => {
+            session.system_prompt = Some(req.system_prompt);
+            Json(serde_json::json!({"status": "updated", "session_id": id})).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Session '{}' not found", id)})),
+        )
+            .into_response(),
+    }
+}
+
+async fn purge_expired_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut sm = state.session_manager.lock().await;
+    let purged = sm.purge_expired();
+
+    Json(serde_json::json!({
+        "status": "purged",
+        "sessions_removed": purged,
+        "sessions_remaining": sm.count(),
+    }))
+    .into_response()
+}
+
+// ── Slot management endpoints ────────────────────────────────────────
+
+async fn list_slots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let Some(ref slot_mgr) = state.slot_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Slot manager not configured. Only available with llama-server backend."})),
+        )
+            .into_response();
+    };
+
+    match slot_mgr.list_slots().await {
+        Ok(slots) => Json(serde_json::json!({"slots": slots})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SaveSlotRequest {
+    checkpoint_name: String,
+}
+
+async fn save_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(slot_id): axum::extract::Path<i32>,
+    Json(req): Json<SaveSlotRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let Some(ref slot_mgr) = state.slot_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Slot manager not configured"})),
+        )
+            .into_response();
+    };
+
+    match slot_mgr.save_slot(slot_id, &req.checkpoint_name).await {
+        Ok(()) => Json(serde_json::json!({
+            "status": "saved",
+            "slot_id": slot_id,
+            "checkpoint": req.checkpoint_name,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn restore_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(slot_id): axum::extract::Path<i32>,
+    Json(req): Json<SaveSlotRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let Some(ref slot_mgr) = state.slot_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Slot manager not configured"})),
+        )
+            .into_response();
+    };
+
+    match slot_mgr.restore_slot(slot_id, &req.checkpoint_name).await {
+        Ok(()) => Json(serde_json::json!({
+            "status": "restored",
+            "slot_id": slot_id,
+            "checkpoint": req.checkpoint_name,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn erase_slot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(slot_id): axum::extract::Path<i32>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let Some(ref slot_mgr) = state.slot_manager else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Slot manager not configured"})),
+        )
+            .into_response();
+    };
+
+    match slot_mgr.erase_slot(slot_id).await {
+        Ok(()) => Json(serde_json::json!({
+            "status": "erased",
+            "slot_id": slot_id,
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }

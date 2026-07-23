@@ -170,7 +170,7 @@ impl LlamaCppBackend {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--parallel")
-            .arg("1")
+            .arg("4")
             // Enterprise performance flags
             .arg("--cont-batching")
             .arg("--cache-prompt")
