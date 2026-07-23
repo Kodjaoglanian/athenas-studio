@@ -24,6 +24,17 @@ type AdditionalModelLoadResult =
 
 type AdditionalModelLoadTask = Option<tokio::task::JoinHandle<AdditionalModelLoadResult>>;
 
+type ServerStartResult = std::result::Result<
+    (
+        tokio::task::JoinHandle<athenas_core::Result<()>>,
+        athenas_server::SharedModelManager,
+        String,
+        u16,
+    ),
+    athenas_core::AthenasError,
+>;
+type ServerStartTask = Option<tokio::task::JoinHandle<ServerStartResult>>;
+
 #[derive(PartialEq)]
 pub enum AppMode {
     Chat,
@@ -31,6 +42,7 @@ pub enum AppMode {
     Browser,
     Server,
     Settings,
+    Logs,
 }
 
 impl AppMode {
@@ -41,6 +53,7 @@ impl AppMode {
             AppMode::Browser => 2,
             AppMode::Server => 3,
             AppMode::Settings => 4,
+            AppMode::Logs => 5,
         }
     }
 }
@@ -74,6 +87,10 @@ pub struct TuiApp {
     // Background additional model loading state (server panel)
     additional_model_load_task: AdditionalModelLoadTask,
     additional_model_name_hint: Option<String>,
+    // Background server start task (server panel)
+    server_start_task: ServerStartTask,
+    // Logs page state
+    logs_state: crate::log_buffer::LogsState,
     // Background chat streaming state
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
 }
@@ -108,8 +125,20 @@ impl TuiApp {
             loading_spinner: 0,
             additional_model_load_task: None,
             additional_model_name_hint: None,
+            server_start_task: None,
+            logs_state: crate::log_buffer::LogsState::new(crate::log_buffer::LogBuffer::new(500)),
             chat_stream_rx: None,
         }
+    }
+
+    pub fn with_log_buffer(
+        config: AppConfig,
+        hardware: HardwareInfo,
+        log_buffer: crate::log_buffer::LogBuffer,
+    ) -> Self {
+        let mut app = Self::new(config, hardware);
+        app.logs_state = crate::log_buffer::LogsState::new(log_buffer);
+        app
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -149,6 +178,9 @@ impl TuiApp {
 
             // Poll additional model loading task (server panel)
             self.poll_additional_model_loading().await;
+
+            // Poll server start task (server panel)
+            self.poll_server_start_task().await;
 
             // Poll chat stream
             self.poll_chat_stream().await;
@@ -201,6 +233,10 @@ impl TuiApp {
                         self.mode = AppMode::Settings;
                         continue;
                     }
+                    if key.code == KeyCode::F(6) {
+                        self.mode = AppMode::Logs;
+                        continue;
+                    }
 
                     // Global Tab cycling (skip when editing or in chat mode
                     // where Tab is used for thinking toggle)
@@ -214,7 +250,8 @@ impl TuiApp {
                             AppMode::ModelList => AppMode::Browser,
                             AppMode::Browser => AppMode::Server,
                             AppMode::Server => AppMode::Settings,
-                            AppMode::Settings => AppMode::Chat,
+                            AppMode::Settings => AppMode::Logs,
+                            AppMode::Logs => AppMode::Chat,
                         };
                         if matches!(self.mode, AppMode::ModelList) {
                             self.refresh_models();
@@ -231,6 +268,7 @@ impl TuiApp {
                         AppMode::Browser => self.handle_browser_key(key).await,
                         AppMode::Server => self.handle_server_key(key).await,
                         AppMode::Settings => self.handle_settings_key(key).await,
+                        AppMode::Logs => self.handle_logs_key(key).await,
                     }
                 }
             }
@@ -281,6 +319,9 @@ impl TuiApp {
             }
             AppMode::Settings => {
                 components::render_settings(f, content, &self.settings_state);
+            }
+            AppMode::Logs => {
+                components::render_logs(f, content, &self.logs_state);
             }
         }
     }
@@ -417,6 +458,21 @@ impl TuiApp {
                 }
                 _ => {}
             }
+        }
+    }
+
+    async fn handle_logs_key(&mut self, key: event::KeyEvent) {
+        match key.code {
+            KeyCode::Char('c') => {
+                self.logs_state.clear();
+            }
+            KeyCode::Char('a') => {
+                self.logs_state.auto_scroll = !self.logs_state.auto_scroll;
+            }
+            KeyCode::Esc => {
+                self.mode = AppMode::Chat;
+            }
+            _ => {}
         }
     }
 
@@ -914,11 +970,14 @@ impl TuiApp {
             "/settings" => {
                 self.mode = AppMode::Settings;
             }
+            "/logs" => {
+                self.mode = AppMode::Logs;
+            }
             "/help" => {
                 self.chat_state.add_message(
                     "system",
-                    "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /help, /quit\n\
-                     F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | Ctrl+C: Quit",
+                    "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /logs, /help, /quit\n\
+                     F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | F6: Logs | Ctrl+C: Quit",
                 );
             }
             "/quit" => {
@@ -1168,6 +1227,13 @@ impl TuiApp {
             return;
         }
 
+        // Don't start if already loading
+        if self.server_start_task.is_some() {
+            self.server_panel_state.status_message =
+                Some("Server is already starting, please wait...".to_string());
+            return;
+        }
+
         let model_path = match self.server_panel_state.selected_model_path() {
             Some(p) => p,
             None => {
@@ -1180,77 +1246,105 @@ impl TuiApp {
         self.server_panel_state.phase = ServerPhase::LoadingModel;
         self.server_panel_state.status_message = Some(format!("Loading model: {}...", model_path));
 
-        // Create backend and load model
-        let mut backend = match self.server_panel_state.create_backend() {
-            Ok(b) => b,
-            Err(e) => {
-                self.server_panel_state.phase = ServerPhase::Error;
-                self.server_panel_state.status_message = Some(format!("Error: {}", e));
-                return;
-            }
-        };
-
+        let backend_type = self.server_panel_state.backend;
+        let hardware = self.server_panel_state.hardware.clone();
         let load_config = self.server_panel_state.build_load_config(&model_path);
-
-        if let Err(e) = backend.load_model(load_config).await {
-            self.server_panel_state.phase = ServerPhase::Error;
-            self.server_panel_state.status_message = Some(format!("Failed to load model: {}", e));
-            return;
-        }
-
-        // Get model info
-        let model_name = backend
-            .model_info()
-            .map(|i| i.name.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        let backend_name = backend.name().to_string();
-
-        self.server_panel_state.loaded_model_name = Some(model_name.clone());
-        self.server_panel_state.loaded_backend_name = Some(backend_name.clone());
-
-        // Build config for server
         let server_config = self.server_panel_state.build_app_config(&self.config);
         let host = self.server_panel_state.host.clone();
         let port = self.server_panel_state.port;
 
-        let api_server = athenas_server::ApiServer::new(server_config, backend);
-        let model_mgr = api_server.model_manager();
+        let task = tokio::spawn(async move {
+            let mut backend = BackendFactory::create(backend_type, &hardware)?;
+            backend.load_model(load_config).await?;
 
-        // Populate loaded models list
-        {
-            let mgr = model_mgr.lock().await;
-            self.server_panel_state.loaded_models = mgr
-                .list()
-                .iter()
-                .map(|m| crate::server_panel::LoadedModelInfo {
-                    id: m.id.clone(),
-                    name: m.model_info.name.clone(),
-                    backend: m.backend_name.clone(),
-                    is_default: mgr.default_id() == Some(m.id.as_str()),
-                })
-                .collect();
+            let api_server = athenas_server::ApiServer::new(server_config, backend);
+            let model_mgr = api_server.model_manager();
+
+            // Start the server in the background
+            let server_host = host.clone();
+            let server_port = port;
+            let server_handle =
+                tokio::spawn(async move { api_server.start(&server_host, server_port).await });
+
+            Ok::<
+                (
+                    tokio::task::JoinHandle<athenas_core::Result<()>>,
+                    athenas_server::SharedModelManager,
+                    String,
+                    u16,
+                ),
+                athenas_core::AthenasError,
+            >((server_handle, model_mgr, host, port))
+        });
+
+        self.server_start_task = Some(task);
+    }
+
+    async fn poll_server_start_task(&mut self) {
+        if self.server_start_task.is_none() {
+            return;
         }
-        self.shared_model_manager = Some(model_mgr);
 
-        self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
-        self.server_panel_state.phase = ServerPhase::Running;
-        self.server_panel_state.status_message = None;
+        let task = self.server_start_task.as_ref().unwrap();
+        if !task.is_finished() {
+            return;
+        }
 
-        let handle = tokio::spawn(async move { api_server.start(&host, port).await });
+        let task = self.server_start_task.take().unwrap();
 
-        self.server_handle = Some(handle);
+        match task.await {
+            Ok(Ok((server_handle, model_mgr, host, port))) => {
+                // Populate loaded models list
+                {
+                    let mgr = model_mgr.lock().await;
+                    self.server_panel_state.loaded_models = mgr
+                        .list()
+                        .iter()
+                        .map(|m| crate::server_panel::LoadedModelInfo {
+                            id: m.id.clone(),
+                            name: m.model_info.name.clone(),
+                            backend: m.backend_name.clone(),
+                            is_default: mgr.default_id() == Some(m.id.as_str()),
+                        })
+                        .collect();
+                }
+                self.shared_model_manager = Some(model_mgr);
+
+                self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message = None;
+
+                self.server_handle = Some(server_handle);
+            }
+            Ok(Err(e)) => {
+                self.server_panel_state.phase = ServerPhase::Error;
+                self.server_panel_state.status_message =
+                    Some(format!("Failed to start server: {}", e));
+            }
+            Err(e) => {
+                self.server_panel_state.phase = ServerPhase::Error;
+                self.server_panel_state.status_message =
+                    Some(format!("Server start task crashed: {}", e));
+            }
+        }
     }
 
     fn stop_server(&mut self) {
-        if self.server_panel_state.phase != ServerPhase::Running {
+        if self.server_panel_state.phase == ServerPhase::Running {
+            // Abort the server task
+            if let Some(handle) = self.server_handle.take() {
+                handle.abort();
+            }
+        } else if self.server_panel_state.phase == ServerPhase::LoadingModel {
+            // Cancel the server start task
+            if let Some(task) = self.server_start_task.take() {
+                task.abort();
+            }
+        } else {
             self.server_panel_state.status_message = Some("Server is not running".to_string());
             return;
         }
 
-        // Abort the server task
-        if let Some(handle) = self.server_handle.take() {
-            handle.abort();
-        }
         self.server_panel_state.phase = ServerPhase::Configuring;
         self.server_panel_state.server_url = None;
         self.server_panel_state.loaded_model_name = None;

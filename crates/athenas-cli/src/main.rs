@@ -1,6 +1,7 @@
 mod commands;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -198,6 +199,10 @@ enum BackendCommands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let command = cli.command.unwrap_or(Commands::Tui);
+
+    let is_tui = matches!(command, Commands::Tui);
+
     let filter = if cli.debug {
         EnvFilter::new("debug")
     } else if cli.verbose {
@@ -206,33 +211,40 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::new("warn")
     };
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // For TUI mode, use a custom subscriber that captures logs into a buffer
+    // instead of writing to stderr (which would corrupt the terminal display).
+    // For other modes, use the standard fmt subscriber.
+    if is_tui {
+        let log_buffer = athenas_tui::log_buffer::LogBuffer::new(500);
+        let buffer_layer = athenas_tui::log_buffer::LogBufferLayer::new(log_buffer.clone());
 
-    let command = cli.command.unwrap_or(Commands::Tui);
+        tracing_subscriber::registry()
+            .with(EnvFilter::new(if cli.debug {
+                "debug"
+            } else if cli.verbose {
+                "info"
+            } else {
+                "warn"
+            }))
+            .with(buffer_layer)
+            .init();
 
-    match command {
-        Commands::Tui => commands::tui::run().await?,
-        Commands::Chat {
-            model,
-            backend,
-            gpu_layers,
-            context_size,
-        } => commands::chat::run(model, backend, gpu_layers, context_size).await?,
-        Commands::Serve {
-            model,
-            host,
-            port,
-            backend,
-            gpu_layers,
-            context_size,
-            max_concurrent,
-            rate_limit,
-            timeout,
-            max_body_size,
-        } => {
-            commands::serve::run(
+        commands::tui::run_with_log_buffer(log_buffer).await?;
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
+
+    if !is_tui {
+        match command {
+            Commands::Chat {
                 model,
-                &host,
+                backend,
+                gpu_layers,
+                context_size,
+            } => commands::chat::run(model, backend, gpu_layers, context_size).await?,
+            Commands::Serve {
+                model,
+                host,
                 port,
                 backend,
                 gpu_layers,
@@ -241,50 +253,65 @@ async fn main() -> anyhow::Result<()> {
                 rate_limit,
                 timeout,
                 max_body_size,
-            )
-            .await?
-        }
-        Commands::Run {
-            model,
-            prompt,
-            backend,
-            temperature,
-            max_tokens,
-            gpu_layers,
-        } => {
-            commands::run::run(model, &prompt, backend, temperature, max_tokens, gpu_layers).await?
-        }
-        Commands::Models { action } => match action {
-            ModelsCommands::List => commands::models::list().await?,
-            ModelsCommands::Search {
-                query,
-                pipeline,
-                gguf,
-            } => commands::models::search(&query, pipeline, gguf).await?,
-            ModelsCommands::Pull {
-                repo_id,
-                file,
-                revision,
-            } => commands::models::pull(&repo_id, file, &revision).await?,
-            ModelsCommands::Remove { model } => commands::models::remove(&model).await?,
-            ModelsCommands::Info { model } => commands::models::info(&model).await?,
-        },
-        Commands::Config { action } => match action {
-            ConfigCommands::Set { key, value } => commands::config::set(&key, &value).await?,
-            ConfigCommands::Get { key } => commands::config::get(&key).await?,
-            ConfigCommands::Show => commands::config::show().await?,
-            ConfigCommands::Init => commands::config::init().await?,
-        },
-        Commands::Hardware => commands::hardware::show().await?,
-        Commands::Backend { action } => match action {
-            Some(BackendCommands::List) => commands::backend::list().await?,
-            Some(BackendCommands::Benchmark { model }) => {
-                commands::backend::benchmark(model).await?
+            } => {
+                commands::serve::run(
+                    model,
+                    &host,
+                    port,
+                    backend,
+                    gpu_layers,
+                    context_size,
+                    max_concurrent,
+                    rate_limit,
+                    timeout,
+                    max_body_size,
+                )
+                .await?
             }
-            None => commands::backend::list().await?,
-        },
-        Commands::Login { token } => commands::config::login(token).await?,
-        Commands::Update => commands::update::run().await?,
+            Commands::Run {
+                model,
+                prompt,
+                backend,
+                temperature,
+                max_tokens,
+                gpu_layers,
+            } => {
+                commands::run::run(model, &prompt, backend, temperature, max_tokens, gpu_layers)
+                    .await?
+            }
+            Commands::Models { action } => match action {
+                ModelsCommands::List => commands::models::list().await?,
+                ModelsCommands::Search {
+                    query,
+                    pipeline,
+                    gguf,
+                } => commands::models::search(&query, pipeline, gguf).await?,
+                ModelsCommands::Pull {
+                    repo_id,
+                    file,
+                    revision,
+                } => commands::models::pull(&repo_id, file, &revision).await?,
+                ModelsCommands::Remove { model } => commands::models::remove(&model).await?,
+                ModelsCommands::Info { model } => commands::models::info(&model).await?,
+            },
+            Commands::Config { action } => match action {
+                ConfigCommands::Set { key, value } => commands::config::set(&key, &value).await?,
+                ConfigCommands::Get { key } => commands::config::get(&key).await?,
+                ConfigCommands::Show => commands::config::show().await?,
+                ConfigCommands::Init => commands::config::init().await?,
+            },
+            Commands::Hardware => commands::hardware::show().await?,
+            Commands::Backend { action } => match action {
+                Some(BackendCommands::List) => commands::backend::list().await?,
+                Some(BackendCommands::Benchmark { model }) => {
+                    commands::backend::benchmark(model).await?
+                }
+                None => commands::backend::list().await?,
+            },
+            Commands::Login { token } => commands::config::login(token).await?,
+            Commands::Update => commands::update::run().await?,
+            Commands::Tui => {} // already handled above
+        }
     }
 
     Ok(())

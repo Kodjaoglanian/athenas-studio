@@ -368,7 +368,7 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
 }
 
 pub fn render_tab_bar(f: &mut Frame, area: Rect, active: usize) {
-    let tabs = ["Chat", "Models", "Browser", "Server", "Settings"];
+    let tabs = ["Chat", "Models", "Browser", "Server", "Settings", "Logs"];
     let spans: Vec<Span> = tabs
         .iter()
         .enumerate()
@@ -465,6 +465,87 @@ pub fn render_settings(f: &mut Frame, area: Rect, state: &SettingsState) {
         Box::leak(msg.clone().into_boxed_str())
     } else {
         " Up/Down: Navigate | Enter: Edit | F2: Save all "
+    };
+    let status_bar = Paragraph::new(status)
+        .style(Style::default().fg(Color::Cyan).bg(Color::Black))
+        .alignment(Alignment::Center);
+    f.render_widget(status_bar, chunks[1]);
+}
+
+pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            " Live Logs — F6 ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    let entries = state.entries();
+    let mut lines: Vec<Line> = Vec::new();
+
+    for entry in &entries {
+        let level_color = match entry.level.as_str() {
+            "ERROR" => Color::Red,
+            "WARN" => Color::Yellow,
+            "INFO" => Color::Green,
+            "DEBUG" => Color::Blue,
+            "TRACE" => Color::DarkGray,
+            _ => Color::White,
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", entry.timestamp),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:<5} ", entry.level),
+                Style::default()
+                    .fg(level_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", entry.target),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(entry.message.clone(), Style::default().fg(Color::White)),
+        ]));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            " No logs yet. Logs will appear here in real-time.",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    // Auto-scroll to bottom
+    let total_lines = lines.len() as u16;
+    let visible_height = chunks[0].height.saturating_sub(2);
+    let scroll = if state.auto_scroll && total_lines > visible_height {
+        total_lines - visible_height
+    } else {
+        0
+    };
+
+    let p = Paragraph::new(lines)
+        .block(block)
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, chunks[0]);
+
+    let status = if state.auto_scroll {
+        " Auto-scroll: ON | 'a' to toggle | 'c' to clear | Esc: Back "
+    } else {
+        " Auto-scroll: OFF | 'a' to toggle | 'c' to clear | Esc: Back "
     };
     let status_bar = Paragraph::new(status)
         .style(Style::default().fg(Color::Cyan).bg(Color::Black))
@@ -924,6 +1005,8 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             } else if is_stop {
                 if state.phase == ServerPhase::Running {
                     (Color::Red, "■ Stop Server".to_string())
+                } else if state.phase == ServerPhase::LoadingModel {
+                    (Color::Yellow, "■ Cancel Loading".to_string())
                 } else {
                     (Color::DarkGray, "■ Server not running".to_string())
                 }
@@ -1138,7 +1221,7 @@ fn render_server_status_bar(f: &mut Frame, area: Rect, state: &ServerPanelState)
             state.server_url.as_deref().unwrap_or("?")
         )
     } else {
-        " Up/Down: Navigate | Enter: Edit/Toggle/Action | Left/Right: Cycle Model | F5: Server "
+        " Up/Down: Navigate | Enter: Edit/Toggle/Action | Left/Right: Cycle Model | F4: Server | F6: Logs "
             .to_string()
     };
 
