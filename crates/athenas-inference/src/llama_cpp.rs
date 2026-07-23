@@ -237,7 +237,7 @@ impl LlamaCppBackend {
 
         // Wait for server to be ready
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        for _attempt in 0..20 {
+        for _attempt in 0..60 {
             // Check if process exited early
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
@@ -325,7 +325,7 @@ impl LlamaCppBackend {
         self.server_handle = None;
 
         Err(AthenasError::Backend(
-            "llama-server failed to start within 10 seconds".to_string(),
+            "llama-server failed to start within 30 seconds".to_string(),
         ))
     }
 

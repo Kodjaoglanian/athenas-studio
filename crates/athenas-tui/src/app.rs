@@ -1395,13 +1395,6 @@ impl TuiApp {
         if let Some(mgr) = &self.shared_model_manager {
             let mut m = mgr.lock().await;
 
-            // Don't allow unloading if it's the only model
-            if m.count() <= 1 {
-                self.server_panel_state.status_message =
-                    Some("Cannot unload the only model. Load another first.".to_string());
-                return;
-            }
-
             match m.remove(&model_id).await {
                 Ok(()) => {
                     self.server_panel_state.loaded_models = m
