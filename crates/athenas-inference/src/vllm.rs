@@ -7,8 +7,9 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
-    MessageContent, ModelLoadConfig, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, EmbeddingData,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, InferenceStats, MessageContent,
+    ModelLoadConfig, StreamChunk,
 };
 
 /// vLLM backend — manages a vLLM Python subprocess for high-throughput inference
@@ -249,6 +250,8 @@ impl Backend for VllmBackend {
                 time_total_ms: 0,
                 tokens_per_second: 0.0,
             },
+            tool_calls: None,
+            finish_reason: None,
         })
     }
 
@@ -564,6 +567,89 @@ impl Backend for VllmBackend {
         }
 
         Ok(())
+    }
+
+    async fn embeddings(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        if !self.loaded {
+            return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        let inputs = request.input.as_vec();
+        let body = serde_json::json!({
+            "model": self.model_name,
+            "input": inputs,
+        });
+
+        let url = format!("http://127.0.0.1:{}/v1/embeddings", self.server_port);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("Embeddings request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(AthenasError::Backend(format!(
+                "vLLM embeddings returned {}: {}",
+                status, text
+            )));
+        }
+
+        let result: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("Invalid embeddings response: {}", e)))?;
+
+        let data_arr = result
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| {
+                AthenasError::Backend("Missing 'data' in embeddings response".to_string())
+            })?;
+
+        let data: Vec<EmbeddingData> = data_arr
+            .iter()
+            .map(|d| {
+                let embedding = d
+                    .get("embedding")
+                    .and_then(|e| e.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let index = d.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                EmbeddingData {
+                    object: "embedding".to_string(),
+                    embedding,
+                    index,
+                }
+            })
+            .collect();
+
+        let usage = result.get("usage");
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let total_tokens = usage
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(prompt_tokens as u64) as u32;
+
+        Ok(EmbeddingResponse {
+            object: "list".to_string(),
+            data,
+            model: self.model_name.clone(),
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens,
+            },
+        })
     }
 
     fn model_info(&self) -> Option<ModelInfo> {

@@ -1,6 +1,6 @@
 use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Result};
 use athenas_inference::{BackendFactory, ModelLoadConfig};
-use athenas_server::ApiServer;
+use athenas_server::{ApiKeyManager, ApiServer, AuditLogger, ModelRouter};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -55,9 +55,17 @@ pub async fn run(
     backend.load_model(load_config).await?;
     println!("Model loaded with backend: {}", backend.name());
 
+    let data_dir = std::path::PathBuf::from(&config.paths.data_dir);
+    let api_key_mgr = ApiKeyManager::new(data_dir.clone());
+    let model_router = ModelRouter::new();
+    let audit_logger = AuditLogger::new(data_dir, 10000);
+
     print_startup_banner(&config, host, port, &hardware, &model);
 
-    let server = ApiServer::new(config, backend);
+    let server = ApiServer::new(config, backend)
+        .with_api_key_manager(api_key_mgr)
+        .with_model_router(model_router)
+        .with_audit_logger(audit_logger);
     server.start(host, port).await
 }
 
@@ -134,10 +142,15 @@ fn print_startup_banner(
     println!("  │  Endpoints:                                             │");
     println!("  │    POST /v1/chat/completions   (OpenAI-compatible)      │");
     println!("  │    POST /v1/completions        (OpenAI-compatible)      │");
+    println!("  │    POST /v1/embeddings         (OpenAI-compatible)      │");
     println!("  │    GET  /v1/models             (List loaded models)     │");
     println!("  │    GET  /v1/health             (Health + system info)   │");
     println!("  │    GET  /v1/ready              (Kubernetes readiness)   │");
     println!("  │    GET  /metrics               (Prometheus metrics)     │");
+    println!("  │    POST /v1/keys               (Create API key)         │");
+    println!("  │    GET  /v1/keys               (List API keys)          │");
+    println!("  │    GET  /v1/audit/logs         (Query audit logs)       │");
+    println!("  │    GET  /v1/audit/stats        (Audit statistics)       │");
     println!("  └─────────────────────────────────────────────────────────┘");
     println!();
     println!("  Press Ctrl+C to stop.");

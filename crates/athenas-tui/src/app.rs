@@ -842,6 +842,8 @@ impl TuiApp {
             stream: self.config.inference.streaming_enabled,
             stop: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         };
 
         // Get a backend reference: prefer local backend, fall back to server's model manager

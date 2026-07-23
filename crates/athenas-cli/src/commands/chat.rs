@@ -90,6 +90,8 @@ pub async fn run(
             stream: true,
             stop: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         };
 
         let (tx, mut rx) = mpsc::channel::<StreamChunk>(100);

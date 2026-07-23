@@ -133,6 +133,12 @@ pub struct ChatRequest {
     pub stream: bool,
     pub stop: Option<Vec<String>>,
     pub seed: Option<u64>,
+    /// Optional tools/functions for function calling (OpenAI format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<serde_json::Value>,
+    /// Tool choice: "auto", "none", "required", or specific tool
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 impl Default for ChatRequest {
@@ -146,6 +152,8 @@ impl Default for ChatRequest {
             stream: false,
             stop: None,
             seed: None,
+            tools: None,
+            tool_choice: None,
         }
     }
 }
@@ -155,6 +163,12 @@ pub struct ChatResponse {
     pub model: String,
     pub message: ChatMessage,
     pub stats: InferenceStats,
+    /// Tool calls from the model (if function calling was used)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Finish reason: "stop", "tool_calls", "length", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,4 +254,113 @@ pub struct InferenceConfig {
     pub max_tokens: u32,
     pub repeat_penalty: f32,
     pub seed: Option<u64>,
+}
+
+// ─── Embeddings ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingRequest {
+    pub model: String,
+    /// Single string or array of strings
+    pub input: EmbeddingInput,
+    #[serde(default = "default_encoding_format")]
+    pub encoding_format: String,
+}
+
+fn default_encoding_format() -> String {
+    "float".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+impl EmbeddingInput {
+    pub fn as_vec(&self) -> Vec<&str> {
+        match self {
+            EmbeddingInput::Single(s) => vec![s.as_str()],
+            EmbeddingInput::Batch(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingResponse {
+    pub object: String,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingData {
+    pub object: String,
+    pub embedding: Vec<f32>,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+// ─── Function Calling / Tool Use ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Specific(ToolChoiceSpecific),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChoiceSpecific {
+    #[serde(rename = "type")]
+    pub choice_type: String,
+    pub function: ToolChoiceFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolChoiceFunction {
+    pub name: String,
+}
+
+impl Default for ToolChoice {
+    fn default() -> Self {
+        ToolChoice::Auto
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub arguments: String,
 }

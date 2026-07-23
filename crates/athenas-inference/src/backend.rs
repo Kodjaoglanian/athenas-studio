@@ -4,7 +4,8 @@ use tokio::sync::mpsc;
 use athenas_core::Result;
 
 use crate::types::{
-    ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, ModelLoadConfig, StreamChunk,
+    ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, EmbeddingRequest,
+    EmbeddingResponse, ModelLoadConfig, StreamChunk,
 };
 
 #[async_trait]
@@ -24,6 +25,14 @@ pub trait Backend: Send + Sync {
         request: CompletionRequest,
         tx: mpsc::Sender<StreamChunk>,
     ) -> Result<()>;
+
+    /// Generate embeddings for the given input text(s).
+    /// Default implementation returns an error — backends override if supported.
+    async fn embeddings(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        Err(athenas_core::AthenasError::Backend(
+            "Embeddings not supported by this backend".to_string(),
+        ))
+    }
 
     fn model_info(&self) -> Option<ModelInfo>;
 

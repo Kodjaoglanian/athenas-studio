@@ -6,8 +6,9 @@ use athenas_core::{AthenasError, HardwareInfo, Result};
 
 use crate::backend::{Backend, ModelInfo};
 use crate::types::{
-    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, InferenceStats,
-    MessageContent, ModelLoadConfig, Role, StreamChunk,
+    ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, EmbeddingData,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, InferenceStats, MessageContent,
+    ModelLoadConfig, Role, StreamChunk,
 };
 
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
@@ -473,7 +474,7 @@ impl Backend for LlamaCppBackend {
             })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_name,
             "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
@@ -483,6 +484,13 @@ impl Backend for LlamaCppBackend {
             "stop": request.stop.as_deref().unwrap_or(&[]),
             "chat_template_kwargs": {"enable_thinking": self.reasoning_enabled},
         });
+
+        if let Some(ref tools) = request.tools {
+            body["tools"] = tools.clone();
+        }
+        if let Some(ref tc) = request.tool_choice {
+            body["tool_choice"] = tc.clone();
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
@@ -552,10 +560,60 @@ impl Backend for LlamaCppBackend {
             tokens_per_second: tps,
         };
 
+        // Parse tool_calls from response (function calling)
+        let tool_calls = result
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|tc| {
+                        let id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("call_0")
+                            .to_string();
+                        let call_type = tc
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("function")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        crate::types::ToolCall {
+                            id,
+                            call_type,
+                            function: crate::types::ToolCallFunction { name, arguments },
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+        let finish_reason = result
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         Ok(ChatResponse {
             model: self.model_name.clone(),
             message: ChatMessage::assistant(content),
             stats,
+            tool_calls,
+            finish_reason,
         })
     }
 
@@ -584,7 +642,7 @@ impl Backend for LlamaCppBackend {
             })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_name,
             "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
@@ -596,6 +654,13 @@ impl Backend for LlamaCppBackend {
             "stop": request.stop.as_deref().unwrap_or(&[]),
             "chat_template_kwargs": {"enable_thinking": self.reasoning_enabled},
         });
+
+        if let Some(ref tools) = request.tools {
+            body["tools"] = tools.clone();
+        }
+        if let Some(ref tc) = request.tool_choice {
+            body["tool_choice"] = tc.clone();
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
@@ -923,6 +988,89 @@ impl Backend for LlamaCppBackend {
             ..Default::default()
         };
         self.chat_stream(chat_req, tx).await
+    }
+
+    async fn embeddings(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        if !self.loaded {
+            return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        let inputs = request.input.as_vec();
+        let body = serde_json::json!({
+            "model": self.model_name,
+            "input": inputs,
+        });
+
+        let url = format!("{}/v1/embeddings", self.server_url());
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("Embeddings request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(AthenasError::Backend(format!(
+                "llama-server embeddings returned {}: {}",
+                status, text
+            )));
+        }
+
+        let result: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("Invalid embeddings response: {}", e)))?;
+
+        let data_arr = result
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| {
+                AthenasError::Backend("Missing 'data' in embeddings response".to_string())
+            })?;
+
+        let data: Vec<EmbeddingData> = data_arr
+            .iter()
+            .map(|d| {
+                let embedding = d
+                    .get("embedding")
+                    .and_then(|e| e.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_f64().map(|f| f as f32))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let index = d.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                EmbeddingData {
+                    object: "embedding".to_string(),
+                    embedding,
+                    index,
+                }
+            })
+            .collect();
+
+        let usage = result.get("usage");
+        let prompt_tokens = usage
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let total_tokens = usage
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(prompt_tokens as u64) as u32;
+
+        Ok(EmbeddingResponse {
+            object: "list".to_string(),
+            data,
+            model: self.model_name.clone(),
+            usage: EmbeddingUsage {
+                prompt_tokens,
+                total_tokens,
+            },
+        })
     }
 
     fn model_info(&self) -> Option<ModelInfo> {

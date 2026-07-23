@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     middleware::from_fn_with_state,
     response::sse::{Event, KeepAlive},
@@ -19,13 +19,16 @@ use tower_http::{
 
 use athenas_core::ServerConfig;
 use athenas_inference::{
-    BackendFactory, ChatMessage, ChatRequest, CompletionRequest, ContentPart, MessageContent,
-    ModelLoadConfig, Role, StreamChunk,
+    Backend, BackendFactory, ChatMessage, ChatRequest, CompletionRequest, ContentPart,
+    EmbeddingRequest, MessageContent, ModelLoadConfig, Role, StreamChunk,
 };
 
+use crate::api_keys::{AuthResult, SharedApiKeyManager};
+use crate::audit_log::{AuditEntry, SharedAuditLogger};
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
 use crate::model_manager::SharedModelManager;
+use crate::model_router::SharedModelRouter;
 use crate::session_manager::{SessionInfo, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 
@@ -35,6 +38,9 @@ struct AppState {
     session_manager: SharedSessionManager,
     slot_manager: Option<Arc<SlotManager>>,
     api_key: Option<String>,
+    api_key_manager: Option<SharedApiKeyManager>,
+    model_router: Option<SharedModelRouter>,
+    audit_logger: Option<SharedAuditLogger>,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     start_time: std::time::Instant,
@@ -47,6 +53,9 @@ pub fn create_router(
     rate_limiter: SharedRateLimiter,
     session_manager: SharedSessionManager,
     slot_manager: Option<Arc<SlotManager>>,
+    api_key_manager: Option<SharedApiKeyManager>,
+    model_router: Option<SharedModelRouter>,
+    audit_logger: Option<SharedAuditLogger>,
     config: &ServerConfig,
 ) -> Router {
     let state = AppState {
@@ -54,6 +63,9 @@ pub fn create_router(
         session_manager,
         slot_manager,
         api_key: config.api_key.clone(),
+        api_key_manager,
+        model_router,
+        audit_logger,
         metrics: metrics.clone(),
         semaphore,
         start_time: std::time::Instant::now(),
@@ -62,6 +74,7 @@ pub fn create_router(
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(list_models))
         .route("/v1/models/load", post(load_model_endpoint))
         .route("/v1/models/unload", post(unload_model_endpoint))
@@ -77,6 +90,18 @@ pub fn create_router(
         .route("/v1/slots/:id/restore", post(restore_slot))
         .route("/v1/slots/:id/erase", post(erase_slot))
         .route("/v1/files", post(upload_file))
+        // API Key management endpoints
+        .route("/v1/keys", post(create_api_key).get(list_api_keys))
+        .route("/v1/keys/:id", get(get_api_key).delete(delete_api_key))
+        .route("/v1/keys/:id/revoke", post(revoke_api_key))
+        .route("/v1/keys/:id/usage", get(get_api_key_usage))
+        // Model routing endpoints
+        .route("/v1/routing/aliases", post(create_alias).get(list_aliases))
+        .route("/v1/routing/chains", post(create_chain).get(list_chains))
+        .route("/v1/routing/health", get(routing_health))
+        // Audit log endpoints
+        .route("/v1/audit/logs", get(query_audit_logs))
+        .route("/v1/audit/stats", get(audit_stats))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/health", get(health))
@@ -121,6 +146,75 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
         }
     }
     false
+}
+
+/// Extract the bearer token from the Authorization header.
+fn extract_bearer(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get("authorization") {
+        if let Ok(auth_str) = auth.to_str() {
+            if auth_str.starts_with("Bearer ") {
+                return Some(auth_str[7..].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Full authentication check: validates against static api_key OR the multi-tenant ApiKeyManager.
+/// Returns an AuthResult indicating the outcome.
+async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&str>) -> AuthResult {
+    // If no static key and no key manager, allow all
+    if state.api_key.is_none() && state.api_key_manager.is_none() {
+        return AuthResult::NoAuthRequired;
+    }
+
+    let token = match extract_bearer(headers) {
+        Some(t) => t,
+        None => return AuthResult::Unauthorized,
+    };
+
+    // Check static key first
+    if let Some(ref expected) = state.api_key {
+        if token == *expected {
+            return AuthResult::Allowed {
+                key_id: "static".to_string(),
+                key_name: "server-key".to_string(),
+            };
+        }
+    }
+
+    // Check API key manager
+    if let Some(ref mgr_arc) = state.api_key_manager {
+        let mut mgr = mgr_arc.lock().await;
+        let key = match mgr.validate(&token) {
+            Some(k) => k.clone(),
+            None => return AuthResult::Unauthorized,
+        };
+
+        // Check model access
+        if let Some(model) = model {
+            if !mgr.check_model_access(&key, model) {
+                return AuthResult::Forbidden;
+            }
+        }
+
+        // Check rate limit
+        if !mgr.check_rate_limit(&key) {
+            return AuthResult::RateLimited;
+        }
+
+        // Check token quota
+        if !mgr.check_token_quota(&key) {
+            return AuthResult::QuotaExceeded;
+        }
+
+        return AuthResult::Allowed {
+            key_id: key.key_id.clone(),
+            key_name: key.name.clone(),
+        };
+    }
+
+    AuthResult::Unauthorized
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -223,6 +317,10 @@ struct ChatCompletionRequest {
     /// If true and session_id is provided, save the assistant response to the session.
     #[serde(default = "default_true")]
     save_response: bool,
+    /// Tools/functions for function calling (OpenAI format)
+    tools: Option<serde_json::Value>,
+    /// Tool choice: "auto", "none", "required", or specific tool object
+    tool_choice: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -260,8 +358,33 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let model_for_auth = req.model.as_deref();
+    match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded for this API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "This API key is not allowed to use the requested model"}))).into_response();
+        }
     }
 
     let _permit = match state.semaphore.acquire().await {
@@ -322,20 +445,52 @@ async fn chat_completions(
         stream: req.stream.unwrap_or(false),
         stop,
         seed: req.seed,
+        tools: req.tools.clone(),
+        tool_choice: req.tool_choice.clone(),
     };
 
     let model_id = chat_req.model.clone();
 
+    // Determine the model sequence (primary + fallbacks) using the router
+    let model_sequence = if let Some(ref router_arc) = state.model_router {
+        let router = router_arc.lock().await;
+        router.get_model_sequence(&model_id)
+    } else {
+        vec![model_id.clone()]
+    };
+
     let mgr = state.model_manager.lock().await;
-    let backend = match mgr.get(Some(model_id.as_str())) {
+
+    // Try each model in the fallback sequence
+    let mut backend: Option<&dyn Backend> = None;
+    let mut resolved_model_id = String::new();
+    let mut tried_models = Vec::new();
+
+    for mid in &model_sequence {
+        tried_models.push(mid.clone());
+        if let Some(ref router_arc) = state.model_router {
+            let router = router_arc.lock().await;
+            if !router.is_healthy(mid) {
+                tracing::warn!("Skipping unhealthy model: {}", mid);
+                continue;
+            }
+        }
+        if let Some(b) = mgr.get(Some(mid.as_str())) {
+            backend = Some(b);
+            resolved_model_id = mid.clone();
+            break;
+        }
+    }
+
+    let backend = match backend {
         Some(b) => b,
         None => {
             let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
-                    "error": format!("Model '{}' not loaded. Available models: {:?}",
-                        model_id, available)
+                    "error": format!("No available model in chain. Tried: {:?}. Available models: {:?}",
+                        tried_models, available)
                 })),
             )
                 .into_response();
@@ -435,13 +590,26 @@ async fn chat_completions(
             .keep_alive(KeepAlive::default())
             .into_response()
     } else {
-        match backend.chat(chat_req).await {
+        match backend.chat(chat_req.clone()).await {
             Ok(resp) => {
                 state.metrics.record_tokens(
                     &resp.model,
                     resp.stats.tokens_prompt,
                     resp.stats.tokens_generated,
                 );
+
+                // Record audit entry
+                record_audit(
+                    &state,
+                    "/v1/chat/completions",
+                    "POST",
+                    200,
+                    &resp.model,
+                    resp.stats.tokens_prompt as u64,
+                    resp.stats.tokens_generated as u64,
+                    None,
+                )
+                .await;
 
                 // Save messages to session if session_id was provided
                 if let Some(ref sid) = session_id {
@@ -461,6 +629,29 @@ async fn chat_completions(
                     }
                 }
 
+                let mut message_json = serde_json::json!({
+                    "role": "assistant",
+                    "content": resp.message.content.as_text(),
+                });
+                if let Some(ref tool_calls) = resp.tool_calls {
+                    message_json["tool_calls"] =
+                        serde_json::to_value(tool_calls).unwrap_or(serde_json::Value::Null);
+                    // If there are tool calls, content is typically null
+                    if !resp.message.content.as_text().is_empty() {
+                        // keep content if present
+                    } else {
+                        message_json["content"] = serde_json::Value::Null;
+                    }
+                }
+
+                let finish_reason = resp.finish_reason.unwrap_or_else(|| {
+                    if resp.tool_calls.is_some() {
+                        "tool_calls".to_string()
+                    } else {
+                        "stop".to_string()
+                    }
+                });
+
                 let json = serde_json::json!({
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion",
@@ -468,11 +659,8 @@ async fn chat_completions(
                     "model": resp.model,
                     "choices": [{
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": resp.message.content.as_text(),
-                        },
-                        "finish_reason": "stop",
+                        "message": message_json,
+                        "finish_reason": finish_reason,
                     }],
                     "usage": {
                         "prompt_tokens": resp.stats.tokens_prompt,
@@ -483,13 +671,124 @@ async fn chat_completions(
                 Json(json).into_response()
             }
             Err(e) => {
-                tracing::error!("Chat completion error: {}", e);
+                tracing::error!(
+                    "Chat completion error with model '{}': {}",
+                    resolved_model_id,
+                    e
+                );
+
+                // Record failure in router
+                if let Some(ref router_arc) = state.model_router {
+                    let mut router = router_arc.lock().await;
+                    router.record_failure(&resolved_model_id);
+                }
+
                 state
                     .metrics
                     .errors_total
                     .with_label_values(&["/v1/chat/completions", "inference"])
                     .inc();
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+                // Try fallback models
+                let fallback_idx = model_sequence
+                    .iter()
+                    .position(|m| m == &resolved_model_id)
+                    .map(|i| i + 1)
+                    .unwrap_or(model_sequence.len());
+
+                for next_model in &model_sequence[fallback_idx..] {
+                    tracing::info!("Attempting fallback model: {}", next_model);
+                    if let Some(ref router_arc) = state.model_router {
+                        let router = router_arc.lock().await;
+                        if !router.is_healthy(next_model) {
+                            continue;
+                        }
+                    }
+                    let next_backend = mgr.get(Some(next_model.as_str()));
+                    if let Some(next_b) = next_backend {
+                        let mut fb_req = chat_req.clone();
+                        fb_req.model = next_model.clone();
+                        match next_b.chat(fb_req).await {
+                            Ok(resp) => {
+                                if let Some(ref router_arc) = state.model_router {
+                                    let mut router = router_arc.lock().await;
+                                    router.record_success(next_model);
+                                }
+                                state.metrics.record_tokens(
+                                    &resp.model,
+                                    resp.stats.tokens_prompt,
+                                    resp.stats.tokens_generated,
+                                );
+                                tracing::info!("Fallback model '{}' succeeded", next_model);
+
+                                record_audit(
+                                    &state,
+                                    "/v1/chat/completions",
+                                    "POST",
+                                    200,
+                                    &resp.model,
+                                    resp.stats.tokens_prompt as u64,
+                                    resp.stats.tokens_generated as u64,
+                                    Some(&format!("fallback from {}", resolved_model_id)),
+                                )
+                                .await;
+
+                                let mut message_json = serde_json::json!({
+                                    "role": "assistant",
+                                    "content": resp.message.content.as_text(),
+                                });
+                                if let Some(ref tool_calls) = resp.tool_calls {
+                                    message_json["tool_calls"] = serde_json::to_value(tool_calls)
+                                        .unwrap_or(serde_json::Value::Null);
+                                }
+                                let finish_reason = resp.finish_reason.unwrap_or_else(|| {
+                                    if resp.tool_calls.is_some() {
+                                        "tool_calls".to_string()
+                                    } else {
+                                        "stop".to_string()
+                                    }
+                                });
+
+                                let json = serde_json::json!({
+                                    "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                                    "object": "chat.completion",
+                                    "created": chrono::Utc::now().timestamp(),
+                                    "model": resp.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "message": message_json,
+                                        "finish_reason": finish_reason,
+                                    }],
+                                    "usage": {
+                                        "prompt_tokens": resp.stats.tokens_prompt,
+                                        "completion_tokens": resp.stats.tokens_generated,
+                                        "total_tokens": resp.stats.tokens_prompt + resp.stats.tokens_generated,
+                                    },
+                                });
+                                return Json(json).into_response();
+                            }
+                            Err(fe) => {
+                                tracing::error!(
+                                    "Fallback model '{}' also failed: {}",
+                                    next_model,
+                                    fe
+                                );
+                                if let Some(ref router_arc) = state.model_router {
+                                    let mut router = router_arc.lock().await;
+                                    router.record_failure(next_model);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("All models in chain failed. Primary error: {}", e),
+                    })),
+                )
+                    .into_response()
             }
         }
     }
@@ -512,8 +811,37 @@ async fn completions(
     headers: HeaderMap,
     Json(req): Json<CompletionRequestBody>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let model_for_auth = req.model.as_deref();
+    match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
+            )
+                .into_response();
+        }
     }
 
     let _permit = match state.semaphore.acquire().await {
@@ -1220,4 +1548,553 @@ async fn erase_slot(
         )
             .into_response(),
     }
+}
+
+// ─── Embeddings ───
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsApiRequest {
+    model: Option<String>,
+    input: serde_json::Value,
+    #[serde(default = "default_encoding_format_api")]
+    encoding_format: Option<String>,
+}
+
+fn default_encoding_format_api() -> Option<String> {
+    Some("float".to_string())
+}
+
+async fn embeddings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<EmbeddingsApiRequest>,
+) -> Response {
+    let model_for_auth = req.model.as_deref();
+    match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
+            )
+                .into_response();
+        }
+    }
+
+    let _permit = match state.semaphore.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let model_id = req.model.clone().unwrap_or_default();
+
+    let mgr = state.model_manager.lock().await;
+    let backend = match mgr.get(Some(model_id.as_str())) {
+        Some(b) => b,
+        None => {
+            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Model '{}' not loaded. Available models: {:?}",
+                        model_id, available)
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let embedding_input = match &req.input {
+        serde_json::Value::String(s) => athenas_inference::EmbeddingInput::Single(s.clone()),
+        serde_json::Value::Array(arr) => {
+            let strings: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if strings.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Input array must not be empty"})),
+                )
+                    .into_response();
+            }
+            athenas_inference::EmbeddingInput::Batch(strings)
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Input must be a string or array of strings"})),
+            )
+                .into_response();
+        }
+    };
+
+    let model_name = backend
+        .model_info()
+        .map(|i| i.name.clone())
+        .unwrap_or_default();
+
+    let emb_req = EmbeddingRequest {
+        model: model_name,
+        input: embedding_input,
+        encoding_format: req.encoding_format.unwrap_or_else(|| "float".to_string()),
+    };
+
+    match backend.embeddings(emb_req).await {
+        Ok(resp) => {
+            state
+                .metrics
+                .record_tokens(&model_id, resp.usage.prompt_tokens, 0);
+            Json(resp).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ─── Multi-tenant API Key Management ───
+
+#[derive(Debug, Deserialize)]
+struct CreateKeyRequest {
+    name: String,
+    #[serde(default = "default_rate_limit")]
+    rate_limit_per_minute: u32,
+    #[serde(default = "default_token_limit")]
+    daily_token_limit: u64,
+    #[serde(default)]
+    allowed_models: Vec<String>,
+    metadata: Option<serde_json::Value>,
+}
+
+fn default_rate_limit() -> u32 {
+    60
+}
+
+fn default_token_limit() -> u64 {
+    0 // 0 = unlimited
+}
+
+async fn create_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateKeyRequest>,
+) -> Response {
+    // Only the server's static key (admin) can create keys
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Multi-tenant API keys not enabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut mgr = mgr_arc.lock().await;
+    let key = mgr.create_key(
+        &req.name,
+        req.rate_limit_per_minute,
+        req.daily_token_limit,
+        req.allowed_models,
+        req.metadata,
+    );
+    Json(key).into_response()
+}
+
+async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Multi-tenant API keys not enabled"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mgr = mgr_arc.lock().await;
+    let keys: Vec<serde_json::Value> = mgr
+        .list_keys()
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "key_id": k.key_id,
+                "api_key": k.api_key,
+                "name": k.name,
+                "created_at": k.created_at,
+                "expires_at": k.expires_at,
+                "active": k.active,
+                "rate_limit_per_minute": k.rate_limit_per_minute,
+                "daily_token_limit": k.daily_token_limit,
+                "allowed_models": k.allowed_models,
+                "metadata": k.metadata,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"keys": keys})).into_response()
+}
+
+async fn get_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mgr = mgr_arc.lock().await;
+    match mgr.get_key(&id) {
+        Some(key) => Json(serde_json::json!({
+            "key_id": key.key_id,
+            "api_key": key.api_key,
+            "name": key.name,
+            "created_at": key.created_at,
+            "expires_at": key.expires_at,
+            "active": key.active,
+            "rate_limit_per_minute": key.rate_limit_per_minute,
+            "daily_token_limit": key.daily_token_limit,
+            "allowed_models": key.allowed_models,
+            "metadata": key.metadata,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Key not found"})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mut mgr = mgr_arc.lock().await;
+    if mgr.delete_key(&id) {
+        Json(serde_json::json!({"status": "deleted", "key_id": id})).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Key not found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn revoke_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mut mgr = mgr_arc.lock().await;
+    if mgr.revoke_key(&id) {
+        Json(serde_json::json!({"status": "revoked", "key_id": id})).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Key not found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn get_api_key_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mgr_arc = match &state.api_key_manager {
+        Some(m) => m,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mgr = mgr_arc.lock().await;
+    match mgr.get_usage(&id) {
+        Some((key, usage)) => {
+            let remaining = mgr.rate_limit_remaining(key);
+            Json(serde_json::json!({
+                "key_id": key.key_id,
+                "name": key.name,
+                "date": usage.date,
+                "requests": usage.requests,
+                "tokens_prompt": usage.tokens_prompt,
+                "tokens_generated": usage.tokens_generated,
+                "tokens_total": usage.tokens_total(),
+                "daily_token_limit": key.daily_token_limit,
+                "rate_limit_per_minute": key.rate_limit_per_minute,
+                "rate_limit_remaining": remaining,
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Key not found"})),
+        )
+            .into_response(),
+    }
+}
+
+// ─── Model Routing & Fallback Chains ───
+
+#[derive(Debug, Deserialize)]
+struct CreateAliasRequest {
+    alias: String,
+    target: String,
+}
+
+async fn create_alias(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateAliasRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let router_arc = match &state.model_router {
+        Some(r) => r,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mut router = router_arc.lock().await;
+    router.add_alias(&req.alias, &req.target);
+    Json(serde_json::json!({"status": "created", "alias": req.alias, "target": req.target}))
+        .into_response()
+}
+
+async fn list_aliases(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let router_arc = match &state.model_router {
+        Some(r) => r,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let router = router_arc.lock().await;
+    let aliases: Vec<serde_json::Value> = router
+        .list_aliases()
+        .iter()
+        .map(|(a, t)| serde_json::json!({"alias": a, "target": t}))
+        .collect();
+    Json(serde_json::json!({"aliases": aliases})).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChainRequest {
+    primary: String,
+    fallbacks: Vec<String>,
+    max_retries: Option<u32>,
+    timeout_secs: Option<u64>,
+}
+
+async fn create_chain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateChainRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let router_arc = match &state.model_router {
+        Some(r) => r,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let mut router = router_arc.lock().await;
+    let chain = crate::model_router::FallbackChain {
+        primary: req.primary.clone(),
+        fallbacks: req.fallbacks.clone(),
+        max_retries: req.max_retries.unwrap_or(1),
+        timeout_secs: req.timeout_secs.unwrap_or(0),
+    };
+    router.add_chain(chain);
+    Json(serde_json::json!({
+        "status": "created",
+        "primary": req.primary,
+        "fallbacks": req.fallbacks,
+    }))
+    .into_response()
+}
+
+async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let router_arc = match &state.model_router {
+        Some(r) => r,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let router = router_arc.lock().await;
+    let chains = router.list_chains();
+    Json(serde_json::json!({"chains": chains})).into_response()
+}
+
+async fn routing_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let router_arc = match &state.model_router {
+        Some(r) => r,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let router = router_arc.lock().await;
+    let health = router.health_status();
+    Json(serde_json::json!({"models": health})).into_response()
+}
+
+// ─── Audit Logging ───
+
+/// Helper to record an audit entry if the audit logger is enabled.
+async fn record_audit(
+    state: &AppState,
+    endpoint: &str,
+    method: &str,
+    status: u16,
+    model: &str,
+    tokens_prompt: u64,
+    tokens_generated: u64,
+    error: Option<&str>,
+) {
+    if let Some(ref logger_arc) = state.audit_logger {
+        let entry = AuditEntry {
+            id: format!("audit_{}", &uuid::Uuid::new_v4().to_string()[..12]),
+            timestamp: chrono::Utc::now(),
+            endpoint: endpoint.to_string(),
+            method: method.to_string(),
+            status,
+            key_id: None,
+            key_name: None,
+            model: if model.is_empty() {
+                None
+            } else {
+                Some(model.to_string())
+            },
+            tokens_prompt,
+            tokens_generated,
+            latency_ms: 0,
+            client_ip: None,
+            user_agent: None,
+            error: error.map(|e| e.to_string()),
+            request_id: None,
+        };
+        let mut logger = logger_arc.lock().await;
+        logger.record(entry);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQueryParams {
+    limit: Option<usize>,
+    key_id: Option<String>,
+    endpoint: Option<String>,
+    min_status: Option<u16>,
+}
+
+async fn query_audit_logs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let logger_arc = match &state.audit_logger {
+        Some(l) => l,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let logger = logger_arc.lock().await;
+    let entries = logger.query(
+        params.limit.unwrap_or(100),
+        params.key_id.as_deref(),
+        params.endpoint.as_deref(),
+        params.min_status,
+    );
+    Json(serde_json::json!({"logs": entries, "count": entries.len()})).into_response()
+}
+
+async fn audit_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let logger_arc = match &state.audit_logger {
+        Some(l) => l,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let logger = logger_arc.lock().await;
+    let stats = logger.stats();
+    Json(stats).into_response()
 }

@@ -43,6 +43,8 @@ pub async fn run(
         stream: false,
         stop: None,
         seed: None,
+        tools: None,
+        tool_choice: None,
     };
 
     let response = backend.chat(req).await?;

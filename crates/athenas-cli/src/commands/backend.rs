@@ -172,6 +172,8 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             stream: false,
             stop: None,
             seed: Some(42),
+            tools: None,
+            tool_choice: None,
         };
 
         let start = Instant::now();

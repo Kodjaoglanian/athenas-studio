@@ -7,9 +7,12 @@ use tracing::info;
 use athenas_core::{AppConfig, Result};
 use athenas_inference::Backend;
 
+use crate::api_keys::{ApiKeyManager, SharedApiKeyManager};
+use crate::audit_log::{AuditLogger, SharedAuditLogger};
 use crate::metrics::{Metrics, SharedMetrics};
 use crate::middleware::{RateLimiter, SharedRateLimiter};
 use crate::model_manager::{ModelManager, SharedModelManager};
+use crate::model_router::{ModelRouter, SharedModelRouter};
 use crate::session_manager::{SessionManager, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 
@@ -21,6 +24,9 @@ pub struct ApiServer {
     rate_limiter: SharedRateLimiter,
     session_manager: SharedSessionManager,
     slot_manager: Option<Arc<SlotManager>>,
+    api_key_manager: Option<SharedApiKeyManager>,
+    model_router: Option<SharedModelRouter>,
+    audit_logger: Option<SharedAuditLogger>,
 }
 
 impl ApiServer {
@@ -45,6 +51,9 @@ impl ApiServer {
             rate_limiter,
             session_manager,
             slot_manager: None,
+            api_key_manager: None,
+            model_router: None,
+            audit_logger: None,
         }
     }
 
@@ -69,12 +78,33 @@ impl ApiServer {
             rate_limiter,
             session_manager,
             slot_manager: None,
+            api_key_manager: None,
+            model_router: None,
+            audit_logger: None,
         }
     }
 
     /// Attach a slot manager (for KV cache persistence with llama-server).
     pub fn with_slot_manager(mut self, slot_mgr: SlotManager) -> Self {
         self.slot_manager = Some(Arc::new(slot_mgr));
+        self
+    }
+
+    /// Enable multi-tenant API key management.
+    pub fn with_api_key_manager(mut self, mgr: ApiKeyManager) -> Self {
+        self.api_key_manager = Some(Arc::new(Mutex::new(mgr)));
+        self
+    }
+
+    /// Enable model routing with fallback chains.
+    pub fn with_model_router(mut self, router: ModelRouter) -> Self {
+        self.model_router = Some(Arc::new(Mutex::new(router)));
+        self
+    }
+
+    /// Enable audit logging.
+    pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
+        self.audit_logger = Some(Arc::new(Mutex::new(logger)));
         self
     }
 
@@ -101,6 +131,9 @@ impl ApiServer {
             self.rate_limiter.clone(),
             self.session_manager.clone(),
             self.slot_manager.clone(),
+            self.api_key_manager.clone(),
+            self.model_router.clone(),
+            self.audit_logger.clone(),
             &self.config.server,
         );
 
