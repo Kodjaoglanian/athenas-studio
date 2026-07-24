@@ -85,6 +85,7 @@ pub fn create_router(
         .route("/v1/models", get(list_models))
         .route("/v1/models/load", post(load_model_endpoint))
         .route("/v1/models/unload", post(unload_model_endpoint))
+        .route("/v1/models/default", post(set_default_model_endpoint))
         // Session management endpoints
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route("/v1/sessions/:id", get(get_session).delete(delete_session))
@@ -301,6 +302,7 @@ async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
     let mgr = state.model_manager.lock().await;
     let models = mgr.list();
+    let default_id = mgr.default_id().map(|s| s.to_string());
     let data: Vec<_> = models
         .iter()
         .map(|m| {
@@ -310,8 +312,10 @@ async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 "created": chrono::Utc::now().timestamp(),
                 "owned_by": "athenas-studio",
                 "backend": m.backend_name,
+                "model_name": m.model_info.name,
                 "context_size": m.model_info.context_size,
                 "gpu_layers": m.model_info.gpu_layers,
+                "is_default": default_id.as_deref() == Some(&m.id),
             })
         })
         .collect();
@@ -1323,6 +1327,37 @@ async fn unload_model_endpoint(
                 "model_id": req.model_id,
                 "models_loaded": count,
                 "default_model": default,
+            }))
+            .into_response()
+        }
+        Err(e) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SetDefaultModelRequest {
+    model_id: String,
+}
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/models/default"))]
+async fn set_default_model_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<SetDefaultModelRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut mgr = state.model_manager.lock().await;
+
+    match mgr.set_default(&req.model_id) {
+        Ok(()) => {
+            let count = mgr.count();
+            Json(serde_json::json!({
+                "status": "ok",
+                "default_model": req.model_id,
+                "models_loaded": count,
             }))
             .into_response()
         }

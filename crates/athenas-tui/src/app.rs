@@ -20,8 +20,10 @@ use crate::server_manager;
 use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
-type AdditionalModelLoadResult =
-    std::result::Result<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>;
+enum AdditionalModelLoadResult {
+    InProcess(std::result::Result<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>),
+    Detached(std::result::Result<String, String>),
+}
 
 type AdditionalModelLoadTask = Option<tokio::task::JoinHandle<AdditionalModelLoadResult>>;
 
@@ -786,19 +788,22 @@ impl TuiApp {
             if let Some(mgr) = &self.shared_model_manager {
                 let m = mgr.lock().await;
                 if m.has_models() {
-                    let default_name = m
-                        .default_id()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    self.chat_state.add_message(
-                        "system",
-                        &format!(
-                            "Using server model '{}' for inference. \
-                             The server is running with {} model(s) loaded.",
-                            default_name,
-                            m.count()
-                        ),
-                    );
+                    // Only show the message once when current_model is not set
+                    if self.chat_state.current_model.is_none() {
+                        let default_name = m
+                            .default_id()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        self.chat_state.add_message(
+                            "system",
+                            &format!(
+                                "Using server model '{}' for inference. \
+                                 The server is running with {} model(s) loaded.",
+                                default_name,
+                                m.count()
+                            ),
+                        );
+                    }
                 } else {
                     self.chat_state.add_message(
                         "system",
@@ -808,13 +813,18 @@ impl TuiApp {
                 }
             } else if let Some(ref state) = self.server_state {
                 // Detached server is running — use HTTP API
-                self.chat_state.add_message(
-                    "system",
-                    &format!(
-                        "Using remote server model '{}' ({}:{})",
-                        state.model, state.host, state.port
-                    ),
-                );
+                // Only show the message once when current_model is not set
+                if self.chat_state.current_model.is_none() {
+                    self.chat_state.add_message(
+                        "system",
+                        &format!(
+                            "Using remote server model '{}' ({}:{})",
+                            state.model, state.host, state.port
+                        ),
+                    );
+                    self.chat_state.current_model = Some(state.model.clone());
+                    self.chat_state.current_backend = Some("remote".to_string());
+                }
             } else {
                 self.chat_state
                     .add_message("system", "No model loaded. Press F2 to select a model.");
@@ -1439,6 +1449,8 @@ impl TuiApp {
                     Some(format!("Server running (PID: {})", state.pid));
                 self.chat_state.current_model = Some(state.model);
                 self.chat_state.current_backend = Some(state.backend);
+                // Fetch loaded models list from the detached server
+                self.refresh_remote_loaded_models().await;
             }
             Ok(None) => {
                 // No running server found
@@ -1605,6 +1617,71 @@ impl TuiApp {
             Some(format!("Loading additional model: {}...", model_name));
         self.additional_model_name_hint = Some(model_name.clone());
 
+        // If detached server, use HTTP API to load model
+        if let Some(ref state) = self.server_state {
+            let host = state.host.clone();
+            let port = state.port;
+            let api_key = if self.server_panel_state.api_key.is_empty() {
+                None
+            } else {
+                Some(self.server_panel_state.api_key.clone())
+            };
+            let gpu_layers = self.server_panel_state.gpu_layers;
+            let context_size = self.server_panel_state.context_size;
+
+            let task = tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let url = format!("http://{}:{}/v1/models/load", host, port);
+
+                let body = serde_json::json!({
+                    "model_path": model_path,
+                    "gpu_layers": gpu_layers,
+                    "context_size": context_size,
+                    "set_default": false,
+                });
+
+                let mut req = client.post(&url).json(&body);
+                if let Some(ref key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
+
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(format!("Server returned {}: {}", status, text));
+                }
+
+                // Parse response to get model_id
+                let resp_json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+                let model_id = resp_json
+                    .get("model_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                Ok::<String, String>(model_id)
+            });
+
+            let task = tokio::spawn(async move {
+                AdditionalModelLoadResult::Detached(
+                    task.await.unwrap_or(Err("Task panicked".to_string())),
+                )
+            });
+
+            self.additional_model_load_task = Some(task);
+            return;
+        }
+
+        // In-process server: use shared_model_manager
         let backend_type = self.server_panel_state.backend;
         let hardware = self.server_panel_state.hardware.clone();
         let load_config = self.server_panel_state.build_load_config(&model_path);
@@ -1632,6 +1709,14 @@ impl TuiApp {
             Ok::<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>(backend)
         });
 
+        let task = tokio::spawn(async move {
+            AdditionalModelLoadResult::InProcess(task.await.unwrap_or(Err((
+                athenas_core::AthenasError::Backend("Task panicked".to_string()),
+                "unknown".to_string(),
+                "unknown".to_string(),
+            ))))
+        });
+
         self.additional_model_load_task = Some(task);
     }
 
@@ -1649,7 +1734,7 @@ impl TuiApp {
         let hint = self.additional_model_name_hint.take();
 
         match task.await {
-            Ok(Ok(backend)) => {
+            Ok(AdditionalModelLoadResult::InProcess(Ok(backend))) => {
                 let model_name = backend
                     .model_info()
                     .map(|i| i.name.clone())
@@ -1684,10 +1769,25 @@ impl TuiApp {
                 }
                 self.server_panel_state.phase = ServerPhase::Running;
             }
-            Ok(Err((e, name, _))) => {
+            Ok(AdditionalModelLoadResult::InProcess(Err((e, name, _)))) => {
                 self.server_panel_state.phase = ServerPhase::Running;
                 self.server_panel_state.status_message =
                     Some(format!("Failed to load '{}': {}", name, e));
+            }
+            Ok(AdditionalModelLoadResult::Detached(Ok(model_id))) => {
+                let model_name = hint.unwrap_or_else(|| "unknown".to_string());
+                self.server_panel_state.status_message = Some(format!(
+                    "Loaded '{}' on remote server (id: {})",
+                    model_name, model_id
+                ));
+                // Fetch updated model list from detached server
+                self.refresh_remote_loaded_models().await;
+                self.server_panel_state.phase = ServerPhase::Running;
+            }
+            Ok(AdditionalModelLoadResult::Detached(Err(e))) => {
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message =
+                    Some(format!("Failed to load model on remote server: {}", e));
             }
             Err(e) => {
                 self.server_panel_state.phase = ServerPhase::Running;
@@ -1708,6 +1808,55 @@ impl TuiApp {
             None => return,
         };
 
+        // Detached server: use HTTP API
+        if let Some(ref state) = self.server_state {
+            let host = state.host.clone();
+            let port = state.port;
+            let api_key = if self.server_panel_state.api_key.is_empty() {
+                None
+            } else {
+                Some(self.server_panel_state.api_key.clone())
+            };
+            let mid = model_id.clone();
+
+            let result = tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let url = format!("http://{}:{}/v1/models/unload", host, port);
+                let body = serde_json::json!({ "model_id": mid });
+                let mut req = client.post(&url).json(&body);
+                if let Some(ref key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("HTTP request failed: {}", e))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(format!("Server returned {}: {}", status, text));
+                }
+                Ok::<(), String>(())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    self.refresh_remote_loaded_models().await;
+                    self.server_panel_state.status_message =
+                        Some(format!("Unloaded model: {}", model_id));
+                }
+                Ok(Err(e)) => {
+                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                }
+                Err(e) => {
+                    self.server_panel_state.status_message = Some(format!("Task crashed: {}", e));
+                }
+            }
+            return;
+        }
+
+        // In-process server: use shared_model_manager
         if let Some(mgr) = &self.shared_model_manager {
             let mut m = mgr.lock().await;
 
@@ -1761,6 +1910,55 @@ impl TuiApp {
             None => return,
         };
 
+        // Detached server: use HTTP API
+        if let Some(ref state) = self.server_state {
+            let host = state.host.clone();
+            let port = state.port;
+            let api_key = if self.server_panel_state.api_key.is_empty() {
+                None
+            } else {
+                Some(self.server_panel_state.api_key.clone())
+            };
+            let mid = model_id.clone();
+
+            let result = tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let url = format!("http://{}:{}/v1/models/default", host, port);
+                let body = serde_json::json!({ "model_id": mid });
+                let mut req = client.post(&url).json(&body);
+                if let Some(ref key) = api_key {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| format!("HTTP request failed: {}", e))?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(format!("Server returned {}: {}", status, text));
+                }
+                Ok::<(), String>(())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => {
+                    self.refresh_remote_loaded_models().await;
+                    self.server_panel_state.status_message =
+                        Some(format!("Default model set to: {}", model_id));
+                }
+                Ok(Err(e)) => {
+                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                }
+                Err(e) => {
+                    self.server_panel_state.status_message = Some(format!("Task crashed: {}", e));
+                }
+            }
+            return;
+        }
+
+        // In-process server: use shared_model_manager
         if let Some(mgr) = &self.shared_model_manager {
             let mut m = mgr.lock().await;
             match m.set_default(&model_id) {
@@ -1782,6 +1980,85 @@ impl TuiApp {
                 Err(e) => {
                     self.server_panel_state.status_message = Some(format!("Error: {}", e));
                 }
+            }
+        }
+    }
+
+    /// Fetch the list of loaded models from a detached server via GET /v1/models
+    async fn refresh_remote_loaded_models(&mut self) {
+        let Some(ref state) = self.server_state else {
+            return;
+        };
+        let host = state.host.clone();
+        let port = state.port;
+        let api_key = if self.server_panel_state.api_key.is_empty() {
+            None
+        } else {
+            Some(self.server_panel_state.api_key.clone())
+        };
+
+        let result = tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let url = format!("http://{}:{}/v1/models", host, port);
+            let mut req = client.get(&url);
+            if let Some(ref key) = api_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Server returned {}", resp.status()));
+            }
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            Ok::<serde_json::Value, String>(json)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(json)) => {
+                let mut models = Vec::new();
+                if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+                    for m in data {
+                        let id = m
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let name = m
+                            .get("model_name")
+                            .or_else(|| m.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let backend = m
+                            .get("backend")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("remote")
+                            .to_string();
+                        let is_default = m
+                            .get("is_default")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        models.push(crate::server_panel::LoadedModelInfo {
+                            id,
+                            name,
+                            backend,
+                            is_default,
+                        });
+                    }
+                }
+                self.server_panel_state.loaded_models = models;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to fetch remote models: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Remote model fetch task crashed: {}", e);
             }
         }
     }
