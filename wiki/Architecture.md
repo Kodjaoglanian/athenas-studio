@@ -8,10 +8,10 @@ Athenas Studio is built as a Rust workspace with modular crates for clean separa
 athenas-studio/
 ├── crates/
 │   ├── athenas-core/        # Config, storage, hardware detection, model registry
-│   ├── athenas-inference/   # Backend trait, llama.cpp & vLLM implementations
+│   ├── athenas-inference/   # Backend trait, llama.cpp, vLLM & RemoteBackend implementations
 │   ├── athenas-hub/         # HuggingFace API client, download manager
 │   ├── athenas-server/      # OpenAI-compatible API server (axum), multi-model manager
-│   ├── athenas-tui/         # Terminal UI (ratatui + crossterm)
+│   ├── athenas-tui/         # Terminal UI (ratatui + crossterm), server panel with enterprise configs
 │   └── athenas-cli/         # CLI entry point (clap)
 ├── .github/workflows/       # CI, release & PR build pipelines
 ├── install.sh               # Linux/macOS installer script
@@ -76,6 +76,10 @@ pub struct AppConfig {
 }
 ```
 
+`InferenceConfig` includes `lora_paths: Vec<String>` and `parallel_slots: u32`.
+
+`ServerConfig` includes `vector_store: VectorStoreConfig`, `otel: OtelConfig`, `ip_allowlist: Vec<String>`, `ip_denylist: Vec<String>`.
+
 ## athenas-inference
 
 **Purpose**: Backend abstraction and implementations for LLM inference.
@@ -101,6 +105,8 @@ pub trait Backend: Send + Sync {
 ### Implementations
 
 - `LlamaCppBackend` — Runs `llama-server` subprocess, communicates via HTTP
+- `VllmBackend` — vLLM backend for high-throughput serving
+- `RemoteBackend` — Proxies chat/completion/embeddings to a running Athenas server via HTTP API (used by TUI chat when server is detached)
 - `BackendFactory` — Creates backends based on `BackendType` and hardware
 
 ### Key Types
@@ -198,7 +204,8 @@ Client Request
 
 - `TuiApp` — Main application state and event loop
 - `ChatState` — Chat panel state (messages, streaming, model info)
-- `ServerPanel` — Server configuration and multi-model management
+- `ServerPanelState` — Server configuration with enterprise configs (Vector Store, OpenTelemetry, IP Filter, LoRA, Parallel Slots)
+- `ServerManager` — Detached server process management (start, stop by process group, health check)
 - `ModelBrowser` — HuggingFace model search and download
 - `Settings` — Configuration editor
 - `LogBuffer` / `LogBufferLayer` — In-app log viewing (tracing layer)

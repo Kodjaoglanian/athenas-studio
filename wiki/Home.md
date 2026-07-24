@@ -19,6 +19,12 @@ Athenas Studio is an enterprise-grade local LLM inference platform that provides
 | **Audit Logging** | ✅ JSONL audit trail + TUI logs page | ❌ None |
 | **Reasoning/Thinking Mode** | ✅ Configurable budget (Qwen3.5, DeepSeek R1) | ✅ Limited |
 | **Multimodal** | ✅ Auto mmproj detection | ✅ Yes |
+| **LoRA Adapters** | ✅ Multiple adapters, TUI configurable | ❌ None |
+| **Parallel Inference Slots** | ✅ Configurable batched decoding | ❌ None |
+| **Vector Store (RAG)** | ✅ Integrated, TUI configurable | ❌ None |
+| **OpenTelemetry Tracing** | ✅ OTLP export with sampling | ❌ None |
+| **IP Filtering** | ✅ Allowlist/denylist (CIDR) | ❌ None |
+| **RemoteBackend (TUI)** | ✅ Chat connects to detached server via HTTP | ❌ N/A |
 | **Self-Update** | ✅ `athenas update` | ❌ Manual |
 
 ## Wiki Pages

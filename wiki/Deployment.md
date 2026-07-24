@@ -262,5 +262,60 @@ See [Audit Logging](Audit-Logging) for SIEM integration details.
 - [ ] Set `request_timeout_secs` to prevent stuck requests
 - [ ] Enable [audit logging](Audit-Logging)
 - [ ] Restrict `/metrics` endpoint to internal networks
+- [ ] Configure `ip_allowlist` / `ip_denylist` for IP-based access control
+- [ ] Enable [OpenTelemetry tracing](Configuration#opentelemetry-tracing) for observability
 - [ ] Regularly rotate API keys
 - [ ] Monitor token usage for anomalous patterns
+
+## Enterprise Features
+
+### LoRA Adapters
+
+Load multiple LoRA adapters for customized model behavior:
+
+```toml
+[inference]
+lora_paths = ["/path/to/adapter1.gguf", "/path/to/adapter2.gguf"]
+```
+
+### Parallel Inference Slots
+
+For multi-user workloads, increase parallel decoding slots:
+
+```toml
+[inference]
+parallel_slots = 4  # Higher throughput, more GPU/CPU memory
+```
+
+### Vector Store (RAG)
+
+Enable the integrated vector store for retrieval-augmented generation:
+
+```toml
+[server.vector_store]
+enabled = true
+max_documents = 10000
+default_top_k = 5
+```
+
+### OpenTelemetry Tracing
+
+Enable distributed tracing for production observability:
+
+```toml
+[server.otel]
+enabled = true
+endpoint = "http://otel-collector:4317"
+service_name = "athenas-production"
+sample_ratio = 0.1  # Sample 10% of requests
+```
+
+### IP Filtering
+
+Restrict access by IP address or CIDR range:
+
+```toml
+[server]
+ip_allowlist = ["10.0.0.0/8", "172.16.0.0/12"]
+ip_denylist = ["10.0.0.5"]
+```

@@ -35,6 +35,12 @@
 - **Self-Update** — Built-in `athenas update` command to upgrade to the latest release
 - **Model Management** — List, search, download, inspect, and remove local models
 - **Backend Benchmarking** — Compare backend performance with `athenas backend benchmark`
+- **LoRA Adapters** — Load multiple LoRA adapters for model customization
+- **Parallel Inference Slots** — Configurable parallel decoding slots for batched inference
+- **Vector Store** — Integrated vector store for RAG (retrieval-augmented generation)
+- **OpenTelemetry Tracing** — Distributed tracing with OTLP export for observability
+- **IP Filtering** — Allowlist/denylist for IP-based access control
+- **RemoteBackend** — TUI chat automatically connects to detached server via HTTP API
 
 ## Installation
 
@@ -109,6 +115,17 @@ When the server is running, you can:
 3. Use **■ Unload** (Left/Right to select, Enter to unload) to remove a model from memory
 4. Use **★ Default** (Left/Right to select, Enter to set) to choose which model handles requests without a `model` field
 5. The **LOADED MODELS** section shows all active models with their IDs, backends, and default status (★)
+
+#### TUI Server Panel — Enterprise Configuration
+
+The server panel (F5) also provides full configuration for enterprise features:
+
+- **ADVANCED:** Parallel Slots, LoRA Adapters (comma-separated paths)
+- **VECTOR STORE:** Enable/disable, Max Documents, Default Top-K
+- **TRACING:** OpenTelemetry enable, OTLP Endpoint, Service Name, Sample Ratio
+- **SECURITY:** IP Allowlist, IP Denylist (comma-separated IPs/CIDRs)
+
+All fields are editable (Enter to edit, Esc to cancel) or toggleable (Enter to toggle ON/OFF), and persist to `~/.athenas/config.toml`.
 
 ### Chat in terminal
 ```bash
@@ -311,10 +328,10 @@ print(response.choices[0].message.content)
 athenas-studio/
 ├── crates/
 │   ├── athenas-core/        # Config, storage, hardware detection, model registry
-│   ├── athenas-inference/   # Backend trait, llama.cpp & vLLM implementations
+│   ├── athenas-inference/   # Backend trait, llama.cpp, vLLM & RemoteBackend implementations
 │   ├── athenas-hub/         # HuggingFace API client, download manager
 │   ├── athenas-server/      # OpenAI-compatible API server (axum), multi-model manager
-│   ├── athenas-tui/         # Terminal UI (ratatui + crossterm), server panel with multi-model
+│   ├── athenas-tui/         # Terminal UI (ratatui + crossterm), server panel with multi-model, enterprise configs
 │   └── athenas-cli/         # CLI entry point (clap)
 ├── .github/workflows/       # CI, release & PR build pipelines
 ├── install.sh               # Linux/macOS installer script
@@ -332,7 +349,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.3.1"
+version = "0.7.4"
 
 [paths]
 models_dir = "~/.athenas/models"
@@ -357,6 +374,9 @@ reasoning_budget = -1           # -1 = unlimited, 0 = off, N = token limit
 ram_reserve_mb = 2048           # MB reserved for OS
 cpu_reserve_cores = 1           # cores to leave free
 auto_resource_limits = true     # auto-cap threads/ctx/batch based on hardware
+# Advanced inference
+lora_paths = []                 # LoRA adapter paths (e.g. ["/path/to/adapter.gguf"])
+parallel_slots = 1              # parallel decoding slots (1=safe, 4=fast but more RAM)
 
 [server]
 default_host = "127.0.0.1"
@@ -369,6 +389,20 @@ request_timeout_secs = 120      # kill stuck requests
 max_body_size_mb = 10           # DoS protection
 enable_metrics = true           # Prometheus /metrics endpoint
 enable_compression = true       # gzip response compression
+# IP filtering (empty allowlist = allow all)
+ip_allowlist = []               # e.g. ["10.0.0.0/8", "192.168.1.100"]
+ip_denylist = []                # e.g. ["10.0.0.5"]
+
+[server.vector_store]
+enabled = false                 # enable integrated vector store for RAG
+max_documents = 0               # 0 = unlimited
+default_top_k = 5               # default search results count
+
+[server.otel]
+enabled = false                 # enable OpenTelemetry distributed tracing
+# endpoint = "http://localhost:4317"  # OTLP endpoint
+service_name = "athenas-studio" # service name for traces
+sample_ratio = 1.0              # sampling ratio 0.0-1.0
 
 [huggingface]
 # token = "hf_xxxxx"            # for gated models
