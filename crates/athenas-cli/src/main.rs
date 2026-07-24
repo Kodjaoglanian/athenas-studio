@@ -37,7 +37,7 @@ enum Commands {
         #[arg(long, value_enum, default_value = "auto")]
         backend: athenas_core::BackendType,
         /// GPU layers to offload (-1 for all)
-        #[arg(long, default_value = "-1")]
+        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
         gpu_layers: i32,
         /// Context size
         #[arg(long, default_value = "4096")]
@@ -58,7 +58,7 @@ enum Commands {
         #[arg(long, value_enum, default_value = "auto")]
         backend: athenas_core::BackendType,
         /// GPU layers to offload
-        #[arg(long, default_value = "-1")]
+        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
         gpu_layers: i32,
         /// Context size
         #[arg(long, default_value = "4096")]
@@ -93,7 +93,7 @@ enum Commands {
         #[arg(long, default_value = "2048")]
         max_tokens: u32,
         /// GPU layers
-        #[arg(long, default_value = "-1")]
+        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
         gpu_layers: i32,
     },
 
