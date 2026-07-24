@@ -26,11 +26,12 @@ use athenas_inference::{
 use crate::api_keys::{AuthResult, SharedApiKeyManager};
 use crate::audit_log::{AuditEntry, SharedAuditLogger};
 use crate::metrics::{metrics_middleware, SharedMetrics};
-use crate::middleware::{rate_limit_middleware, SharedRateLimiter};
+use crate::middleware::{ip_filter_middleware, rate_limit_middleware, IpFilterConfig, SharedRateLimiter};
 use crate::model_manager::SharedModelManager;
 use crate::model_router::SharedModelRouter;
 use crate::session_manager::{SessionInfo, SharedSessionManager};
 use crate::slot_manager::SlotManager;
+use crate::vector_store::SharedVectorStore;
 
 #[derive(Clone)]
 struct AppState {
@@ -41,6 +42,7 @@ struct AppState {
     api_key_manager: Option<SharedApiKeyManager>,
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
+    vector_store: Option<SharedVectorStore>,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     start_time: std::time::Instant,
@@ -57,6 +59,7 @@ pub fn create_router(
     api_key_manager: Option<SharedApiKeyManager>,
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
+    vector_store: Option<SharedVectorStore>,
     config: &ServerConfig,
 ) -> Router {
     let state = AppState {
@@ -67,6 +70,7 @@ pub fn create_router(
         api_key_manager,
         model_router,
         audit_logger,
+        vector_store,
         metrics: metrics.clone(),
         semaphore,
         start_time: std::time::Instant::now(),
@@ -103,6 +107,14 @@ pub fn create_router(
         // Audit log endpoints
         .route("/v1/audit/logs", get(query_audit_logs))
         .route("/v1/audit/stats", get(audit_stats))
+        // Vector store endpoints
+        .route("/v1/vector/add", post(vs_add_document))
+        .route("/v1/vector/add-batch", post(vs_add_batch))
+        .route("/v1/vector/search", post(vs_search))
+        .route("/v1/vector/documents", get(vs_list_documents))
+        .route("/v1/vector/documents/:id", get(vs_get_document).delete(vs_delete_document))
+        .route("/v1/vector/clear", post(vs_clear))
+        .route("/v1/vector/stats", get(vs_stats))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/health", get(health))
@@ -114,6 +126,16 @@ pub fn create_router(
 
     if config.enable_compression {
         router = router.layer(CompressionLayer::new());
+    }
+
+    // IP filter (only if allowlist or denylist is configured)
+    let has_ip_filter = !config.ip_allowlist.is_empty() || !config.ip_denylist.is_empty();
+    if has_ip_filter {
+        let ip_filter = IpFilterConfig::new(
+            config.ip_allowlist.clone(),
+            config.ip_denylist.clone(),
+        );
+        router = router.layer(from_fn_with_state(ip_filter, ip_filter_middleware));
     }
 
     router = router
@@ -322,6 +344,10 @@ struct ChatCompletionRequest {
     tools: Option<serde_json::Value>,
     /// Tool choice: "auto", "none", "required", or specific tool object
     tool_choice: Option<serde_json::Value>,
+    /// JSON mode / structured output: {"type": "json_object"} or {"type": "json_schema", ...}
+    response_format: Option<serde_json::Value>,
+    /// GBNF grammar string for grammar-constrained generation
+    grammar: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -354,14 +380,16 @@ where
     }
 }
 
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/chat/completions"))]
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    match check_auth_full(&headers, &state, model_for_auth).await {
-        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired => None,
+        AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -386,7 +414,7 @@ async fn chat_completions(
         AuthResult::Forbidden => {
             return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "This API key is not allowed to use the requested model"}))).into_response();
         }
-    }
+    };
 
     let _permit = match state.semaphore.acquire().await {
         Ok(permit) => permit,
@@ -448,6 +476,8 @@ async fn chat_completions(
         seed: req.seed,
         tools: req.tools.clone(),
         tool_choice: req.tool_choice.clone(),
+        response_format: req.response_format.clone(),
+        grammar: req.grammar.clone(),
     };
 
     let model_id = chat_req.model.clone();
@@ -524,6 +554,8 @@ async fn chat_completions(
         let session_mgr_clone = state.session_manager.clone();
         let session_id_clone = session_id.clone();
         let should_save_response = req.save_response;
+        let api_key_mgr_clone = state.api_key_manager.clone();
+        let auth_key_id_clone = auth_key_id.clone();
         tokio::spawn(async move {
             let m = mgr2.lock().await;
             if let Some(b) = m.get(Some(model_id_clone.as_str())) {
@@ -540,6 +572,16 @@ async fn chat_completions(
                 if chunk.done {
                     if let Some(stats) = &chunk.stats {
                         metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
+
+                        // Record token usage for API key
+                        if let Some(ref key_id) = auth_key_id_clone {
+                            if let Some(ref mgr_arc) = api_key_mgr_clone {
+                                let mut mgr = mgr_arc.lock().await;
+                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                    mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
+                                }
+                            }
+                        }
                     }
 
                     // Save assistant response to session
@@ -598,6 +640,16 @@ async fn chat_completions(
                     resp.stats.tokens_prompt,
                     resp.stats.tokens_generated,
                 );
+
+                // Record token usage for API key
+                if let Some(ref key_id) = auth_key_id {
+                    if let Some(ref mgr_arc) = state.api_key_manager {
+                        let mut mgr = mgr_arc.lock().await;
+                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                            mgr.record_usage(&key, resp.stats.tokens_prompt as u64, resp.stats.tokens_generated as u64);
+                        }
+                    }
+                }
 
                 // Record audit entry
                 record_audit(
@@ -812,16 +864,22 @@ struct CompletionRequestBody {
     stream: Option<bool>,
     stop: Option<serde_json::Value>,
     seed: Option<u64>,
+    /// GBNF grammar string for grammar-constrained generation
+    grammar: Option<String>,
+    /// JSON mode / structured output
+    response_format: Option<serde_json::Value>,
 }
 
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/completions"))]
 async fn completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<CompletionRequestBody>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    match check_auth_full(&headers, &state, model_for_auth).await {
-        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired => None,
+        AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -850,7 +908,7 @@ async fn completions(
             )
                 .into_response();
         }
-    }
+    };
 
     let _permit = match state.semaphore.acquire().await {
         Ok(permit) => permit,
@@ -878,6 +936,8 @@ async fn completions(
         stream: req.stream.unwrap_or(false),
         stop,
         seed: req.seed,
+        grammar: req.grammar.clone(),
+        response_format: req.response_format.clone(),
     };
 
     let model_id = comp_req.model.clone();
@@ -909,6 +969,8 @@ async fn completions(
         let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
         let model_id_clone = model_id.clone();
+        let api_key_mgr_clone = state.api_key_manager.clone();
+        let auth_key_id_clone = auth_key_id.clone();
         tokio::spawn(async move {
             let m = mgr2.lock().await;
             if let Some(b) = m.get(Some(model_id_clone.as_str())) {
@@ -924,6 +986,16 @@ async fn completions(
                 if chunk.done {
                     if let Some(stats) = &chunk.stats {
                         metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
+
+                        // Record token usage for API key
+                        if let Some(ref key_id) = auth_key_id_clone {
+                            if let Some(ref mgr_arc) = api_key_mgr_clone {
+                                let mut mgr = mgr_arc.lock().await;
+                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                    mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
+                                }
+                            }
+                        }
                     }
                     let json = serde_json::json!({
                         "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
@@ -970,6 +1042,17 @@ async fn completions(
                     resp.stats.tokens_prompt,
                     resp.stats.tokens_generated,
                 );
+
+                // Record token usage for API key
+                if let Some(ref key_id) = auth_key_id {
+                    if let Some(ref mgr_arc) = state.api_key_manager {
+                        let mut mgr = mgr_arc.lock().await;
+                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                            mgr.record_usage(&key, resp.stats.tokens_prompt as u64, resp.stats.tokens_generated as u64);
+                        }
+                    }
+                }
+
                 let json = serde_json::json!({
                     "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
                     "object": "text_completion",
@@ -1103,9 +1186,15 @@ struct LoadModelRequest {
     reasoning_enabled: Option<bool>,
     reasoning_budget: Option<i32>,
     mmproj_path: Option<String>,
+    /// LoRA adapter file paths to load
+    #[serde(default)]
+    lora_paths: Vec<String>,
+    /// Number of parallel slots for batched inference
+    parallel_slots: Option<u32>,
     set_default: Option<bool>,
 }
 
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/models/load"))]
 async fn load_model_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1155,6 +1244,8 @@ async fn load_model_endpoint(
         reasoning_enabled: req.reasoning_enabled.unwrap_or(false),
         reasoning_budget: req.reasoning_budget.unwrap_or(-1),
         mmproj_path: req.mmproj_path,
+        lora_paths: req.lora_paths.clone(),
+        parallel_slots: req.parallel_slots.unwrap_or(4),
     };
 
     if let Err(e) = backend.load_model(load_config).await {
@@ -1572,14 +1663,16 @@ fn default_encoding_format_api() -> Option<String> {
     Some("float".to_string())
 }
 
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/embeddings"))]
 async fn embeddings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<EmbeddingsApiRequest>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    match check_auth_full(&headers, &state, model_for_auth).await {
-        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired => None,
+        AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1608,7 +1701,7 @@ async fn embeddings(
             )
                 .into_response();
         }
-    }
+    };
 
     let _permit = match state.semaphore.acquire().await {
         Ok(permit) => permit,
@@ -1674,6 +1767,17 @@ async fn embeddings(
             state
                 .metrics
                 .record_tokens(&model_id, resp.usage.prompt_tokens, 0);
+
+            // Record token usage for API key
+            if let Some(ref key_id) = auth_key_id {
+                if let Some(ref mgr_arc) = state.api_key_manager {
+                    let mut mgr = mgr_arc.lock().await;
+                    if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                        mgr.record_usage(&key, resp.usage.prompt_tokens as u64, 0);
+                    }
+                }
+            }
+
             Json(resp).into_response()
         }
         Err(e) => (
@@ -2107,4 +2211,205 @@ async fn audit_stats(State(state): State<AppState>, headers: HeaderMap) -> Respo
     let logger = logger_arc.lock().await;
     let stats = logger.stats();
     Json(stats).into_response()
+}
+
+// ─── Vector Store Endpoints ───
+
+#[derive(Debug, Deserialize)]
+struct VsAddRequest {
+    id: String,
+    content: String,
+    embedding: Vec<f32>,
+    metadata: Option<serde_json::Value>,
+}
+
+async fn vs_add_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<VsAddRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Vector store not enabled"})),
+        ).into_response(),
+    };
+
+    match vs.add_document(req.id, req.content, req.embedding, req.metadata).await {
+        Ok(doc) => Json(doc).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VsAddBatchRequest {
+    documents: Vec<VsAddRequest>,
+}
+
+async fn vs_add_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<VsAddBatchRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Vector store not enabled"})),
+        ).into_response(),
+    };
+
+    let docs: Vec<(String, String, Vec<f32>, Option<serde_json::Value>)> = req.documents
+        .into_iter()
+        .map(|d| (d.id, d.content, d.embedding, d.metadata))
+        .collect();
+
+    match vs.add_documents(docs).await {
+        Ok(added) => Json(serde_json::json!({"added": added.len(), "documents": added})).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VsSearchRequest {
+    embedding: Vec<f32>,
+    top_k: Option<usize>,
+}
+
+async fn vs_search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<VsSearchRequest>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Vector store not enabled"})),
+        ).into_response(),
+    };
+
+    let top_k = req.top_k.unwrap_or(5);
+    let results = vs.search(&req.embedding, top_k).await;
+    Json(serde_json::json!({"results": results, "count": results.len()})).into_response()
+}
+
+async fn vs_list_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Vector store not enabled"})),
+        ).into_response(),
+    };
+
+    let docs = vs.list_documents().await;
+    Json(serde_json::json!({"documents": docs, "count": docs.len()})).into_response()
+}
+
+async fn vs_get_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    match vs.get_document(&id).await {
+        Some(doc) => Json(doc).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Document not found"})),
+        ).into_response(),
+    }
+}
+
+async fn vs_delete_document(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    if vs.delete_document(&id).await {
+        Json(serde_json::json!({"status": "deleted", "id": id})).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Document not found"})),
+        ).into_response()
+    }
+}
+
+async fn vs_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    vs.clear().await;
+    Json(serde_json::json!({"status": "cleared"})).into_response()
+}
+
+async fn vs_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if !check_auth(&headers, &state.api_key) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let vs = match &state.vector_store {
+        Some(v) => v,
+        None => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+
+    let count = vs.len().await;
+    Json(serde_json::json!({"document_count": count, "enabled": vs.is_enabled()})).into_response()
 }

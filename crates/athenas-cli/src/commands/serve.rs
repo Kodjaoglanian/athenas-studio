@@ -1,6 +1,6 @@
 use athenas_core::{AppConfig, BackendType, HardwareDetector, ModelRegistry, Result};
 use athenas_inference::{BackendFactory, ModelLoadConfig};
-use athenas_server::{ApiKeyManager, ApiServer, AuditLogger, ModelRouter};
+use athenas_server::{ApiKeyManager, ApiServer, AuditLogger, ModelRouter, VectorStoreConfig};
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -17,6 +17,10 @@ pub async fn run(
 ) -> Result<()> {
     let mut config = AppConfig::load()?;
     config.ensure_dirs()?;
+
+    // Initialize OpenTelemetry tracing
+    let otel_config = config.server.otel.clone();
+    let _otel_provider = athenas_server::tracing_setup::init_tracing(&otel_config);
 
     if let Some(mc) = max_concurrent {
         config.server.max_concurrent_requests = mc;
@@ -50,6 +54,8 @@ pub async fn run(
         reasoning_enabled: config.inference.reasoning_enabled,
         reasoning_budget: config.inference.reasoning_budget,
         mmproj_path: None,
+        lora_paths: Vec::new(),
+        parallel_slots: 4,
     };
 
     backend.load_model(load_config).await?;
@@ -58,14 +64,30 @@ pub async fn run(
     let data_dir = std::path::PathBuf::from(&config.paths.data_dir);
     let api_key_mgr = ApiKeyManager::new(data_dir.clone());
     let model_router = ModelRouter::new();
-    let audit_logger = AuditLogger::new(data_dir, 10000);
+    let audit_logger = AuditLogger::new(data_dir.clone(), 10000);
+
+    // Check if vector store is enabled before moving config
+    let vs_enabled = config.server.vector_store.enabled;
+    let vs_max_docs = config.server.vector_store.max_documents;
+    let vs_top_k = config.server.vector_store.default_top_k;
 
     print_startup_banner(&config, host, port, &hardware, &model);
 
-    let server = ApiServer::new(config, backend)
+    let mut server = ApiServer::new(config, backend)
         .with_api_key_manager(api_key_mgr)
         .with_model_router(model_router)
         .with_audit_logger(audit_logger);
+
+    if vs_enabled {
+        let vs_config = VectorStoreConfig {
+            enabled: true,
+            data_dir,
+            max_documents: vs_max_docs,
+            default_top_k: vs_top_k,
+        };
+        server = server.with_vector_store(vs_config);
+    }
+
     server.start(host, port).await
 }
 

@@ -15,6 +15,7 @@ use crate::model_manager::{ModelManager, SharedModelManager};
 use crate::model_router::{ModelRouter, SharedModelRouter};
 use crate::session_manager::{SessionManager, SharedSessionManager};
 use crate::slot_manager::SlotManager;
+use crate::vector_store::{SharedVectorStore, VectorStore, VectorStoreConfig};
 
 pub struct ApiServer {
     config: AppConfig,
@@ -27,6 +28,7 @@ pub struct ApiServer {
     api_key_manager: Option<SharedApiKeyManager>,
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
+    vector_store: Option<SharedVectorStore>,
 }
 
 impl ApiServer {
@@ -54,6 +56,7 @@ impl ApiServer {
             api_key_manager: None,
             model_router: None,
             audit_logger: None,
+            vector_store: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl ApiServer {
             api_key_manager: None,
             model_router: None,
             audit_logger: None,
+            vector_store: None,
         }
     }
 
@@ -105,6 +109,12 @@ impl ApiServer {
     /// Enable audit logging.
     pub fn with_audit_logger(mut self, logger: AuditLogger) -> Self {
         self.audit_logger = Some(Arc::new(Mutex::new(logger)));
+        self
+    }
+
+    /// Enable the integrated vector store.
+    pub fn with_vector_store(mut self, vs_config: VectorStoreConfig) -> Self {
+        self.vector_store = Some(Arc::new(VectorStore::new(vs_config)));
         self
     }
 
@@ -134,6 +144,7 @@ impl ApiServer {
             self.api_key_manager.clone(),
             self.model_router.clone(),
             self.audit_logger.clone(),
+            self.vector_store.clone(),
             &self.config.server,
         );
 
@@ -144,7 +155,7 @@ impl ApiServer {
             .await
             .map_err(|e| athenas_core::AthenasError::Server(format!("Failed to bind: {}", e)))?;
 
-        axum::serve(listener, app)
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .map_err(|e| athenas_core::AthenasError::Server(format!("Server error: {}", e)))?;
 

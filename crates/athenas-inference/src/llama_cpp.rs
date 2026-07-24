@@ -171,7 +171,7 @@ impl LlamaCppBackend {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--parallel")
-            .arg("4")
+            .arg(config.parallel_slots.to_string())
             // Enterprise performance flags
             .arg("--cont-batching")
             .arg("--cache-prompt")
@@ -219,6 +219,14 @@ impl LlamaCppBackend {
         if let Some(mmproj) = mmproj_path {
             info!("Using mmproj: {}", mmproj);
             cmd.arg("--mmproj").arg(mmproj);
+        }
+
+        // LoRA adapters
+        for lora_path in &config.lora_paths {
+            if !lora_path.is_empty() {
+                info!("Loading LoRA adapter: {}", lora_path);
+                cmd.arg("--lora").arg(lora_path);
+            }
         }
 
         cmd.stdout(std::process::Stdio::piped())
@@ -491,6 +499,12 @@ impl Backend for LlamaCppBackend {
         if let Some(ref tc) = request.tool_choice {
             body["tool_choice"] = tc.clone();
         }
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(ref grammar) = request.grammar {
+            body["grammar"] = serde_json::Value::String(grammar.clone());
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
@@ -660,6 +674,12 @@ impl Backend for LlamaCppBackend {
         }
         if let Some(ref tc) = request.tool_choice {
             body["tool_choice"] = tc.clone();
+        }
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(ref grammar) = request.grammar {
+            body["grammar"] = serde_json::Value::String(grammar.clone());
         }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
@@ -904,7 +924,7 @@ impl Backend for LlamaCppBackend {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "prompt": request.prompt,
             "temperature": request.temperature.unwrap_or(0.7),
             "top_p": request.top_p.unwrap_or(0.9),
@@ -912,6 +932,13 @@ impl Backend for LlamaCppBackend {
             "stream": false,
             "stop": request.stop.as_deref().unwrap_or(&[]),
         });
+
+        if let Some(ref grammar) = request.grammar {
+            body["grammar"] = serde_json::Value::String(grammar.clone());
+        }
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
 
         let url = format!("{}/completion", self.server_url());
         let resp = self
@@ -985,6 +1012,8 @@ impl Backend for LlamaCppBackend {
             max_tokens: request.max_tokens,
             stream: true,
             stop: request.stop.clone(),
+            grammar: request.grammar.clone(),
+            response_format: request.response_format.clone(),
             ..Default::default()
         };
         self.chat_stream(chat_req, tx).await

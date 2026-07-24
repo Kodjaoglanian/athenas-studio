@@ -856,6 +856,8 @@ impl TuiApp {
             seed: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
+            grammar: None,
         };
 
         // Get a backend reference: prefer local backend, fall back to server's model manager
@@ -1139,6 +1141,8 @@ impl TuiApp {
             reasoning_enabled: self.config.inference.reasoning_enabled,
             reasoning_budget: self.config.inference.reasoning_budget,
             mmproj_path: None,
+            lora_paths: Vec::new(),
+            parallel_slots: 1,
         };
 
         let task = tokio::spawn(async move {

@@ -643,6 +643,8 @@ impl ServerPanelState {
             reasoning_enabled: self.reasoning_enabled,
             reasoning_budget: self.reasoning_budget,
             mmproj_path: None,
+            lora_paths: Vec::new(),
+            parallel_slots: 1,
         }
     }
 

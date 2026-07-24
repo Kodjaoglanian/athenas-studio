@@ -8,6 +8,8 @@ pub mod routes;
 pub mod server;
 pub mod session_manager;
 pub mod slot_manager;
+pub mod tracing_setup;
+pub mod vector_store;
 
 pub use api_keys::{ApiKeyManager, SharedApiKeyManager};
 pub use audit_log::{AuditLogger, SharedAuditLogger};
@@ -16,3 +18,5 @@ pub use model_router::{ModelRouter, SharedModelRouter};
 pub use server::ApiServer;
 pub use session_manager::{SessionManager, SharedSessionManager};
 pub use slot_manager::SlotManager;
+pub use middleware::{IpFilterConfig, RateLimiter, SharedRateLimiter};
+pub use vector_store::{SharedVectorStore, VectorStore, VectorStoreConfig};

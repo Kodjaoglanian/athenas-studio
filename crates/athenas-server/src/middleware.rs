@@ -76,3 +76,127 @@ pub async fn rate_limit_middleware(
 
     next.run(req).await
 }
+
+// ─── IP Allowlist / Denylist Middleware ───
+
+/// IP filter configuration for allowlist/denylist.
+#[derive(Clone, Debug)]
+pub struct IpFilterConfig {
+    /// List of allowed IPs/CIDRs. Empty = allow all (subject to denylist).
+    pub allowlist: Vec<String>,
+    /// List of denied IPs/CIDRs. These are always blocked.
+    pub denylist: Vec<String>,
+}
+
+impl IpFilterConfig {
+    pub fn new(allowlist: Vec<String>, denylist: Vec<String>) -> Self {
+        Self { allowlist, denylist }
+    }
+
+    /// Check if an IP address is allowed.
+    pub fn is_allowed(&self, ip: &IpAddr) -> bool {
+        // Check denylist first
+        for entry in &self.denylist {
+            if ip_matches(ip, entry) {
+                return false;
+            }
+        }
+
+        // If allowlist is empty, allow all (not in denylist)
+        if self.allowlist.is_empty() {
+            return true;
+        }
+
+        // Check allowlist
+        for entry in &self.allowlist {
+            if ip_matches(ip, entry) {
+                return true;
+            }
+        }
+
+        false
+    }
+}
+
+/// Check if an IP address matches an entry (IP or CIDR).
+fn ip_matches(ip: &IpAddr, entry: &str) -> bool {
+    // Try CIDR notation first
+    if let Some((range_ip, prefix_len)) = entry.split_once('/') {
+        if let Ok(prefix_len) = prefix_len.parse::<u8>() {
+            return cidr_match(ip, range_ip, prefix_len);
+        }
+    }
+
+    // Try exact IP match
+    if let Ok(entry_ip) = entry.parse::<IpAddr>() {
+        return ip == &entry_ip;
+    }
+
+    false
+}
+
+/// Check if an IP is within a CIDR range.
+fn cidr_match(ip: &IpAddr, range_ip: &str, prefix_len: u8) -> bool {
+    match (ip, range_ip.parse()) {
+        (IpAddr::V4(addr), Ok(IpAddr::V4(range))) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(*addr) & mask) == (u32::from(range) & mask)
+        }
+        (IpAddr::V6(addr), Ok(IpAddr::V6(range))) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            let addr_bytes = addr.octets();
+            let range_bytes = range.octets();
+            let full_bytes = (prefix_len / 8) as usize;
+            let remainder_bits = prefix_len % 8;
+
+            // Compare full bytes
+            if addr_bytes[..full_bytes] != range_bytes[..full_bytes] {
+                return false;
+            }
+
+            // Compare remaining bits
+            if remainder_bits > 0 && full_bytes < 16 {
+                let mask = 0xFFu8 << (8 - remainder_bits);
+                if (addr_bytes[full_bytes] & mask) != (range_bytes[full_bytes] & mask) {
+                    return false;
+                }
+            }
+
+            true
+        }
+        _ => false,
+    }
+}
+
+/// IP filter middleware.
+pub async fn ip_filter_middleware(
+    State(filter): State<IpFilterConfig>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+    if !filter.is_allowed(&ip) {
+        tracing::warn!("IP {} blocked by filter", ip);
+        return (
+            StatusCode::FORBIDDEN,
+            "Access denied: IP not allowed.",
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}

@@ -69,6 +69,18 @@ pub struct ServerConfig {
     pub enable_metrics: bool,
     #[serde(default = "default_true")]
     pub enable_compression: bool,
+    /// Vector store configuration
+    #[serde(default)]
+    pub vector_store: VectorStoreServerConfig,
+    /// IP filter: allowlist of IPs/CIDRs that can access the server. Empty = allow all.
+    #[serde(default)]
+    pub ip_allowlist: Vec<String>,
+    /// IP filter: denylist of IPs/CIDRs that are blocked.
+    #[serde(default)]
+    pub ip_denylist: Vec<String>,
+    /// OpenTelemetry tracing configuration
+    #[serde(default)]
+    pub otel: OtelConfig,
 }
 
 fn default_max_concurrent() -> u32 {
@@ -107,6 +119,70 @@ pub struct HuggingFaceConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub file_logging: bool,
+}
+
+/// Configuration for the integrated vector store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorStoreServerConfig {
+    /// Whether the vector store is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of documents to store (0 = unlimited).
+    #[serde(default)]
+    pub max_documents: usize,
+    /// Number of results to return by default in search.
+    #[serde(default = "default_vs_top_k")]
+    pub default_top_k: usize,
+}
+
+fn default_vs_top_k() -> usize {
+    5
+}
+
+impl Default for VectorStoreServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_documents: 0,
+            default_top_k: 5,
+        }
+    }
+}
+
+/// Configuration for OpenTelemetry distributed tracing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtelConfig {
+    /// Whether OpenTelemetry tracing is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP endpoint URL (e.g., "http://localhost:4317").
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Service name for traces.
+    #[serde(default = "default_otel_service_name")]
+    pub service_name: String,
+    /// Sampling ratio (0.0 to 1.0).
+    #[serde(default = "default_otel_sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+fn default_otel_service_name() -> String {
+    "athenas-studio".to_string()
+}
+
+fn default_otel_sample_ratio() -> f64 {
+    1.0
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: None,
+            service_name: default_otel_service_name(),
+            sample_ratio: default_otel_sample_ratio(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
@@ -167,6 +243,10 @@ impl Default for AppConfig {
                 max_body_size_mb: 10,
                 enable_metrics: true,
                 enable_compression: true,
+                vector_store: VectorStoreServerConfig::default(),
+                ip_allowlist: Vec::new(),
+                ip_denylist: Vec::new(),
+                otel: OtelConfig::default(),
             },
             huggingface: HuggingFaceConfig {
                 token: None,

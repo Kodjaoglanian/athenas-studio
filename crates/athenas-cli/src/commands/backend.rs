@@ -133,6 +133,8 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             reasoning_enabled: config.inference.reasoning_enabled,
             reasoning_budget: config.inference.reasoning_budget,
             mmproj_path: None,
+            lora_paths: Vec::new(),
+            parallel_slots: 1,
         })
         .await?;
     let load_time = load_start.elapsed();
@@ -174,6 +176,8 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             seed: Some(42),
             tools: None,
             tool_choice: None,
+            response_format: None,
+            grammar: None,
         };
 
         let start = Instant::now();

@@ -193,7 +193,7 @@ impl Backend for VllmBackend {
             })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_path,
             "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
@@ -201,6 +201,13 @@ impl Backend for VllmBackend {
             "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": false,
         });
+
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(ref grammar) = request.grammar {
+            body["guided_grammar"] = serde_json::Value::String(grammar.clone());
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
@@ -277,7 +284,7 @@ impl Backend for VllmBackend {
             })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_path,
             "messages": messages,
             "temperature": request.temperature.unwrap_or(0.7),
@@ -286,6 +293,13 @@ impl Backend for VllmBackend {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
+
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
+        if let Some(ref grammar) = request.grammar {
+            body["guided_grammar"] = serde_json::Value::String(grammar.clone());
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         let resp = self
@@ -403,7 +417,7 @@ impl Backend for VllmBackend {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": self.model_path,
             "prompt": request.prompt,
             "temperature": request.temperature.unwrap_or(0.7),
@@ -411,6 +425,13 @@ impl Backend for VllmBackend {
             "max_tokens": request.max_tokens.unwrap_or(2048),
             "stream": false,
         });
+
+        if let Some(ref grammar) = request.grammar {
+            body["guided_grammar"] = serde_json::Value::String(grammar.clone());
+        }
+        if let Some(ref rf) = request.response_format {
+            body["response_format"] = rf.clone();
+        }
 
         let url = format!("{}/v1/completions", self.server_url());
         let resp = self

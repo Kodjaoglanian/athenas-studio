@@ -139,6 +139,12 @@ pub struct ChatRequest {
     /// Tool choice: "auto", "none", "required", or specific tool
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<serde_json::Value>,
+    /// JSON mode / structured output: {"type": "json_object"} or {"type": "json_schema", "json_schema": {...}}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
+    /// GBNF grammar string for grammar-constrained generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
 }
 
 impl Default for ChatRequest {
@@ -154,6 +160,8 @@ impl Default for ChatRequest {
             seed: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
+            grammar: None,
         }
     }
 }
@@ -181,6 +189,12 @@ pub struct CompletionRequest {
     pub stream: bool,
     pub stop: Option<Vec<String>>,
     pub seed: Option<u64>,
+    /// GBNF grammar string for grammar-constrained generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
+    /// JSON mode / structured output: {"type": "json_object"} or {"type": "json_schema", ...}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +237,16 @@ pub struct ModelLoadConfig {
     /// Path to multimodal projector file (mmproj) for vision models.
     /// If None, auto-detection will be attempted in the model's directory.
     pub mmproj_path: Option<String>,
+    /// LoRA adapter paths to load (one or more .gguf LoRA files)
+    #[serde(default)]
+    pub lora_paths: Vec<String>,
+    /// Number of parallel slots for batched inference (decoding multiple sequences simultaneously)
+    #[serde(default = "default_parallel_slots")]
+    pub parallel_slots: u32,
+}
+
+fn default_parallel_slots() -> u32 {
+    4
 }
 
 impl Default for ModelLoadConfig {
@@ -243,6 +267,8 @@ impl Default for ModelLoadConfig {
             reasoning_enabled: true,
             reasoning_budget: -1,
             mmproj_path: None,
+            lora_paths: Vec::new(),
+            parallel_slots: 4,
         }
     }
 }
