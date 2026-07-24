@@ -180,7 +180,8 @@ pub fn start_detached(
     Ok(state)
 }
 
-/// Stop the server by sending SIGTERM to the process.
+/// Stop the server by sending SIGTERM to the process group.
+/// Uses negative PID to kill the entire process group (athenas serve + llama-server child).
 pub fn stop_by_pid(pid: u32) -> Result<(), String> {
     if !is_process_alive(pid) {
         return Err("Server process is not running".to_string());
@@ -189,8 +190,14 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
         unsafe {
-            if libc::kill(pid as i32, libc::SIGTERM) != 0 {
-                return Err(format!("Failed to send SIGTERM to PID {}", pid));
+            // Send SIGTERM to the entire process group (negative PID).
+            // The detached process called setsid(), so it's a session leader
+            // and killing -pid targets the whole group, including llama-server.
+            if libc::kill(-(pid as i32), libc::SIGTERM) != 0 {
+                // Fallback: try killing just the process
+                if libc::kill(pid as i32, libc::SIGTERM) != 0 {
+                    return Err(format!("Failed to send SIGTERM to PID {}", pid));
+                }
             }
         }
     }
@@ -198,7 +205,7 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
     {
         // On non-Unix, try to kill via the OS
         let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
             .spawn();
     }
 
@@ -210,6 +217,9 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
         #[cfg(unix)]
         {
             unsafe {
+                // Kill the entire process group
+                libc::kill(-(pid as i32), libc::SIGKILL);
+                // Also try individual PID as fallback
                 libc::kill(pid as i32, libc::SIGKILL);
             }
         }
