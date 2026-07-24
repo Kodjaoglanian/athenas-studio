@@ -51,7 +51,7 @@ impl ServerState {
 }
 
 /// Check if a process with the given PID is still running.
-fn is_process_alive(pid: u32) -> bool {
+pub fn is_process_alive(pid: u32) -> bool {
     // SAFETY: kill(pid, 0) doesn't send a signal — it just checks existence.
     // On Unix, this is safe. On Windows, we'd need a different approach.
     #[cfg(unix)]
@@ -128,10 +128,24 @@ pub fn start_detached(
         cmd.arg("--max-body-size").arg(bs.to_string());
     }
 
-    // Detach: redirect stdio to /dev/null, create new session
+    // Detach: redirect stdin to /dev/null, stdout to log file, stderr to log file
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".athenas");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("server.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open server log: {}", e))?;
+
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(
+            log_file.try_clone().map_err(|e| e.to_string())?,
+        ))
+        .stderr(Stdio::from(log_file));
 
     #[cfg(unix)]
     {

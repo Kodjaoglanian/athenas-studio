@@ -1346,8 +1346,9 @@ impl TuiApp {
                 self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
                 // Keep LoadingModel phase — the detached process is still loading the model.
                 // We'll poll the health endpoint until it responds, then switch to Running.
+                let health_pid = state.pid;
                 self.server_panel_state.status_message =
-                    Some(format!("Loading model (PID: {})...", state.pid));
+                    Some(format!("Loading model (PID: {})...", health_pid));
                 self.server_panel_state.loaded_model_name = Some(model_name.clone());
                 self.server_panel_state.loaded_backend_name = Some(backend_str.to_string());
                 self.server_state = Some(state);
@@ -1364,6 +1365,15 @@ impl TuiApp {
                         .ok()?;
                     // Poll for up to 5 minutes (300 attempts * 1s interval)
                     for _ in 0..300 {
+                        // Check if the server process is still alive
+                        if !server_manager::is_process_alive(health_pid) {
+                            tracing::error!(
+                                "Server process (PID: {}) died during startup. \
+                                 Check ~/.athenas/server.log for details.",
+                                health_pid
+                            );
+                            return None;
+                        }
                         if client.get(&url).send().await.is_ok() {
                             return health_state;
                         }
@@ -1415,7 +1425,7 @@ impl TuiApp {
                     // We were waiting for a server we started — it timed out
                     self.server_panel_state.phase = ServerPhase::Error;
                     self.server_panel_state.status_message = Some(
-                        "Server failed to start within 5 minutes. Check if the model is valid."
+                        "Server failed to start. Check ~/.athenas/server.log for details."
                             .to_string(),
                     );
                     self.server_state = None;

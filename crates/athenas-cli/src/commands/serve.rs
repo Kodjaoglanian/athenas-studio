@@ -55,7 +55,7 @@ pub async fn run(
         reasoning_budget: config.inference.reasoning_budget,
         mmproj_path: None,
         lora_paths: Vec::new(),
-        parallel_slots: 4,
+        parallel_slots: 1,
     };
 
     backend.load_model(load_config).await?;
