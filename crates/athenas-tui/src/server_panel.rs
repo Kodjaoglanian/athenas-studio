@@ -51,6 +51,21 @@ pub enum ConfigField {
     RamReserve,
     CpuReserve,
     AutoResourceLimits,
+    // Advanced inference
+    ParallelSlots,
+    LoraPaths,
+    // Vector store
+    VectorStoreEnabled,
+    VectorStoreMaxDocs,
+    VectorStoreTopK,
+    // OpenTelemetry
+    OtelEnabled,
+    OtelEndpoint,
+    OtelServiceName,
+    OtelSampleRatio,
+    // IP filter
+    IpAllowlist,
+    IpDenylist,
     // Actions
     StartServer,
     StopServer,
@@ -87,6 +102,17 @@ impl ConfigField {
             ConfigField::RamReserve,
             ConfigField::CpuReserve,
             ConfigField::AutoResourceLimits,
+            ConfigField::ParallelSlots,
+            ConfigField::LoraPaths,
+            ConfigField::VectorStoreEnabled,
+            ConfigField::VectorStoreMaxDocs,
+            ConfigField::VectorStoreTopK,
+            ConfigField::OtelEnabled,
+            ConfigField::OtelEndpoint,
+            ConfigField::OtelServiceName,
+            ConfigField::OtelSampleRatio,
+            ConfigField::IpAllowlist,
+            ConfigField::IpDenylist,
             ConfigField::StartServer,
             ConfigField::StopServer,
             ConfigField::LoadAdditionalModel,
@@ -122,6 +148,17 @@ impl ConfigField {
             ConfigField::RamReserve => "RAM Reserve (MB)",
             ConfigField::CpuReserve => "CPU Reserve (cores)",
             ConfigField::AutoResourceLimits => "Auto Resource Limits",
+            ConfigField::ParallelSlots => "Parallel Slots",
+            ConfigField::LoraPaths => "LoRA Adapters",
+            ConfigField::VectorStoreEnabled => "Vector Store",
+            ConfigField::VectorStoreMaxDocs => "VS Max Documents",
+            ConfigField::VectorStoreTopK => "VS Default Top-K",
+            ConfigField::OtelEnabled => "OpenTelemetry",
+            ConfigField::OtelEndpoint => "OTLP Endpoint",
+            ConfigField::OtelServiceName => "OTel Service Name",
+            ConfigField::OtelSampleRatio => "OTel Sample Ratio",
+            ConfigField::IpAllowlist => "IP Allowlist",
+            ConfigField::IpDenylist => "IP Denylist",
             ConfigField::StartServer => "Start Server",
             ConfigField::StopServer => "Stop Server",
             ConfigField::LoadAdditionalModel => "Load Additional Model",
@@ -156,7 +193,17 @@ impl ConfigField {
             | ConfigField::ReasoningBudget
             | ConfigField::RamReserve
             | ConfigField::CpuReserve
-            | ConfigField::AutoResourceLimits => "OPTIMIZATION",
+            | ConfigField::AutoResourceLimits
+            | ConfigField::ParallelSlots
+            | ConfigField::LoraPaths => "ADVANCED",
+            ConfigField::VectorStoreEnabled
+            | ConfigField::VectorStoreMaxDocs
+            | ConfigField::VectorStoreTopK => "VECTOR STORE",
+            ConfigField::OtelEnabled
+            | ConfigField::OtelEndpoint
+            | ConfigField::OtelServiceName
+            | ConfigField::OtelSampleRatio => "TRACING",
+            ConfigField::IpAllowlist | ConfigField::IpDenylist => "SECURITY",
             ConfigField::StartServer
             | ConfigField::StopServer
             | ConfigField::LoadAdditionalModel
@@ -186,6 +233,8 @@ impl ConfigField {
                 | ConfigField::FlashAttention
                 | ConfigField::Reasoning
                 | ConfigField::AutoResourceLimits
+                | ConfigField::VectorStoreEnabled
+                | ConfigField::OtelEnabled
         )
     }
 
@@ -243,6 +292,25 @@ pub struct ServerPanelState {
     pub cpu_reserve_cores: u32,
     pub auto_resource_limits: bool,
 
+    // Advanced inference
+    pub parallel_slots: u32,
+    pub lora_paths: String,
+
+    // Vector store
+    pub vs_enabled: bool,
+    pub vs_max_documents: usize,
+    pub vs_top_k: usize,
+
+    // OpenTelemetry
+    pub otel_enabled: bool,
+    pub otel_endpoint: String,
+    pub otel_service_name: String,
+    pub otel_sample_ratio: f64,
+
+    // IP filter
+    pub ip_allowlist: String,
+    pub ip_denylist: String,
+
     // Runtime state
     pub phase: ServerPhase,
     pub status_message: Option<String>,
@@ -293,6 +361,17 @@ impl ServerPanelState {
             ram_reserve_mb: config.inference.ram_reserve_mb,
             cpu_reserve_cores: config.inference.cpu_reserve_cores,
             auto_resource_limits: config.inference.auto_resource_limits,
+            parallel_slots: config.inference.parallel_slots,
+            lora_paths: config.inference.lora_paths.join(", "),
+            vs_enabled: config.server.vector_store.enabled,
+            vs_max_documents: config.server.vector_store.max_documents,
+            vs_top_k: config.server.vector_store.default_top_k,
+            otel_enabled: config.server.otel.enabled,
+            otel_endpoint: config.server.otel.endpoint.clone().unwrap_or_default(),
+            otel_service_name: config.server.otel.service_name.clone(),
+            otel_sample_ratio: config.server.otel.sample_ratio,
+            ip_allowlist: config.server.ip_allowlist.join(", "),
+            ip_denylist: config.server.ip_denylist.join(", "),
             phase: ServerPhase::Configuring,
             status_message: None,
             server_url: None,
@@ -385,6 +464,47 @@ impl ServerPanelState {
             ConfigField::RamReserve => self.ram_reserve_mb.to_string(),
             ConfigField::CpuReserve => self.cpu_reserve_cores.to_string(),
             ConfigField::AutoResourceLimits => on_off(self.auto_resource_limits),
+            ConfigField::ParallelSlots => self.parallel_slots.to_string(),
+            ConfigField::LoraPaths => {
+                if self.lora_paths.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.lora_paths.clone()
+                }
+            }
+            ConfigField::VectorStoreEnabled => on_off(self.vs_enabled),
+            ConfigField::VectorStoreMaxDocs => {
+                if self.vs_max_documents == 0 {
+                    "unlimited".to_string()
+                } else {
+                    self.vs_max_documents.to_string()
+                }
+            }
+            ConfigField::VectorStoreTopK => self.vs_top_k.to_string(),
+            ConfigField::OtelEnabled => on_off(self.otel_enabled),
+            ConfigField::OtelEndpoint => {
+                if self.otel_endpoint.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.otel_endpoint.clone()
+                }
+            }
+            ConfigField::OtelServiceName => self.otel_service_name.clone(),
+            ConfigField::OtelSampleRatio => self.otel_sample_ratio.to_string(),
+            ConfigField::IpAllowlist => {
+                if self.ip_allowlist.is_empty() {
+                    "(allow all)".to_string()
+                } else {
+                    self.ip_allowlist.clone()
+                }
+            }
+            ConfigField::IpDenylist => {
+                if self.ip_denylist.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.ip_denylist.clone()
+                }
+            }
             ConfigField::StartServer => {
                 if self.phase == ServerPhase::Running {
                     "Server is running".to_string()
@@ -453,6 +573,17 @@ impl ServerPanelState {
             ConfigField::RamReserve => "MB reserved for OS (e.g. 2048)",
             ConfigField::CpuReserve => "Cores to leave free (e.g. 1)",
             ConfigField::AutoResourceLimits => "Auto-cap threads/ctx/batch based on hardware",
+            ConfigField::ParallelSlots => "Parallel decoding slots (1=safe, 4=fast but more RAM)",
+            ConfigField::LoraPaths => "Comma-separated paths to .gguf LoRA adapter files",
+            ConfigField::VectorStoreEnabled => "Enable integrated vector store for RAG",
+            ConfigField::VectorStoreMaxDocs => "Max documents (0 = unlimited)",
+            ConfigField::VectorStoreTopK => "Default search results count",
+            ConfigField::OtelEnabled => "Enable OpenTelemetry distributed tracing",
+            ConfigField::OtelEndpoint => "OTLP endpoint (e.g. http://localhost:4317)",
+            ConfigField::OtelServiceName => "Service name for traces",
+            ConfigField::OtelSampleRatio => "Sampling ratio 0.0-1.0",
+            ConfigField::IpAllowlist => "Comma-separated IPs/CIDRs (empty = allow all)",
+            ConfigField::IpDenylist => "Comma-separated IPs/CIDRs to block",
             ConfigField::StartServer => "Loads model and starts the API server",
             ConfigField::StopServer => "Stops the running server",
             ConfigField::LoadAdditionalModel => "Load another model while server is running",
@@ -583,6 +714,37 @@ impl ServerPanelState {
                     .parse::<u32>()
                     .map_err(|_| "Must be a number (cores)")?;
             }
+            ConfigField::ParallelSlots => {
+                self.parallel_slots = value.parse::<u32>().map_err(|_| "Must be 1-16")?;
+            }
+            ConfigField::LoraPaths => {
+                self.lora_paths = value.to_string();
+            }
+            ConfigField::VectorStoreMaxDocs => {
+                self.vs_max_documents = value
+                    .parse::<usize>()
+                    .map_err(|_| "0 = unlimited, N = limit")?;
+            }
+            ConfigField::VectorStoreTopK => {
+                self.vs_top_k = value
+                    .parse::<usize>()
+                    .map_err(|_| "Must be a positive number")?;
+            }
+            ConfigField::OtelEndpoint => {
+                self.otel_endpoint = value.to_string();
+            }
+            ConfigField::OtelServiceName => {
+                self.otel_service_name = value.to_string();
+            }
+            ConfigField::OtelSampleRatio => {
+                self.otel_sample_ratio = value.parse::<f64>().map_err(|_| "0.0-1.0")?;
+            }
+            ConfigField::IpAllowlist => {
+                self.ip_allowlist = value.to_string();
+            }
+            ConfigField::IpDenylist => {
+                self.ip_denylist = value.to_string();
+            }
             _ => {}
         }
 
@@ -604,6 +766,8 @@ impl ServerPanelState {
             ConfigField::AutoResourceLimits => {
                 self.auto_resource_limits = !self.auto_resource_limits;
             }
+            ConfigField::VectorStoreEnabled => self.vs_enabled = !self.vs_enabled,
+            ConfigField::OtelEnabled => self.otel_enabled = !self.otel_enabled,
             _ => {}
         }
     }
@@ -643,8 +807,16 @@ impl ServerPanelState {
             reasoning_enabled: self.reasoning_enabled,
             reasoning_budget: self.reasoning_budget,
             mmproj_path: None,
-            lora_paths: Vec::new(),
-            parallel_slots: 1,
+            lora_paths: if self.lora_paths.is_empty() {
+                Vec::new()
+            } else {
+                self.lora_paths
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            },
+            parallel_slots: self.parallel_slots,
         }
     }
 
@@ -678,6 +850,45 @@ impl ServerPanelState {
         config.inference.ram_reserve_mb = self.ram_reserve_mb;
         config.inference.cpu_reserve_cores = self.cpu_reserve_cores;
         config.inference.auto_resource_limits = self.auto_resource_limits;
+        config.inference.lora_paths = if self.lora_paths.is_empty() {
+            Vec::new()
+        } else {
+            self.lora_paths
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        config.inference.parallel_slots = self.parallel_slots;
+        config.server.vector_store.enabled = self.vs_enabled;
+        config.server.vector_store.max_documents = self.vs_max_documents;
+        config.server.vector_store.default_top_k = self.vs_top_k;
+        config.server.otel.enabled = self.otel_enabled;
+        config.server.otel.endpoint = if self.otel_endpoint.is_empty() {
+            None
+        } else {
+            Some(self.otel_endpoint.clone())
+        };
+        config.server.otel.service_name = self.otel_service_name.clone();
+        config.server.otel.sample_ratio = self.otel_sample_ratio;
+        config.server.ip_allowlist = if self.ip_allowlist.is_empty() {
+            Vec::new()
+        } else {
+            self.ip_allowlist
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        config.server.ip_denylist = if self.ip_denylist.is_empty() {
+            Vec::new()
+        } else {
+            self.ip_denylist
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
         config
     }
 

@@ -8,8 +8,8 @@ use std::io::stdout;
 
 use athenas_core::{AppConfig, HardwareInfo, ModelRegistry, Result};
 use athenas_inference::{
-    Backend, BackendFactory, ChatMessage, ChatRequest, MessageContent, ModelLoadConfig, Role,
-    StreamChunk,
+    Backend, BackendFactory, ChatMessage, ChatRequest, MessageContent, ModelLoadConfig,
+    RemoteBackend, Role, StreamChunk,
 };
 
 use crate::chat::ChatState;
@@ -806,6 +806,15 @@ impl TuiApp {
                     );
                     return;
                 }
+            } else if let Some(ref state) = self.server_state {
+                // Detached server is running — use HTTP API
+                self.chat_state.add_message(
+                    "system",
+                    &format!(
+                        "Using remote server model '{}' ({}:{})",
+                        state.model, state.host, state.port
+                    ),
+                );
             } else {
                 self.chat_state
                     .add_message("system", "No model loaded. Press F2 to select a model.");
@@ -860,12 +869,24 @@ impl TuiApp {
             grammar: None,
         };
 
-        // Get a backend reference: prefer local backend, fall back to server's model manager
+        // Get a backend reference: prefer local backend, then in-process server, then detached server
         let backend_ref: Option<Box<dyn Backend>> = if let Some(ref b) = self.backend {
             Some(b.boxed_clone())
         } else if let Some(mgr) = &self.shared_model_manager {
             let m = mgr.lock().await;
             m.get(None).map(|b| b.boxed_clone())
+        } else if let Some(ref state) = self.server_state {
+            let api_key = if self.server_panel_state.api_key.is_empty() {
+                None
+            } else {
+                Some(self.server_panel_state.api_key.as_str())
+            };
+            Some(Box::new(RemoteBackend::new(
+                &state.host,
+                state.port,
+                &state.model,
+                api_key,
+            )))
         } else {
             None
         };

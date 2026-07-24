@@ -54,8 +54,8 @@ pub async fn run(
         reasoning_enabled: config.inference.reasoning_enabled,
         reasoning_budget: config.inference.reasoning_budget,
         mmproj_path: None,
-        lora_paths: Vec::new(),
-        parallel_slots: 1,
+        lora_paths: config.inference.lora_paths.clone(),
+        parallel_slots: config.inference.parallel_slots,
     };
 
     backend.load_model(load_config).await?;

@@ -49,6 +49,16 @@ pub struct InferenceConfig {
     /// When false, use the configured values as-is without auto-capping.
     #[serde(default = "default_true")]
     pub auto_resource_limits: bool,
+    /// LoRA adapter paths (comma-separated in config, stored as Vec)
+    #[serde(default)]
+    pub lora_paths: Vec<String>,
+    /// Number of parallel decoding slots for batched inference
+    #[serde(default = "default_parallel_slots_cfg")]
+    pub parallel_slots: u32,
+}
+
+fn default_parallel_slots_cfg() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +241,8 @@ impl Default for AppConfig {
                 ram_reserve_mb: 2048,
                 cpu_reserve_cores: 1,
                 auto_resource_limits: true,
+                lora_paths: Vec::new(),
+                parallel_slots: 1,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),
