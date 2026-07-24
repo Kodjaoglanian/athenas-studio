@@ -16,6 +16,7 @@ use crate::chat::ChatState;
 use crate::components;
 use crate::model_browser::{BrowserPhase, ModelBrowserState};
 use crate::model_list::ModelListState;
+use crate::server_manager;
 use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
 
@@ -78,6 +79,9 @@ pub struct TuiApp {
     // Background server state
     server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
     shared_model_manager: Option<athenas_server::SharedModelManager>,
+    // External server state (detached process)
+    server_state: Option<server_manager::ServerState>,
+    server_health_task: Option<tokio::task::JoinHandle<Option<server_manager::ServerState>>>,
     // Background model loading state (chat mode)
     is_loading_model: bool,
     model_load_task: Option<
@@ -106,6 +110,9 @@ impl TuiApp {
         let settings_state = SettingsState::new(config.clone());
         let server_panel_state = ServerPanelState::new(&config, hardware.clone());
 
+        // Spawn a background health check to detect an already-running server
+        let health_task = tokio::spawn(server_manager::check_running());
+
         Self {
             config,
             hardware,
@@ -120,6 +127,8 @@ impl TuiApp {
             download_task: None,
             server_handle: None,
             shared_model_manager: None,
+            server_state: None,
+            server_health_task: Some(health_task),
             is_loading_model: false,
             model_load_task: None,
             loading_spinner: 0,
@@ -172,6 +181,9 @@ impl TuiApp {
 
             // Poll server task status
             self.poll_server_status().await;
+
+            // Poll server health check (detect external running server)
+            self.poll_server_health().await;
 
             // Poll model loading task (chat mode)
             self.poll_model_loading().await;
@@ -1280,41 +1292,104 @@ impl TuiApp {
             }
         };
 
-        self.server_panel_state.phase = ServerPhase::LoadingModel;
-        self.server_panel_state.status_message = Some(format!("Loading model: {}...", model_path));
+        // Get model name for display
+        let model_name = self
+            .server_panel_state
+            .models
+            .get(self.server_panel_state.model_selected)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| model_path.clone());
 
-        let backend_type = self.server_panel_state.backend;
-        let hardware = self.server_panel_state.hardware.clone();
-        let load_config = self.server_panel_state.build_load_config(&model_path);
+        self.server_panel_state.phase = ServerPhase::LoadingModel;
+        self.server_panel_state.status_message =
+            Some(format!("Starting server with model: {}...", model_name));
+
+        // Save server config so it persists across restarts
         let server_config = self.server_panel_state.build_app_config(&self.config);
+        if let Err(e) = server_config.save() {
+            tracing::warn!("Failed to save server config: {}", e);
+        }
+        self.config = server_config;
+
         let host = self.server_panel_state.host.clone();
         let port = self.server_panel_state.port;
+        let backend_str = match self.server_panel_state.backend {
+            athenas_core::BackendType::Auto => "auto",
+            athenas_core::BackendType::LlamaCpp => "llama.cpp",
+            athenas_core::BackendType::Vllm => "vllm",
+        };
+        let gpu_layers = self.server_panel_state.gpu_layers;
+        let context_size = self.server_panel_state.context_size;
+        let max_concurrent = Some(self.server_panel_state.max_concurrent);
+        let rate_limit = Some(self.server_panel_state.rate_limit);
+        let timeout_secs = Some(self.server_panel_state.timeout_secs);
+        let max_body_size_mb = Some(self.server_panel_state.max_body_size);
 
-        let task = tokio::spawn(async move {
-            let mut backend = BackendFactory::create(backend_type, &hardware)?;
-            backend.load_model(load_config).await?;
+        // Start the server as a detached child process
+        match server_manager::start_detached(
+            &model_path,
+            &host,
+            port,
+            backend_str,
+            gpu_layers,
+            context_size,
+            max_concurrent,
+            rate_limit,
+            timeout_secs,
+            max_body_size_mb,
+        ) {
+            Ok(state) => {
+                self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.status_message =
+                    Some(format!("Server started (PID: {})", state.pid));
+                self.server_panel_state.loaded_model_name = Some(model_name.clone());
+                self.server_panel_state.loaded_backend_name = Some(backend_str.to_string());
+                self.server_state = Some(state);
 
-            let api_server = athenas_server::ApiServer::new(server_config, backend);
-            let model_mgr = api_server.model_manager();
+                // Update chat state to show server is available
+                self.chat_state.current_model = Some(model_name);
+                self.chat_state.current_backend = Some(backend_str.to_string());
+            }
+            Err(e) => {
+                self.server_panel_state.phase = ServerPhase::Error;
+                self.server_panel_state.status_message =
+                    Some(format!("Failed to start server: {}", e));
+            }
+        }
+    }
 
-            // Start the server in the background
-            let server_host = host.clone();
-            let server_port = port;
-            let server_handle =
-                tokio::spawn(async move { api_server.start(&server_host, server_port).await });
+    async fn poll_server_health(&mut self) {
+        let task = match self.server_health_task.take() {
+            Some(t) => t,
+            None => return,
+        };
+        if !task.is_finished() {
+            self.server_health_task = Some(task);
+            return;
+        }
 
-            Ok::<
-                (
-                    tokio::task::JoinHandle<athenas_core::Result<()>>,
-                    athenas_server::SharedModelManager,
-                    String,
-                    u16,
-                ),
-                athenas_core::AthenasError,
-            >((server_handle, model_mgr, host, port))
-        });
-
-        self.server_start_task = Some(task);
+        match task.await {
+            Ok(Some(state)) => {
+                // A running server was detected
+                self.server_state = Some(state.clone());
+                self.server_panel_state.phase = ServerPhase::Running;
+                self.server_panel_state.server_url =
+                    Some(format!("http://{}:{}", state.host, state.port));
+                self.server_panel_state.loaded_model_name = Some(state.model.clone());
+                self.server_panel_state.loaded_backend_name = Some(state.backend.clone());
+                self.server_panel_state.status_message =
+                    Some(format!("Server running (PID: {})", state.pid));
+                self.chat_state.current_model = Some(state.model);
+                self.chat_state.current_backend = Some(state.backend);
+            }
+            Ok(None) => {
+                // No running server found — that's fine
+            }
+            Err(e) => {
+                tracing::warn!("Server health check task failed: {}", e);
+            }
+        }
     }
 
     async fn poll_server_start_task(&mut self) {
@@ -1380,7 +1455,17 @@ impl TuiApp {
 
     fn stop_server(&mut self) {
         if self.server_panel_state.phase == ServerPhase::Running {
-            // Abort the server task
+            // Stop the detached server process by PID
+            if let Some(ref state) = self.server_state {
+                match server_manager::stop_by_pid(state.pid) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.server_panel_state.status_message =
+                            Some(format!("Error stopping server: {}", e));
+                    }
+                }
+            }
+            // Also abort any in-process server handle (legacy path)
             if let Some(handle) = self.server_handle.take() {
                 handle.abort();
             }
@@ -1402,6 +1487,7 @@ impl TuiApp {
         self.server_panel_state.unload_model_selected = 0;
         self.server_panel_state.default_model_selected = 0;
         self.shared_model_manager = None;
+        self.server_state = None;
         self.server_panel_state.status_message = Some("Server stopped".to_string());
 
         // Clear chat model info if chat was using server model

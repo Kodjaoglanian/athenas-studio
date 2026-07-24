@@ -22,3 +22,6 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+dirs = { workspace = true }
+libc = "0.2"
