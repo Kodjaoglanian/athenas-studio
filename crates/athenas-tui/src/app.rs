@@ -1340,12 +1340,34 @@ impl TuiApp {
         ) {
             Ok(state) => {
                 self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
-                self.server_panel_state.phase = ServerPhase::Running;
+                // Keep LoadingModel phase — the detached process is still loading the model.
+                // We'll poll the health endpoint until it responds, then switch to Running.
                 self.server_panel_state.status_message =
-                    Some(format!("Server started (PID: {})", state.pid));
+                    Some(format!("Loading model (PID: {})...", state.pid));
                 self.server_panel_state.loaded_model_name = Some(model_name.clone());
                 self.server_panel_state.loaded_backend_name = Some(backend_str.to_string());
                 self.server_state = Some(state);
+
+                // Spawn a background task to poll the health endpoint
+                let health_host = host.clone();
+                let health_port = port;
+                let health_state = self.server_state.clone();
+                let health_task = tokio::spawn(async move {
+                    let url = format!("http://{}:{}/v1/health", health_host, health_port);
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(3))
+                        .build()
+                        .ok()?;
+                    // Poll for up to 5 minutes (300 attempts * 1s interval)
+                    for _ in 0..300 {
+                        if client.get(&url).send().await.is_ok() {
+                            return health_state;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    None
+                });
+                self.server_health_task = Some(health_task);
 
                 // Update chat state to show server is available
                 self.chat_state.current_model = Some(model_name);
@@ -1384,7 +1406,17 @@ impl TuiApp {
                 self.chat_state.current_backend = Some(state.backend);
             }
             Ok(None) => {
-                // No running server found — that's fine
+                // No running server found
+                if self.server_panel_state.phase == ServerPhase::LoadingModel {
+                    // We were waiting for a server we started — it timed out
+                    self.server_panel_state.phase = ServerPhase::Error;
+                    self.server_panel_state.status_message = Some(
+                        "Server failed to start within 5 minutes. Check if the model is valid."
+                            .to_string(),
+                    );
+                    self.server_state = None;
+                }
+                // Otherwise it was just a startup check — no server running, that's fine
             }
             Err(e) => {
                 tracing::warn!("Server health check task failed: {}", e);
@@ -1470,9 +1502,17 @@ impl TuiApp {
                 handle.abort();
             }
         } else if self.server_panel_state.phase == ServerPhase::LoadingModel {
-            // Cancel the server start task
+            // Cancel the server start task (legacy in-process path)
             if let Some(task) = self.server_start_task.take() {
                 task.abort();
+            }
+            // Cancel the health check polling task
+            if let Some(task) = self.server_health_task.take() {
+                task.abort();
+            }
+            // Kill the detached process if it was started
+            if let Some(ref state) = self.server_state {
+                let _ = server_manager::stop_by_pid(state.pid);
             }
         } else {
             self.server_panel_state.status_message = Some("Server is not running".to_string());
