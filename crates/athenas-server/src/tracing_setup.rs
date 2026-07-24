@@ -1,9 +1,9 @@
 use athenas_core::OtelConfig;
 use opentelemetry::trace::TracerProvider as TracerProviderTrait;
 use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::Sampler;
 use opentelemetry_semantic_conventions::resource::SERVICE_NAME;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -16,8 +16,7 @@ pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
         // Just initialize basic tracing
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("info")),
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
             )
             .try_init();
         return None;

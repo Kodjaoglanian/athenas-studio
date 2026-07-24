@@ -77,20 +77,18 @@ impl VectorStore {
         }
 
         match std::fs::read_to_string(&self.storage_path) {
-            Ok(content) => {
-                match serde_json::from_str::<Vec<VectorDocument>>(&content) {
-                    Ok(docs) => {
-                        let mut map = self.documents.blocking_write();
-                        for doc in docs {
-                            map.insert(doc.id.clone(), doc);
-                        }
-                        info!("Loaded {} documents from vector store", map.len());
+            Ok(content) => match serde_json::from_str::<Vec<VectorDocument>>(&content) {
+                Ok(docs) => {
+                    let mut map = self.documents.blocking_write();
+                    for doc in docs {
+                        map.insert(doc.id.clone(), doc);
                     }
-                    Err(e) => {
-                        warn!("Failed to parse vector store data: {}", e);
-                    }
+                    info!("Loaded {} documents from vector store", map.len());
                 }
-            }
+                Err(e) => {
+                    warn!("Failed to parse vector store data: {}", e);
+                }
+            },
             Err(e) => {
                 warn!("Failed to read vector store file: {}", e);
             }
@@ -159,7 +157,10 @@ impl VectorStore {
             let mut map = self.documents.write().await;
             for (id, content, embedding, metadata) in documents {
                 // Check limit
-                if self.config.max_documents > 0 && map.len() >= self.config.max_documents && !map.contains_key(&id) {
+                if self.config.max_documents > 0
+                    && map.len() >= self.config.max_documents
+                    && !map.contains_key(&id)
+                {
                     warn!("Skipping document {} - max limit reached", id);
                     continue;
                 }

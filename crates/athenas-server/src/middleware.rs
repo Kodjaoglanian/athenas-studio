@@ -90,7 +90,10 @@ pub struct IpFilterConfig {
 
 impl IpFilterConfig {
     pub fn new(allowlist: Vec<String>, denylist: Vec<String>) -> Self {
-        Self { allowlist, denylist }
+        Self {
+            allowlist,
+            denylist,
+        }
     }
 
     /// Check if an IP address is allowed.
@@ -191,11 +194,7 @@ pub async fn ip_filter_middleware(
 
     if !filter.is_allowed(&ip) {
         tracing::warn!("IP {} blocked by filter", ip);
-        return (
-            StatusCode::FORBIDDEN,
-            "Access denied: IP not allowed.",
-        )
-            .into_response();
+        return (StatusCode::FORBIDDEN, "Access denied: IP not allowed.").into_response();
     }
 
     next.run(req).await

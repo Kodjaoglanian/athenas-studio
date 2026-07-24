@@ -26,7 +26,9 @@ use athenas_inference::{
 use crate::api_keys::{AuthResult, SharedApiKeyManager};
 use crate::audit_log::{AuditEntry, SharedAuditLogger};
 use crate::metrics::{metrics_middleware, SharedMetrics};
-use crate::middleware::{ip_filter_middleware, rate_limit_middleware, IpFilterConfig, SharedRateLimiter};
+use crate::middleware::{
+    ip_filter_middleware, rate_limit_middleware, IpFilterConfig, SharedRateLimiter,
+};
 use crate::model_manager::SharedModelManager;
 use crate::model_router::SharedModelRouter;
 use crate::session_manager::{SessionInfo, SharedSessionManager};
@@ -112,7 +114,10 @@ pub fn create_router(
         .route("/v1/vector/add-batch", post(vs_add_batch))
         .route("/v1/vector/search", post(vs_search))
         .route("/v1/vector/documents", get(vs_list_documents))
-        .route("/v1/vector/documents/:id", get(vs_get_document).delete(vs_delete_document))
+        .route(
+            "/v1/vector/documents/:id",
+            get(vs_get_document).delete(vs_delete_document),
+        )
         .route("/v1/vector/clear", post(vs_clear))
         .route("/v1/vector/stats", get(vs_stats))
         .route("/v1/health", get(health))
@@ -131,10 +136,8 @@ pub fn create_router(
     // IP filter (only if allowlist or denylist is configured)
     let has_ip_filter = !config.ip_allowlist.is_empty() || !config.ip_denylist.is_empty();
     if has_ip_filter {
-        let ip_filter = IpFilterConfig::new(
-            config.ip_allowlist.clone(),
-            config.ip_denylist.clone(),
-        );
+        let ip_filter =
+            IpFilterConfig::new(config.ip_allowlist.clone(), config.ip_denylist.clone());
         router = router.layer(from_fn_with_state(ip_filter, ip_filter_middleware));
     }
 
@@ -387,7 +390,8 @@ async fn chat_completions(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
+    {
         AuthResult::NoAuthRequired => None,
         AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
@@ -645,8 +649,13 @@ async fn chat_completions(
                 if let Some(ref key_id) = auth_key_id {
                     if let Some(ref mgr_arc) = state.api_key_manager {
                         let mut mgr = mgr_arc.lock().await;
-                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
-                            mgr.record_usage(&key, resp.stats.tokens_prompt as u64, resp.stats.tokens_generated as u64);
+                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
+                        {
+                            mgr.record_usage(
+                                &key,
+                                resp.stats.tokens_prompt as u64,
+                                resp.stats.tokens_generated as u64,
+                            );
                         }
                     }
                 }
@@ -877,7 +886,8 @@ async fn completions(
     Json(req): Json<CompletionRequestBody>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
+    {
         AuthResult::NoAuthRequired => None,
         AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
@@ -1047,8 +1057,13 @@ async fn completions(
                 if let Some(ref key_id) = auth_key_id {
                     if let Some(ref mgr_arc) = state.api_key_manager {
                         let mut mgr = mgr_arc.lock().await;
-                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
-                            mgr.record_usage(&key, resp.stats.tokens_prompt as u64, resp.stats.tokens_generated as u64);
+                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
+                        {
+                            mgr.record_usage(
+                                &key,
+                                resp.stats.tokens_prompt as u64,
+                                resp.stats.tokens_generated as u64,
+                            );
                         }
                     }
                 }
@@ -1670,7 +1685,8 @@ async fn embeddings(
     Json(req): Json<EmbeddingsApiRequest>,
 ) -> Response {
     let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await {
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
+    {
         AuthResult::NoAuthRequired => None,
         AuthResult::Allowed { key_id, .. } => Some(key_id),
         AuthResult::Unauthorized => {
@@ -2234,18 +2250,25 @@ async fn vs_add_document(
 
     let vs = match &state.vector_store {
         Some(v) => v,
-        None => return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Vector store not enabled"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Vector store not enabled"})),
+            )
+                .into_response()
+        }
     };
 
-    match vs.add_document(req.id, req.content, req.embedding, req.metadata).await {
+    match vs
+        .add_document(req.id, req.content, req.embedding, req.metadata)
+        .await
+    {
         Ok(doc) => Json(doc).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2265,23 +2288,30 @@ async fn vs_add_batch(
 
     let vs = match &state.vector_store {
         Some(v) => v,
-        None => return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Vector store not enabled"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Vector store not enabled"})),
+            )
+                .into_response()
+        }
     };
 
-    let docs: Vec<(String, String, Vec<f32>, Option<serde_json::Value>)> = req.documents
+    let docs: Vec<(String, String, Vec<f32>, Option<serde_json::Value>)> = req
+        .documents
         .into_iter()
         .map(|d| (d.id, d.content, d.embedding, d.metadata))
         .collect();
 
     match vs.add_documents(docs).await {
-        Ok(added) => Json(serde_json::json!({"added": added.len(), "documents": added})).into_response(),
+        Ok(added) => {
+            Json(serde_json::json!({"added": added.len(), "documents": added})).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2302,10 +2332,13 @@ async fn vs_search(
 
     let vs = match &state.vector_store {
         Some(v) => v,
-        None => return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Vector store not enabled"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Vector store not enabled"})),
+            )
+                .into_response()
+        }
     };
 
     let top_k = req.top_k.unwrap_or(5);
@@ -2313,20 +2346,20 @@ async fn vs_search(
     Json(serde_json::json!({"results": results, "count": results.len()})).into_response()
 }
 
-async fn vs_list_documents(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn vs_list_documents(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let vs = match &state.vector_store {
         Some(v) => v,
-        None => return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Vector store not enabled"})),
-        ).into_response(),
+        None => {
+            return (
+                StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({"error": "Vector store not enabled"})),
+            )
+                .into_response()
+        }
     };
 
     let docs = vs.list_documents().await;
@@ -2352,7 +2385,8 @@ async fn vs_get_document(
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Document not found"})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -2376,14 +2410,12 @@ async fn vs_delete_document(
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Document not found"})),
-        ).into_response()
+        )
+            .into_response()
     }
 }
 
-async fn vs_clear(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -2397,10 +2429,7 @@ async fn vs_clear(
     Json(serde_json::json!({"status": "cleared"})).into_response()
 }
 
-async fn vs_stats(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn vs_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if !check_auth(&headers, &state.api_key) {
         return StatusCode::UNAUTHORIZED.into_response();
     }

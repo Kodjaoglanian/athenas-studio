@@ -155,9 +155,12 @@ impl ApiServer {
             .await
             .map_err(|e| athenas_core::AthenasError::Server(format!("Failed to bind: {}", e)))?;
 
-        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
-            .map_err(|e| athenas_core::AthenasError::Server(format!("Server error: {}", e)))?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .map_err(|e| athenas_core::AthenasError::Server(format!("Server error: {}", e)))?;
 
         Ok(())
     }
