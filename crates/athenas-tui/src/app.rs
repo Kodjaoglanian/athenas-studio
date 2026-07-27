@@ -1295,6 +1295,24 @@ impl TuiApp {
                         self.unload_model_action().await;
                     } else if field == ConfigField::SetDefaultModel {
                         self.set_default_model_action().await;
+                    } else if field == ConfigField::GenerateApiKey {
+                        self.server_panel_state.generate_api_key();
+                        let cfg = self.server_panel_state.build_app_config(&self.config);
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!("Failed to save config: {}", e);
+                        }
+                        self.config = cfg;
+                        self.server_panel_state.status_message =
+                            Some("API key generated and saved".to_string());
+                    } else if field == ConfigField::ClearApiKey {
+                        self.server_panel_state.clear_api_key();
+                        let cfg = self.server_panel_state.build_app_config(&self.config);
+                        if let Err(e) = cfg.save() {
+                            tracing::warn!("Failed to save config: {}", e);
+                        }
+                        self.config = cfg;
+                        self.server_panel_state.status_message =
+                            Some("API key cleared — auth disabled".to_string());
                     }
                 }
                 KeyCode::Esc => {

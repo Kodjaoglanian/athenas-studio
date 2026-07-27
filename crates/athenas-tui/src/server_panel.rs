@@ -67,6 +67,8 @@ pub enum ConfigField {
     IpAllowlist,
     IpDenylist,
     // Actions
+    GenerateApiKey,
+    ClearApiKey,
     StartServer,
     StopServer,
     LoadAdditionalModel,
@@ -81,6 +83,8 @@ impl ConfigField {
             ConfigField::Host,
             ConfigField::Port,
             ConfigField::ApiKey,
+            ConfigField::GenerateApiKey,
+            ConfigField::ClearApiKey,
             ConfigField::MaxConcurrent,
             ConfigField::RateLimit,
             ConfigField::TimeoutSecs,
@@ -127,6 +131,8 @@ impl ConfigField {
             ConfigField::Host => "Host",
             ConfigField::Port => "Port",
             ConfigField::ApiKey => "API Key",
+            ConfigField::GenerateApiKey => "Generate API Key",
+            ConfigField::ClearApiKey => "Clear API Key",
             ConfigField::MaxConcurrent => "Max Concurrent",
             ConfigField::RateLimit => "Rate Limit (req/s)",
             ConfigField::TimeoutSecs => "Timeout (secs)",
@@ -173,6 +179,8 @@ impl ConfigField {
             ConfigField::Host
             | ConfigField::Port
             | ConfigField::ApiKey
+            | ConfigField::GenerateApiKey
+            | ConfigField::ClearApiKey
             | ConfigField::MaxConcurrent
             | ConfigField::RateLimit
             | ConfigField::TimeoutSecs
@@ -216,6 +224,9 @@ impl ConfigField {
         !matches!(
             self,
             ConfigField::ModelSelection
+                | ConfigField::ApiKey
+                | ConfigField::GenerateApiKey
+                | ConfigField::ClearApiKey
                 | ConfigField::StartServer
                 | ConfigField::StopServer
                 | ConfigField::LoadAdditionalModel
@@ -241,7 +252,9 @@ impl ConfigField {
     pub fn is_action(&self) -> bool {
         matches!(
             self,
-            ConfigField::StartServer
+            ConfigField::GenerateApiKey
+                | ConfigField::ClearApiKey
+                | ConfigField::StartServer
                 | ConfigField::StopServer
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
@@ -432,9 +445,23 @@ impl ServerPanelState {
             ConfigField::Port => self.port.to_string(),
             ConfigField::ApiKey => {
                 if self.api_key.is_empty() {
-                    "(none)".to_string()
+                    "(none — no auth)".to_string()
                 } else {
                     "[hidden]".to_string()
+                }
+            }
+            ConfigField::GenerateApiKey => {
+                if self.api_key.is_empty() {
+                    "Press Enter to generate".to_string()
+                } else {
+                    "Press Enter to regenerate".to_string()
+                }
+            }
+            ConfigField::ClearApiKey => {
+                if self.api_key.is_empty() {
+                    "(no key set)".to_string()
+                } else {
+                    "Press Enter to remove key".to_string()
                 }
             }
             ConfigField::MaxConcurrent => self.max_concurrent.to_string(),
@@ -551,7 +578,9 @@ impl ServerPanelState {
             ConfigField::ModelSelection => "Up/Down to select from local models",
             ConfigField::Host => "0.0.0.0 for all interfaces, 127.0.0.1 for local",
             ConfigField::Port => "Port number (e.g. 8080)",
-            ConfigField::ApiKey => "Leave empty for no auth, or set a secret key",
+            ConfigField::ApiKey => "Auto-generated key shown here. Use Generate/Clear below",
+            ConfigField::GenerateApiKey => "Enter to generate a random secure API key",
+            ConfigField::ClearApiKey => "Enter to remove the API key (disables auth)",
             ConfigField::MaxConcurrent => "Max simultaneous inference requests",
             ConfigField::RateLimit => "Token bucket: requests per second per IP",
             ConfigField::TimeoutSecs => "Kill stuck requests after N seconds",
@@ -630,9 +659,6 @@ impl ServerPanelState {
             }
             ConfigField::Port => {
                 self.port = value.parse::<u16>().map_err(|_| "Invalid port number")?;
-            }
-            ConfigField::ApiKey => {
-                self.api_key = value;
             }
             ConfigField::MaxConcurrent => {
                 self.max_concurrent = value
@@ -792,6 +818,31 @@ impl ServerPanelState {
         self.models
             .get(self.model_selected)
             .map(|m| m.file_path.to_string_lossy().to_string())
+    }
+
+    /// Generate a random 32-byte hex API key
+    pub fn generate_api_key(&mut self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut bytes = [0u8; 32];
+        // Simple PRNG seeded by current time — sufficient for API key generation
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let mut state = seed;
+        for b in bytes.iter_mut() {
+            // xorshift64
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *b = (state & 0xFF) as u8;
+        }
+        self.api_key = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    }
+
+    /// Clear the API key (disable auth)
+    pub fn clear_api_key(&mut self) {
+        self.api_key.clear();
     }
 
     pub fn build_load_config(&self, model_path: &str) -> ModelLoadConfig {

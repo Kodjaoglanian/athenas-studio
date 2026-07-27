@@ -1043,6 +1043,18 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                         .min(state.loaded_models.len() - 1)];
                     (Color::Cyan, format!("★ Default: {}", m.name))
                 }
+            } else if *field == ConfigField::GenerateApiKey {
+                if state.api_key.is_empty() {
+                    (Color::Green, "🔑 Generate API Key".to_string())
+                } else {
+                    (Color::Yellow, "🔑 Regenerate API Key".to_string())
+                }
+            } else if *field == ConfigField::ClearApiKey {
+                if state.api_key.is_empty() {
+                    (Color::DarkGray, "○ No key set".to_string())
+                } else {
+                    (Color::Red, "✖ Clear API Key".to_string())
+                }
             } else {
                 (Color::Gray, String::new())
             };
@@ -1067,6 +1079,8 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                     ConfigField::SetDefaultModel => {
                         "Left/Right to pick model, Enter to set default"
                     }
+                    ConfigField::GenerateApiKey => "Enter to generate a random secure API key",
+                    ConfigField::ClearApiKey => "Enter to remove the API key (disables auth)",
                     _ => "",
                 };
                 if !hint.is_empty() {

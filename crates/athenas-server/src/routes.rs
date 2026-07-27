@@ -195,6 +195,16 @@ async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&s
         return AuthResult::NoAuthRequired;
     }
 
+    // If no static key and key manager has no keys, allow all
+    if state.api_key.is_none() {
+        if let Some(ref mgr_arc) = state.api_key_manager {
+            let mgr = mgr_arc.lock().await;
+            if mgr.list_keys().is_empty() {
+                return AuthResult::NoAuthRequired;
+            }
+        }
+    }
+
     let token = match extract_bearer(headers) {
         Some(t) => t,
         None => return AuthResult::Unauthorized,
