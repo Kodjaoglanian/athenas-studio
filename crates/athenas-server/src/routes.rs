@@ -508,43 +508,76 @@ async fn chat_completions(
         vec![model_id.clone()]
     };
 
-    let mgr = state.model_manager.lock().await;
+    // Resolve a backend Arc under a SHORT lock, then release it so inference
+    // never blocks other requests on the model manager mutex.
+    //
+    // Two passes: first respect the router's circuit breaker, then (to avoid
+    // spurious 404s while a loaded model is in cooldown) retry ignoring it.
+    let (backend, resolved_model_id, _tried_models) = {
+        let mgr = state.model_manager.lock().await;
 
-    // Try each model in the fallback sequence
-    let mut backend: Option<&dyn Backend> = None;
-    let mut resolved_model_id = String::new();
-    let mut tried_models = Vec::new();
+        let mut backend: Option<Arc<dyn Backend>> = None;
+        let mut resolved = String::new();
+        let mut tried = Vec::new();
 
-    for mid in &model_sequence {
-        tried_models.push(mid.clone());
-        if let Some(ref router_arc) = state.model_router {
-            let router = router_arc.lock().await;
-            if !router.is_healthy(mid) {
-                tracing::warn!("Skipping unhealthy model: {}", mid);
-                continue;
+        for ignore_health in [false, true] {
+            for mid in &model_sequence {
+                if !ignore_health {
+                    tried.push(mid.clone());
+                    if let Some(ref router_arc) = state.model_router {
+                        let router = router_arc.lock().await;
+                        if !router.is_healthy(mid) {
+                            tracing::warn!("Model '{}' in cooldown, trying fallbacks", mid);
+                            continue;
+                        }
+                    }
+                }
+                if let Some(b) = mgr.get(Some(mid.as_str())) {
+                    backend = Some(b);
+                    resolved = mid.clone();
+                    break;
+                }
+            }
+            if backend.is_some() {
+                break;
             }
         }
-        if let Some(b) = mgr.get(Some(mid.as_str())) {
-            backend = Some(b);
-            resolved_model_id = mid.clone();
-            break;
-        }
-    }
 
-    let backend = match backend {
-        Some(b) => b,
-        None => {
-            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("No available model in chain. Tried: {:?}. Available models: {:?}",
-                        tried_models, available)
-                })),
-            )
-                .into_response();
+        // If the explicitly requested model doesn't exist, serve the default
+        // model instead of returning 404 (OpenAI clients often send arbitrary
+        // model names; a loaded default model should answer).
+        if backend.is_none() {
+            if let Some(b) = mgr.get(None) {
+                if let Some(def_id) = mgr.default_id() {
+                    if !model_id.is_empty() {
+                        tracing::warn!(
+                            "Requested model '{}' not loaded; serving default '{}'",
+                            model_id,
+                            def_id
+                        );
+                    }
+                    resolved = def_id.to_string();
+                }
+                backend = Some(b);
+            }
+        }
+
+        match backend {
+            Some(b) => (b, resolved, tried),
+            None => {
+                let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("No model loaded. Tried: {:?}. Available models: {:?}",
+                            tried, available)
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
+    // model_manager lock is now released — inference below runs lock-free.
 
     if chat_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
@@ -552,7 +585,6 @@ async fn chat_completions(
             .model_info()
             .map(|i| i.name.clone())
             .unwrap_or_default();
-        drop(mgr);
 
         // Append new messages to session at stream start
         if let Some(ref sid) = session_id {
@@ -566,20 +598,17 @@ async fn chat_completions(
             }
         }
 
-        let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
-        let model_id_clone = model_id.clone();
         let session_mgr_clone = state.session_manager.clone();
         let session_id_clone = session_id.clone();
         let should_save_response = req.save_response;
         let api_key_mgr_clone = state.api_key_manager.clone();
         let auth_key_id_clone = auth_key_id.clone();
+        // Spawn the inference on the resolved backend Arc — no manager lock is
+        // held while streaming, so other requests are never blocked.
         tokio::spawn(async move {
-            let m = mgr2.lock().await;
-            if let Some(b) = m.get(Some(model_id_clone.as_str())) {
-                if let Err(e) = b.chat_stream(chat_req, tx).await {
-                    tracing::error!("Stream error: {}", e);
-                }
+            if let Err(e) = backend.chat_stream(chat_req, tx).await {
+                tracing::error!("Stream error: {}", e);
             }
         });
 
@@ -782,7 +811,10 @@ async fn chat_completions(
                             continue;
                         }
                     }
-                    let next_backend = mgr.get(Some(next_model.as_str()));
+                    let next_backend = {
+                        let mgr = state.model_manager.lock().await;
+                        mgr.get(Some(next_model.as_str()))
+                    };
                     if let Some(next_b) = next_backend {
                         let mut fb_req = chat_req.clone();
                         fb_req.model = next_model.clone();
@@ -966,21 +998,43 @@ async fn completions(
 
     let model_id = comp_req.model.clone();
 
-    let mgr = state.model_manager.lock().await;
-    let backend = match mgr.get(Some(model_id.as_str())) {
-        Some(b) => b,
-        None => {
-            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("Model '{}' not loaded. Available models: {:?}",
-                        model_id, available)
-                })),
-            )
-                .into_response();
+    // Resolve backend Arc under a SHORT lock, then release it so inference
+    // never blocks other requests on the model manager mutex.
+    let backend = {
+        let mgr = state.model_manager.lock().await;
+
+        // Try the requested model first, then fall back to the default.
+        let backend = mgr.get(Some(model_id.as_str())).or_else(|| mgr.get(None));
+
+        match backend {
+            Some(b) => {
+                let resolved = b
+                    .model_info()
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| model_id.clone());
+                if model_id != resolved && !model_id.is_empty() {
+                    tracing::warn!(
+                        "Completions: requested model '{}' not loaded; serving default '{}'",
+                        model_id,
+                        resolved
+                    );
+                }
+                b
+            }
+            None => {
+                let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("No model loaded. Requested: '{}'. Available models: {:?}",
+                            model_id, available)
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
+    // model_manager lock is now released — inference below runs lock-free.
 
     if comp_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
@@ -988,19 +1042,15 @@ async fn completions(
             .model_info()
             .map(|i| i.name.clone())
             .unwrap_or_default();
-        drop(mgr);
 
-        let mgr2 = state.model_manager.clone();
         let metrics = state.metrics.clone();
-        let model_id_clone = model_id.clone();
         let api_key_mgr_clone = state.api_key_manager.clone();
         let auth_key_id_clone = auth_key_id.clone();
+        // Spawn the inference on the resolved backend Arc — no manager lock is
+        // held while streaming, so other requests are never blocked.
         tokio::spawn(async move {
-            let m = mgr2.lock().await;
-            if let Some(b) = m.get(Some(model_id_clone.as_str())) {
-                if let Err(e) = b.complete_stream(comp_req, tx).await {
-                    tracing::error!("Stream error: {}", e);
-                }
+            if let Err(e) = backend.complete_stream(comp_req, tx).await {
+                tracing::error!("Stream error: {}", e);
             }
         });
 
@@ -1771,21 +1821,43 @@ async fn embeddings(
 
     let model_id = req.model.clone().unwrap_or_default();
 
-    let mgr = state.model_manager.lock().await;
-    let backend = match mgr.get(Some(model_id.as_str())) {
-        Some(b) => b,
-        None => {
-            let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("Model '{}' not loaded. Available models: {:?}",
-                        model_id, available)
-                })),
-            )
-                .into_response();
+    // Resolve backend Arc under a SHORT lock, then release it so inference
+    // never blocks other requests on the model manager mutex.
+    let (backend, resolved_model_id) = {
+        let mgr = state.model_manager.lock().await;
+
+        // Try the requested model first, then fall back to the default.
+        let backend = mgr.get(Some(model_id.as_str())).or_else(|| mgr.get(None));
+
+        match backend {
+            Some(b) => {
+                let resolved = b
+                    .model_info()
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| model_id.clone());
+                if model_id != resolved && !model_id.is_empty() {
+                    tracing::warn!(
+                        "Embeddings: requested model '{}' not loaded; serving default '{}'",
+                        model_id,
+                        resolved
+                    );
+                }
+                (b, resolved)
+            }
+            None => {
+                let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("No model loaded. Requested: '{}'. Available models: {:?}",
+                            model_id, available)
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
+    // model_manager lock is now released — inference below runs lock-free.
 
     let embedding_input = match &req.input {
         serde_json::Value::String(s) => athenas_inference::EmbeddingInput::Single(s.clone()),
@@ -1827,7 +1899,7 @@ async fn embeddings(
         Ok(resp) => {
             state
                 .metrics
-                .record_tokens(&model_id, resp.usage.prompt_tokens, 0);
+                .record_tokens(&resolved_model_id, resp.usage.prompt_tokens, 0);
 
             // Record token usage for API key
             if let Some(ref key_id) = auth_key_id {

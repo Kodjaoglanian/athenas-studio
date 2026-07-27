@@ -36,6 +36,7 @@ impl VllmBackend {
             server_port: 0,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap(),
         }
