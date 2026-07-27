@@ -19,6 +19,19 @@ pub struct LoadedModelInfo {
     pub is_default: bool,
 }
 
+/// Info about a managed API key, fetched from the running server.
+#[derive(Debug, Clone)]
+pub struct ApiKeyInfo {
+    pub key_id: String,
+    pub api_key: String,
+    pub name: String,
+    pub active: bool,
+    pub rate_limit_per_minute: u32,
+    pub daily_token_limit: u64,
+    pub allowed_models: Vec<String>,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigField {
     // Model selection
@@ -74,6 +87,11 @@ pub enum ConfigField {
     LoadAdditionalModel,
     UnloadModel,
     SetDefaultModel,
+    // API Key Management (multi-tenant)
+    ApiKeysList,
+    CreateApiKey,
+    RevokeApiKey,
+    DeleteApiKey,
 }
 
 impl ConfigField {
@@ -122,6 +140,10 @@ impl ConfigField {
             ConfigField::LoadAdditionalModel,
             ConfigField::UnloadModel,
             ConfigField::SetDefaultModel,
+            ConfigField::ApiKeysList,
+            ConfigField::CreateApiKey,
+            ConfigField::RevokeApiKey,
+            ConfigField::DeleteApiKey,
         ]
     }
 
@@ -170,6 +192,10 @@ impl ConfigField {
             ConfigField::LoadAdditionalModel => "Load Additional Model",
             ConfigField::UnloadModel => "Unload Model",
             ConfigField::SetDefaultModel => "Set Default Model",
+            ConfigField::ApiKeysList => "API Keys",
+            ConfigField::CreateApiKey => "Create API Key",
+            ConfigField::RevokeApiKey => "Revoke API Key",
+            ConfigField::DeleteApiKey => "Delete API Key",
         }
     }
 
@@ -217,6 +243,10 @@ impl ConfigField {
             | ConfigField::LoadAdditionalModel
             | ConfigField::UnloadModel
             | ConfigField::SetDefaultModel => "ACTION",
+            ConfigField::ApiKeysList
+            | ConfigField::CreateApiKey
+            | ConfigField::RevokeApiKey
+            | ConfigField::DeleteApiKey => "API KEYS",
         }
     }
 
@@ -232,6 +262,10 @@ impl ConfigField {
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
                 | ConfigField::SetDefaultModel
+                | ConfigField::ApiKeysList
+                | ConfigField::CreateApiKey
+                | ConfigField::RevokeApiKey
+                | ConfigField::DeleteApiKey
         )
     }
 
@@ -259,8 +293,21 @@ impl ConfigField {
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
                 | ConfigField::SetDefaultModel
+                | ConfigField::ApiKeysList
+                | ConfigField::CreateApiKey
+                | ConfigField::RevokeApiKey
+                | ConfigField::DeleteApiKey
         )
     }
+}
+
+/// Which field of the "Create API Key" form is being edited.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyEditField {
+    Name,
+    RateLimit,
+    TokenLimit,
+    AllowedModels,
 }
 
 pub struct ServerPanelState {
@@ -336,6 +383,16 @@ pub struct ServerPanelState {
 
     // Hardware info for display
     pub hardware: HardwareInfo,
+
+    // Multi-tenant API key management
+    pub api_keys: Vec<ApiKeyInfo>,
+    pub api_key_selected: usize,
+    pub generated_key_display: Option<String>,
+    pub new_key_name: String,
+    pub new_key_rate_limit: String,
+    pub new_key_token_limit: String,
+    pub new_key_allowed_models: String,
+    pub editing_key_field: Option<KeyEditField>,
 }
 
 impl ServerPanelState {
@@ -394,6 +451,14 @@ impl ServerPanelState {
             unload_model_selected: 0,
             default_model_selected: 0,
             hardware,
+            api_keys: Vec::new(),
+            api_key_selected: 0,
+            generated_key_display: None,
+            new_key_name: String::new(),
+            new_key_rate_limit: "60".to_string(),
+            new_key_token_limit: "0".to_string(),
+            new_key_allowed_models: String::new(),
+            editing_key_field: None,
         }
     }
 
@@ -447,7 +512,7 @@ impl ServerPanelState {
                 if self.api_key.is_empty() {
                     "(none — no auth)".to_string()
                 } else {
-                    "[hidden]".to_string()
+                    self.api_key.clone()
                 }
             }
             ConfigField::GenerateApiKey => {
@@ -570,6 +635,34 @@ impl ServerPanelState {
                     format!("{} (Left/Right to select)", m.name)
                 }
             }
+            ConfigField::ApiKeysList => {
+                if self.api_keys.is_empty() {
+                    "Press Enter to load from server".to_string()
+                } else {
+                    format!("{} key(s) loaded", self.api_keys.len())
+                }
+            }
+            ConfigField::CreateApiKey => {
+                if self.editing_key_field.is_some() {
+                    "Editing form — type and press Enter".to_string()
+                } else {
+                    "Press Enter to create with custom limits".to_string()
+                }
+            }
+            ConfigField::RevokeApiKey => {
+                if self.api_keys.is_empty() {
+                    "No keys loaded".to_string()
+                } else {
+                    "Press Enter to revoke selected".to_string()
+                }
+            }
+            ConfigField::DeleteApiKey => {
+                if self.api_keys.is_empty() {
+                    "No keys loaded".to_string()
+                } else {
+                    "Press Enter to delete selected".to_string()
+                }
+            }
         }
     }
 
@@ -618,6 +711,12 @@ impl ServerPanelState {
             ConfigField::LoadAdditionalModel => "Load another model while server is running",
             ConfigField::UnloadModel => "Unload a model from memory (Left/Right to pick)",
             ConfigField::SetDefaultModel => "Set which model handles requests without model field",
+            ConfigField::ApiKeysList => {
+                "View all API keys (Left/Right to select, Enter to refresh)"
+            }
+            ConfigField::CreateApiKey => "Create a new API key with custom limits",
+            ConfigField::RevokeApiKey => "Revoke (deactivate) the selected API key",
+            ConfigField::DeleteApiKey => "Permanently delete the selected API key",
         }
     }
 
@@ -838,11 +937,36 @@ impl ServerPanelState {
             *b = (state & 0xFF) as u8;
         }
         self.api_key = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        self.generated_key_display = Some(self.api_key.clone());
     }
 
     /// Clear the API key (disable auth)
     pub fn clear_api_key(&mut self) {
         self.api_key.clear();
+        self.generated_key_display = None;
+    }
+
+    pub fn api_key_select_next(&mut self) {
+        if !self.api_keys.is_empty() {
+            self.api_key_selected = (self.api_key_selected + 1) % self.api_keys.len();
+        }
+    }
+
+    pub fn api_key_select_prev(&mut self) {
+        if !self.api_keys.is_empty() {
+            if self.api_key_selected == 0 {
+                self.api_key_selected = self.api_keys.len() - 1;
+            } else {
+                self.api_key_selected -= 1;
+            }
+        }
+    }
+
+    pub fn selected_api_key(&self) -> Option<&ApiKeyInfo> {
+        self.api_keys.get(
+            self.api_key_selected
+                .min(self.api_keys.len().saturating_sub(1)),
+        )
     }
 
     pub fn build_load_config(&self, model_path: &str) -> ModelLoadConfig {
