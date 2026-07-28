@@ -80,8 +80,6 @@ pub enum ConfigField {
     IpAllowlist,
     IpDenylist,
     // Actions
-    GenerateApiKey,
-    ClearApiKey,
     StartServer,
     StopServer,
     LoadAdditionalModel,
@@ -101,8 +99,6 @@ impl ConfigField {
             ConfigField::Host,
             ConfigField::Port,
             ConfigField::ApiKey,
-            ConfigField::GenerateApiKey,
-            ConfigField::ClearApiKey,
             ConfigField::MaxConcurrent,
             ConfigField::RateLimit,
             ConfigField::TimeoutSecs,
@@ -153,8 +149,6 @@ impl ConfigField {
             ConfigField::Host => "Host",
             ConfigField::Port => "Port",
             ConfigField::ApiKey => "API Key",
-            ConfigField::GenerateApiKey => "Generate API Key",
-            ConfigField::ClearApiKey => "Clear API Key",
             ConfigField::MaxConcurrent => "Max Concurrent",
             ConfigField::RateLimit => "Rate Limit (req/s)",
             ConfigField::TimeoutSecs => "Timeout (secs)",
@@ -205,8 +199,6 @@ impl ConfigField {
             ConfigField::Host
             | ConfigField::Port
             | ConfigField::ApiKey
-            | ConfigField::GenerateApiKey
-            | ConfigField::ClearApiKey
             | ConfigField::MaxConcurrent
             | ConfigField::RateLimit
             | ConfigField::TimeoutSecs
@@ -254,9 +246,6 @@ impl ConfigField {
         !matches!(
             self,
             ConfigField::ModelSelection
-                | ConfigField::ApiKey
-                | ConfigField::GenerateApiKey
-                | ConfigField::ClearApiKey
                 | ConfigField::StartServer
                 | ConfigField::StopServer
                 | ConfigField::LoadAdditionalModel
@@ -286,9 +275,7 @@ impl ConfigField {
     pub fn is_action(&self) -> bool {
         matches!(
             self,
-            ConfigField::GenerateApiKey
-                | ConfigField::ClearApiKey
-                | ConfigField::StartServer
+            ConfigField::StartServer
                 | ConfigField::StopServer
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
@@ -515,20 +502,6 @@ impl ServerPanelState {
                     self.api_key.clone()
                 }
             }
-            ConfigField::GenerateApiKey => {
-                if self.api_key.is_empty() {
-                    "Press Enter to generate".to_string()
-                } else {
-                    "Press Enter to regenerate".to_string()
-                }
-            }
-            ConfigField::ClearApiKey => {
-                if self.api_key.is_empty() {
-                    "(no key set)".to_string()
-                } else {
-                    "Press Enter to remove key".to_string()
-                }
-            }
             ConfigField::MaxConcurrent => self.max_concurrent.to_string(),
             ConfigField::RateLimit => self.rate_limit.to_string(),
             ConfigField::TimeoutSecs => self.timeout_secs.to_string(),
@@ -671,9 +644,7 @@ impl ServerPanelState {
             ConfigField::ModelSelection => "Up/Down to select from local models",
             ConfigField::Host => "0.0.0.0 for all interfaces, 127.0.0.1 for local",
             ConfigField::Port => "Port number (e.g. 8080)",
-            ConfigField::ApiKey => "Auto-generated key shown here. Use Generate/Clear below",
-            ConfigField::GenerateApiKey => "Enter to generate a random secure API key",
-            ConfigField::ClearApiKey => "Enter to remove the API key (disables auth)",
+            ConfigField::ApiKey => "Static admin key for server auth. Editable — empty = no auth",
             ConfigField::MaxConcurrent => "Max simultaneous inference requests",
             ConfigField::RateLimit => "Token bucket: requests per second per IP",
             ConfigField::TimeoutSecs => "Kill stuck requests after N seconds",
@@ -726,10 +697,6 @@ impl ServerPanelState {
             return;
         }
         self.edit_buffer = self.field_value(&field);
-        if field == ConfigField::ApiKey && self.edit_buffer == "[hidden]" {
-            self.edit_buffer.clear();
-            self.edit_buffer.push_str("[type to replace]");
-        }
         self.editing = true;
     }
 

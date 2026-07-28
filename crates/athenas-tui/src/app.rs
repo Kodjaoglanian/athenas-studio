@@ -1274,6 +1274,7 @@ impl TuiApp {
                             }
                         }
                     }
+                    self.update_key_form_status();
                 }
                 KeyCode::Char(c) => {
                     let field = self.server_panel_state.editing_key_field.clone();
@@ -1297,6 +1298,7 @@ impl TuiApp {
                             }
                         }
                     }
+                    self.update_key_form_status();
                 }
                 _ => {}
             }
@@ -1360,31 +1362,6 @@ impl TuiApp {
                         self.unload_model_action().await;
                     } else if field == ConfigField::SetDefaultModel {
                         self.set_default_model_action().await;
-                    } else if field == ConfigField::GenerateApiKey {
-                        self.server_panel_state.generate_api_key();
-                        let cfg = self.server_panel_state.build_app_config(&self.config);
-                        if let Err(e) = cfg.save() {
-                            tracing::warn!("Failed to save config: {}", e);
-                        }
-                        self.config = cfg;
-                        let key_display = self
-                            .server_panel_state
-                            .generated_key_display
-                            .as_deref()
-                            .unwrap_or("");
-                        self.server_panel_state.status_message = Some(format!(
-                            "API key generated: {} (copy it now — it won't be shown again)",
-                            key_display
-                        ));
-                    } else if field == ConfigField::ClearApiKey {
-                        self.server_panel_state.clear_api_key();
-                        let cfg = self.server_panel_state.build_app_config(&self.config);
-                        if let Err(e) = cfg.save() {
-                            tracing::warn!("Failed to save config: {}", e);
-                        }
-                        self.config = cfg;
-                        self.server_panel_state.status_message =
-                            Some("API key cleared — auth disabled".to_string());
                     } else if field == ConfigField::ApiKeysList {
                         self.refresh_api_keys().await;
                     } else if field == ConfigField::CreateApiKey {
@@ -2206,6 +2183,35 @@ impl TuiApp {
                 }
             }
         }
+    }
+
+    /// Update status_message with the current form field and its value for visual feedback.
+    fn update_key_form_status(&mut self) {
+        use crate::server_panel::KeyEditField;
+        let Some(ref f) = self.server_panel_state.editing_key_field else {
+            return;
+        };
+        let (label, value) = match f {
+            KeyEditField::Name => ("Name", &self.server_panel_state.new_key_name),
+            KeyEditField::RateLimit => (
+                "Rate limit/min",
+                &self.server_panel_state.new_key_rate_limit,
+            ),
+            KeyEditField::TokenLimit => (
+                "Daily token limit",
+                &self.server_panel_state.new_key_token_limit,
+            ),
+            KeyEditField::AllowedModels => (
+                "Allowed models",
+                &self.server_panel_state.new_key_allowed_models,
+            ),
+        };
+        let display = if value.is_empty() {
+            "(empty)".to_string()
+        } else {
+            value.clone()
+        };
+        self.server_panel_state.status_message = Some(format!("{}: {}|", label, display));
     }
 
     /// Fetch the list of API keys from the running server via GET /v1/keys

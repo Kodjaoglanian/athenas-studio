@@ -175,6 +175,62 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
     false
 }
 
+/// Check auth for API key management endpoints.
+/// Allows access without auth when:
+/// - No static key is configured, OR
+/// - Static key is configured but no multi-tenant keys exist yet (bootstrap mode)
+async fn check_auth_for_key_mgmt(headers: &HeaderMap, state: &AppState) -> bool {
+    if check_auth(headers, &state.api_key) {
+        return true;
+    }
+    // Bootstrap: if static key is set but no multi-tenant keys exist, allow access
+    // so the admin can create the first key from the TUI
+    if let Some(ref mgr_arc) = state.api_key_manager {
+        let mgr = mgr_arc.lock().await;
+        if mgr.list_keys().is_empty() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check auth for model management endpoints (load/unload/set default).
+/// Accepts the static key OR any valid multi-tenant key.
+/// Allows access without auth when no keys are configured at all.
+async fn check_auth_any(headers: &HeaderMap, state: &AppState) -> bool {
+    // If no static key and no key manager, allow all
+    if state.api_key.is_none() && state.api_key_manager.is_none() {
+        return true;
+    }
+
+    // If no static key and key manager has no keys, allow all
+    if state.api_key.is_none() {
+        if let Some(ref mgr_arc) = state.api_key_manager {
+            let mgr = mgr_arc.lock().await;
+            if mgr.list_keys().is_empty() {
+                return true;
+            }
+        }
+    }
+
+    // Check static key
+    if check_auth(headers, &state.api_key) {
+        return true;
+    }
+
+    // Check multi-tenant keys
+    if let Some(ref token) = extract_bearer(headers) {
+        if let Some(ref mgr_arc) = state.api_key_manager {
+            let mgr = mgr_arc.lock().await;
+            if mgr.validate(token).is_some() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Extract the bearer token from the Authorization header.
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
@@ -306,7 +362,7 @@ async fn metrics_endpoint() -> impl IntoResponse {
 }
 
 async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1279,7 +1335,7 @@ async fn load_model_endpoint(
     headers: HeaderMap,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1372,7 +1428,7 @@ async fn unload_model_endpoint(
     headers: HeaderMap,
     Json(req): Json<UnloadModelRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1405,7 +1461,7 @@ async fn set_default_model_endpoint(
     headers: HeaderMap,
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1948,8 +2004,7 @@ async fn create_api_key(
     headers: HeaderMap,
     Json(req): Json<CreateKeyRequest>,
 ) -> Response {
-    // Only the server's static key (admin) can create keys
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1976,7 +2031,7 @@ async fn create_api_key(
 }
 
 async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2018,7 +2073,7 @@ async fn get_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2055,7 +2110,7 @@ async fn delete_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2081,7 +2136,7 @@ async fn revoke_api_key(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2107,7 +2162,7 @@ async fn get_api_key_usage(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_for_key_mgmt(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

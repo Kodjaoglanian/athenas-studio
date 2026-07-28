@@ -1043,18 +1043,6 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                         .min(state.loaded_models.len() - 1)];
                     (Color::Cyan, format!("★ Default: {}", m.name))
                 }
-            } else if *field == ConfigField::GenerateApiKey {
-                if state.api_key.is_empty() {
-                    (Color::Green, "🔑 Generate API Key".to_string())
-                } else {
-                    (Color::Yellow, "🔑 Regenerate API Key".to_string())
-                }
-            } else if *field == ConfigField::ClearApiKey {
-                if state.api_key.is_empty() {
-                    (Color::DarkGray, "○ No key set".to_string())
-                } else {
-                    (Color::Red, "✖ Clear API Key".to_string())
-                }
             } else if *field == ConfigField::ApiKeysList {
                 if state.api_keys.is_empty() {
                     (Color::Cyan, "📋 API Keys (press Enter to load)".to_string())
@@ -1119,8 +1107,6 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                     ConfigField::SetDefaultModel => {
                         "Left/Right to pick model, Enter to set default"
                     }
-                    ConfigField::GenerateApiKey => "Enter to generate a random secure API key",
-                    ConfigField::ClearApiKey => "Enter to remove the API key (disables auth)",
                     ConfigField::ApiKeysList => {
                         if state.api_keys.is_empty() {
                             "Enter to fetch keys from server (server must be running)"
@@ -1243,17 +1229,6 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                         style,
                     ));
                 }
-            }
-            continue;
-        }
-
-        // Show generated key display if available
-        if *field == ConfigField::GenerateApiKey && is_selected && !state.editing {
-            if let Some(ref key) = state.generated_key_display {
-                lines.push(Line::styled(
-                    format!("     current key: {}", key),
-                    Style::default().fg(Color::Green),
-                ));
             }
             continue;
         }
