@@ -116,6 +116,8 @@ pub struct SettingsState {
     pub edit_buffer: String,
     pub config: AppConfig,
     pub status_message: Option<String>,
+    /// Detected hardware info for display
+    pub hardware: Option<athenas_core::HardwareInfo>,
 }
 
 impl SettingsState {
@@ -127,7 +129,13 @@ impl SettingsState {
             edit_buffer: String::new(),
             config,
             status_message: None,
+            hardware: None,
         }
+    }
+
+    pub fn with_hardware(mut self, hw: athenas_core::HardwareInfo) -> Self {
+        self.hardware = Some(hw);
+        self
     }
 
     pub fn next(&mut self) {

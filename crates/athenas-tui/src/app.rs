@@ -113,7 +113,7 @@ impl TuiApp {
         let mut model_list_state = ModelListState::default();
         model_list_state.set_models(models);
 
-        let settings_state = SettingsState::new(config.clone());
+        let settings_state = SettingsState::new(config.clone()).with_hardware(hardware.clone());
         let server_panel_state = ServerPanelState::new(&config, hardware.clone());
 
         // Spawn a background health check to detect an already-running server
@@ -445,6 +445,19 @@ impl TuiApp {
         let content = chunks[1];
         match self.mode {
             AppMode::Chat => {
+                // Update GPU info in chat state for status bar display
+                if self.chat_state.gpu_info.is_empty() && !self.hardware.gpus.is_empty() {
+                    self.chat_state.gpu_info = self
+                        .hardware
+                        .gpus
+                        .iter()
+                        .map(|g| format!("{} ({}MB)", g.name, g.vram_total_mb))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                }
+                self.chat_state.gpu_runtime = self.config.inference.gpu_runtime.to_string();
+                self.chat_state.gpu_layers = self.config.inference.default_gpu_layers;
+
                 components::render_chat_area(
                     f,
                     content,
@@ -1425,6 +1438,7 @@ impl TuiApp {
             match task.await {
                 Ok(Ok(backend)) => {
                     let info = backend.model_info();
+                    let gpu_layers = info.as_ref().map(|i| i.gpu_layers).unwrap_or(-1);
                     if let Some(ref i) = info {
                         self.chat_state.current_model = Some(i.name.clone());
                         self.chat_state.current_backend = Some(i.backend_name.clone());
@@ -1433,8 +1447,27 @@ impl TuiApp {
                             i.name, i.backend_name
                         ));
                     }
-                    self.chat_state
-                        .add_message("system", "Model loaded successfully!");
+                    // Show GPU/device info in the system message
+                    let gpu_msg = if self.hardware.gpus.is_empty() {
+                        "CPU-only mode (no GPU detected)".to_string()
+                    } else {
+                        let gpu_name = &self.hardware.gpus[0].name;
+                        let layers_str = if gpu_layers < 0 {
+                            "all layers".to_string()
+                        } else if gpu_layers == 0 {
+                            "0 layers (CPU)".to_string()
+                        } else {
+                            format!("{} layers", gpu_layers)
+                        };
+                        format!(
+                            "GPU: {} | Runtime: {} | {} on GPU",
+                            gpu_name, self.config.inference.gpu_runtime, layers_str
+                        )
+                    };
+                    self.chat_state.add_message(
+                        "system",
+                        &format!("Model loaded successfully!\n  {}", gpu_msg),
+                    );
                     self.backend = Some(backend);
                     self.is_loading_model = false;
                 }

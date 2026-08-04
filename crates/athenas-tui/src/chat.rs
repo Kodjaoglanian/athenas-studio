@@ -23,6 +23,12 @@ pub struct ChatState {
     pub generation_start: Option<std::time::Instant>,
     /// When true, scroll follows the latest content automatically
     pub auto_scroll: bool,
+    /// GPU info string for status bar (e.g. "RTX 3090 (24000MB)")
+    pub gpu_info: String,
+    /// GPU runtime string for status bar (e.g. "cuda")
+    pub gpu_runtime: String,
+    /// Number of GPU layers (e.g. -1, 0, 20)
+    pub gpu_layers: i32,
 }
 
 impl Default for ChatState {
@@ -45,6 +51,9 @@ impl Default for ChatState {
             streaming_reasoning: String::new(),
             generation_start: None,
             auto_scroll: true,
+            gpu_info: String::new(),
+            gpu_runtime: String::new(),
+            gpu_layers: -1,
         }
     }
 }

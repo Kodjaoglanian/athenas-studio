@@ -382,8 +382,31 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
 
     if let Some(ref backend) = state.current_backend {
         status_parts.push(Span::styled(
-            format!(" Backend: {} ", backend),
+            format!(" {} ", backend),
             Style::default().fg(Color::Blue),
+        ));
+    }
+
+    // GPU info: show GPU name + runtime + layers, or CPU
+    if !state.gpu_info.is_empty() {
+        let layers_str = if state.gpu_layers < 0 {
+            "all".to_string()
+        } else if state.gpu_layers == 0 {
+            "CPU".to_string()
+        } else {
+            state.gpu_layers.to_string()
+        };
+        status_parts.push(Span::styled(
+            format!(
+                " GPU: {} [{}] {} layers ",
+                state.gpu_info, state.gpu_runtime, layers_str
+            ),
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if state.gpu_layers == 0 {
+        status_parts.push(Span::styled(
+            " CPU mode ",
+            Style::default().fg(Color::Yellow),
         ));
     }
 
@@ -529,6 +552,64 @@ pub fn render_settings(f: &mut Frame, area: Rect, state: &SettingsState) {
         .border_style(Style::default().fg(Color::DarkGray));
 
     let mut lines: Vec<Line> = Vec::new();
+
+    // Show detected hardware at the top
+    if let Some(ref hw) = state.hardware {
+        lines.push(Line::styled(
+            " Hardware Detected",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::styled(
+            format!(
+                "   CPU: {} threads | RAM: {}MB",
+                hw.cpus, hw.memory_total_mb
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+        if hw.gpus.is_empty() {
+            lines.push(Line::styled(
+                "   GPU: None detected (CPU-only mode)",
+                Style::default().fg(Color::Yellow),
+            ));
+        } else {
+            for gpu in &hw.gpus {
+                lines.push(Line::styled(
+                    format!(
+                        "   GPU {}: {} ({}MB VRAM, {} used){}",
+                        gpu.index,
+                        gpu.name,
+                        gpu.vram_total_mb,
+                        gpu.vram_used_mb,
+                        gpu.compute_capability
+                            .as_ref()
+                            .map(|c| format!(", CC {}", c))
+                            .unwrap_or_default()
+                    ),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            let runtimes: Vec<&str> = [
+                ("CUDA", hw.has_cuda),
+                ("ROCm", hw.has_rocm),
+                ("Vulkan", hw.has_vulkan),
+                ("Metal", hw.has_metal),
+            ]
+            .iter()
+            .filter(|(_, ok)| *ok)
+            .map(|(name, _)| *name)
+            .collect();
+            if !runtimes.is_empty() {
+                lines.push(Line::styled(
+                    format!("   Available runtimes: {}", runtimes.join(", ")),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
     let mut current_section = "";
 
     for (i, field) in state.fields.iter().enumerate() {

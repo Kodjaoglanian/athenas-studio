@@ -208,6 +208,15 @@ impl LlamaCppBackend {
             config.gpu_layers
         };
 
+        tracing::info!(
+            "GPU config: runtime={:?} (effective={:?}), device={:?}, gpu_layers={} (effective={})",
+            config.gpu_runtime,
+            effective_runtime,
+            config.gpu_device,
+            config.gpu_layers,
+            effective_gpu_layers
+        );
+
         cmd.arg("--model")
             .arg(&config.model_path)
             .arg("--ctx-size")
@@ -293,8 +302,8 @@ impl LlamaCppBackend {
             .kill_on_drop(true);
 
         info!(
-            "Starting llama-server on port {} with model: {}",
-            self.server_port, config.model_path
+            "Starting llama-server on port {} with model: {} (gpu_layers={}, runtime={})",
+            self.server_port, config.model_path, effective_gpu_layers, effective_runtime
         );
 
         let child = cmd
