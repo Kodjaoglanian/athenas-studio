@@ -6,21 +6,167 @@ use athenas_core::{AthenasError, Result};
 const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 
 /// Detect the platform-appropriate asset name for llama.cpp releases.
+///
+/// This function checks for GPU availability and selects the correct
+/// GPU-accelerated binary. If no GPU is detected, it falls back to CPU.
+///
+/// Priority order:
+/// - NVIDIA GPU: CUDA (Windows) / Vulkan (Linux — no CUDA prebuilt for Linux)
+/// - AMD GPU: ROCm (if available) / Vulkan
+/// - Intel GPU: SYCL (Linux) / OpenVINO (Windows)
+/// - Apple Silicon: Metal (built into macOS binaries)
+/// - No GPU: CPU-only binary
 fn platform_asset_name() -> Option<String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
+    // Detect GPU capabilities
+    let has_nvidia = detect_nvidia();
+    let has_amd = detect_amd();
+    let has_vulkan = detect_vulkan_support();
+
     match (os, arch) {
-        ("linux", "x86_64") => Some("bin-ubuntu-x64.tar.gz".to_string()),
-        ("linux", "aarch64") => Some("bin-ubuntu-arm64.tar.gz".to_string()),
+        // Linux x86_64
+        ("linux", "x86_64") => {
+            if has_nvidia {
+                // No CUDA prebuilt for Linux — use Vulkan (works with NVIDIA)
+                if has_vulkan {
+                    info!("NVIDIA GPU detected, using Vulkan binary for GPU acceleration");
+                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+                }
+                // No Vulkan support — try ROCm fallback (unlikely for NVIDIA)
+                warn!("NVIDIA GPU detected but no Vulkan — falling back to CPU binary");
+            }
+            if has_amd {
+                // AMD: prefer ROCm, fall back to Vulkan
+                if detect_rocm() {
+                    info!("AMD GPU detected, using ROCm binary for GPU acceleration");
+                    return Some("bin-ubuntu-rocm-7.2-x64.tar.gz".to_string());
+                }
+                if has_vulkan {
+                    info!("AMD GPU detected, using Vulkan binary for GPU acceleration");
+                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+                }
+                warn!("AMD GPU detected but no ROCm/Vulkan — falling back to CPU binary");
+            }
+            if has_vulkan {
+                info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
+                return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+            }
+            info!("No GPU detected, using CPU-only binary");
+            Some("bin-ubuntu-x64.tar.gz".to_string())
+        }
+        // Linux aarch64
+        ("linux", "aarch64") => {
+            if has_vulkan {
+                info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
+                return Some("bin-ubuntu-vulkan-arm64.tar.gz".to_string());
+            }
+            Some("bin-ubuntu-arm64.tar.gz".to_string())
+        }
+        // macOS — Metal is built into all macOS binaries
         ("macos", "aarch64") => Some("bin-macos-arm64.tar.gz".to_string()),
         ("macos", "x86_64") => Some("bin-macos-x64.tar.gz".to_string()),
-        ("windows", "x86_64") => Some("bin-win-cpu-x64.zip".to_string()),
+        // Windows x86_64
+        ("windows", "x86_64") => {
+            if has_nvidia {
+                // CUDA 12.4 is the most widely compatible
+                info!("NVIDIA GPU detected, using CUDA 12.4 binary for GPU acceleration");
+                return Some("bin-win-cuda-12.4-x64.zip".to_string());
+            }
+            if has_amd {
+                info!("AMD GPU detected, using HIP binary for GPU acceleration");
+                return Some("bin-win-hip-radeon-x64.zip".to_string());
+            }
+            if has_vulkan {
+                info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
+                return Some("bin-win-vulkan-x64.zip".to_string());
+            }
+            info!("No GPU detected, using CPU-only binary");
+            Some("bin-win-cpu-x64.zip".to_string())
+        }
         ("windows", "aarch64") => Some("bin-win-cpu-arm64.zip".to_string()),
         _ => {
             warn!("No prebuilt llama-server for os={} arch={}", os, arch);
             None
         }
+    }
+}
+
+/// Check if an NVIDIA GPU is present by running nvidia-smi.
+fn detect_nvidia() -> bool {
+    std::process::Command::new("nvidia-smi")
+        .arg("--query-gpu=name")
+        .arg("--format=csv,noheader")
+        .output()
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Check if an AMD GPU is present by running rocm-smi.
+fn detect_amd() -> bool {
+    std::process::Command::new("rocm-smi")
+        .arg("--showproductname")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if ROCm is installed (rocm-smi works).
+fn detect_rocm() -> bool {
+    std::process::Command::new("rocm-smi")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if Vulkan is available by running vulkaninfo or checking for
+/// libvulkan.so on Linux.
+fn detect_vulkan_support() -> bool {
+    if cfg!(target_os = "linux") {
+        // Method 1: try vulkaninfo
+        if std::process::Command::new("vulkaninfo")
+            .arg("--summary")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Method 2: check for libvulkan.so in common paths
+        let lib_paths = [
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so",
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib/libvulkan.so",
+            "/usr/lib/libvulkan.so.1",
+            "/usr/local/lib/libvulkan.so",
+            "/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/lib/libvulkan.so.1",
+        ];
+        for path in &lib_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        // Method 3: check if NVIDIA driver is installed (provides Vulkan)
+        if std::path::Path::new("/usr/lib/x86_64-linux-gnu/libGL.so.1").exists()
+            || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libnvidia-glcore.so").exists()
+            || std::path::Path::new("/proc/driver/nvidia").exists()
+        {
+            // NVIDIA driver is installed — Vulkan should work even if
+            // vulkaninfo isn't installed
+            return true;
+        }
+        false
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("vulkaninfo")
+            .arg("--summary")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
     }
 }
 
@@ -210,7 +356,21 @@ fn extract_zip(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
 }
 
 /// Auto-download and install llama-server to ~/.athenas/bin/
+///
+/// If `force_variant` is Some, re-downloads with the specified variant
+/// even if a binary already exists. This is used when the user changes
+/// GPU settings and needs a GPU-accelerated binary.
 pub async fn ensure_llama_server() -> Result<PathBuf> {
+    ensure_llama_server_with_variant(None).await
+}
+
+/// Force re-download of llama-server with a specific GPU variant.
+/// This removes the existing binary and downloads the correct one.
+pub async fn force_redownload_llama_server() -> Result<PathBuf> {
+    ensure_llama_server_with_variant(Some(true)).await
+}
+
+async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Result<PathBuf> {
     let bin_dir = athenas_bin_dir()?;
 
     let server_name = if std::env::consts::OS == "windows" {
@@ -220,52 +380,10 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
     };
 
     let server_path = bin_dir.join(server_name);
+    let variant_marker = bin_dir.join(".llama-server-variant");
 
-    // Already installed AND has shared libs?
-    if server_path.exists() {
-        // On Linux/macOS, check for the shared lib that llama-server needs
-        let lib_ok = if std::env::consts::OS == "linux" {
-            // Check for any .so files in the same directory
-            std::fs::read_dir(&bin_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.file_name().to_string_lossy().starts_with("libllama"))
-                })
-                .unwrap_or(false)
-        } else if std::env::consts::OS == "macos" {
-            std::fs::read_dir(&bin_dir)
-                .map(|entries| {
-                    entries
-                        .filter_map(|e| e.ok())
-                        .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
-                })
-                .unwrap_or(false)
-        } else {
-            true
-        };
-
-        if lib_ok {
-            return Ok(server_path);
-        }
-
-        // Shared libs missing — clean up and re-download
-        info!("llama-server exists but shared libs missing, re-downloading...");
-        let _ = std::fs::remove_file(&server_path);
-        // Also clean up any old .so/.dylib files
-        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("libllama") || name.starts_with("libggml") {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        }
-    }
-
-    info!("llama-server not found, auto-downloading...");
-
-    let asset_suffix = platform_asset_name().ok_or_else(|| {
+    // Determine the desired asset (GPU-aware)
+    let desired_asset_suffix = platform_asset_name().ok_or_else(|| {
         AthenasError::Backend(format!(
             "No prebuilt llama-server available for {} {}. Please install llama.cpp manually.",
             std::env::consts::OS,
@@ -273,10 +391,70 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
         ))
     })?;
 
+    // Check if we need to re-download:
+    // 1. Binary doesn't exist → download
+    // 2. Force re-download requested → download
+    // 3. Binary exists but variant doesn't match desired (CPU vs GPU) → re-download
+    let needs_download = if force_redownload == Some(true) {
+        info!("Force re-download requested, replacing llama-server...");
+        cleanup_bin_dir(&bin_dir, &server_path);
+        true
+    } else if !server_path.exists() {
+        true
+    } else {
+        // Check if the variant matches what we need
+        let current_variant = std::fs::read_to_string(&variant_marker).unwrap_or_default();
+        let desired_variant = &desired_asset_suffix;
+        if current_variant.trim() != desired_variant.trim() {
+            info!(
+                "llama-server variant mismatch: have '{}', need '{}' — re-downloading with GPU support...",
+                current_variant.trim(),
+                desired_variant.trim()
+            );
+            cleanup_bin_dir(&bin_dir, &server_path);
+            true
+        } else {
+            // Check for shared libs on Linux/macOS
+            let lib_ok = if std::env::consts::OS == "linux" {
+                std::fs::read_dir(&bin_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .any(|e| e.file_name().to_string_lossy().starts_with("libllama"))
+                    })
+                    .unwrap_or(false)
+            } else if std::env::consts::OS == "macos" {
+                std::fs::read_dir(&bin_dir)
+                    .map(|entries| {
+                        entries
+                            .filter_map(|e| e.ok())
+                            .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
+                    })
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+
+            if !lib_ok {
+                info!("llama-server exists but shared libs missing, re-downloading...");
+                cleanup_bin_dir(&bin_dir, &server_path);
+                true
+            } else {
+                false
+            }
+        }
+    };
+
+    if !needs_download {
+        return Ok(server_path);
+    }
+
+    info!("llama-server not found or needs update, auto-downloading...");
+
     let tag = get_latest_release_tag().await?;
     info!("Latest llama.cpp release: {}", tag);
 
-    let asset_name = format!("llama-{}-{}", tag, asset_suffix);
+    let asset_name = format!("llama-{}-{}", tag, desired_asset_suffix);
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         LLAMA_CPP_REPO, tag, asset_name
@@ -289,7 +467,7 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
         data.len() / (1024 * 1024)
     );
 
-    let is_zip = asset_suffix.ends_with(".zip");
+    let is_zip = desired_asset_suffix.ends_with(".zip");
     let extracted_path = if is_zip {
         extract_zip(&data, &bin_dir)?
     } else {
@@ -366,6 +544,22 @@ pub async fn ensure_llama_server() -> Result<PathBuf> {
         }
     }
 
+    // Write variant marker so we know which GPU variant was installed
+    let _ = std::fs::write(&variant_marker, &desired_asset_suffix);
+
     info!("llama-server installed to {}", extracted_path.display());
     Ok(extracted_path)
+}
+
+/// Remove the llama-server binary and shared libs from the bin directory.
+fn cleanup_bin_dir(bin_dir: &std::path::Path, server_path: &std::path::Path) {
+    let _ = std::fs::remove_file(server_path);
+    if let Ok(entries) = std::fs::read_dir(bin_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("libllama") || name.starts_with("libggml") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }

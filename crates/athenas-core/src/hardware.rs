@@ -304,7 +304,37 @@ fn detect_amd_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
 }
 
 fn detect_vulkan() -> bool {
-    if cfg!(target_os = "linux") || cfg!(target_os = "windows") {
+    if cfg!(target_os = "linux") {
+        // Method 1: try vulkaninfo
+        if Command::new("vulkaninfo")
+            .arg("--summary")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Method 2: check for libvulkan.so in common paths
+        let lib_paths = [
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so",
+            "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib/libvulkan.so",
+            "/usr/lib/libvulkan.so.1",
+            "/usr/local/lib/libvulkan.so",
+            "/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/lib/libvulkan.so.1",
+        ];
+        for path in &lib_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        // Method 3: check if NVIDIA driver is installed (provides Vulkan)
+        if std::path::Path::new("/proc/driver/nvidia").exists() {
+            return true;
+        }
+        false
+    } else if cfg!(target_os = "windows") {
         Command::new("vulkaninfo")
             .arg("--summary")
             .output()

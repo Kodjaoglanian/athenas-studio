@@ -109,7 +109,25 @@ impl LlamaCppBackend {
                     true
                 };
 
-                if needs_lib && !has_lib {
+                // Check if GPU variant is needed but binary is CPU-only
+                let needs_gpu =
+                    config.gpu_layers != 0 && config.gpu_runtime != athenas_core::GpuRuntime::Cpu;
+                let variant_marker = parent.join(".llama-server-variant");
+                let current_variant = std::fs::read_to_string(&variant_marker).unwrap_or_default();
+                let variant_is_cpu = current_variant.contains("bin-ubuntu-x64")
+                    || current_variant.contains("bin-win-cpu");
+                let needs_redownload_for_gpu =
+                    needs_gpu && variant_is_cpu && path.contains(".athenas");
+
+                if needs_redownload_for_gpu {
+                    info!(
+                        "llama-server is CPU-only but GPU is configured (gpu_layers={}, runtime={:?}) — \
+                         re-downloading with GPU support...",
+                        config.gpu_layers, config.gpu_runtime
+                    );
+                    let new_path = crate::backend_setup::force_redownload_llama_server().await?;
+                    new_path.to_string_lossy().to_string()
+                } else if needs_lib && !has_lib {
                     // Binary exists but shared libs are missing — force re-download
                     info!("llama-server found but shared libs missing, re-downloading...");
                     // Only delete if it's in our bin dir (don't touch system installs)
@@ -162,19 +180,42 @@ impl LlamaCppBackend {
         // === GPU runtime and device selection ===
         // Set environment variables based on the chosen GPU runtime and
         // device index. This controls which GPU the subprocess uses.
+        //
+        // IMPORTANT: On Linux, there is no CUDA prebuilt binary from
+        // llama.cpp releases. We download the Vulkan binary instead,
+        // which works with NVIDIA, AMD, and Intel GPUs. So when auto-
+        // detecting on Linux, we prefer Vulkan over CUDA even if
+        // nvidia-smi is available, because the binary we have is Vulkan.
         let effective_runtime = match config.gpu_runtime {
             athenas_core::GpuRuntime::Auto => {
-                // Auto-detect: prefer CUDA > ROCm > Vulkan > Metal > CPU
-                if self.hardware.has_cuda {
-                    athenas_core::GpuRuntime::Cuda
-                } else if self.hardware.has_rocm {
-                    athenas_core::GpuRuntime::Rocm
-                } else if self.hardware.has_vulkan {
-                    athenas_core::GpuRuntime::Vulkan
-                } else if self.hardware.has_metal {
+                if cfg!(target_os = "macos") {
+                    // macOS: Metal is built into all binaries
                     athenas_core::GpuRuntime::Metal
+                } else if cfg!(target_os = "linux") {
+                    // Linux: we download Vulkan binary (no CUDA prebuilt)
+                    // Prefer ROCm if available (AMD), then Vulkan (NVIDIA/Intel/AMD)
+                    if self.hardware.has_rocm {
+                        athenas_core::GpuRuntime::Rocm
+                    } else if self.hardware.has_vulkan {
+                        athenas_core::GpuRuntime::Vulkan
+                    } else if self.hardware.has_cuda {
+                        // CUDA detected but no Vulkan — this means the user
+                        // has a custom CUDA build. Use CUDA.
+                        athenas_core::GpuRuntime::Cuda
+                    } else {
+                        athenas_core::GpuRuntime::Cpu
+                    }
                 } else {
-                    athenas_core::GpuRuntime::Cpu
+                    // Windows and others: prefer CUDA > ROCm > Vulkan > CPU
+                    if self.hardware.has_cuda {
+                        athenas_core::GpuRuntime::Cuda
+                    } else if self.hardware.has_rocm {
+                        athenas_core::GpuRuntime::Rocm
+                    } else if self.hardware.has_vulkan {
+                        athenas_core::GpuRuntime::Vulkan
+                    } else {
+                        athenas_core::GpuRuntime::Cpu
+                    }
                 }
             }
             other => other,
@@ -366,6 +407,21 @@ impl LlamaCppBackend {
                                     // that the caller can retry, or just retry inline
                                     return self.retry_start_server(config).await;
                                 }
+                            }
+                            // Check if libvulkan is missing (Vulkan binary needs it)
+                            if stderr_msg.contains("libvulkan.so")
+                                || stderr_msg.contains("libvulkan")
+                            {
+                                msg.push_str(
+                                    "\n\nHint: Vulkan library missing. The GPU-accelerated \
+                                     binary needs Vulkan libraries.\n\
+                                     On Ubuntu/Debian: apt install -y libvulkan1 mesa-vulkan-drivers\n\
+                                     On Fedora: dnf install -y vulkan-loader\n\
+                                     On Arch: pacman -S vulkan-icd-loader\n\
+                                     \n\
+                                     For NVIDIA: also install nvidia-vulkan-icd or ensure \
+                                     your NVIDIA driver supports Vulkan (driver >= 390.x).",
+                                );
                             }
                             msg.push_str(
                                 "\n\nHint: exit code 127 usually means the binary has missing \
