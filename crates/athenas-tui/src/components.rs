@@ -312,13 +312,34 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     f.render_widget(paragraph, area);
 }
 
-pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::ModelListState) {
+pub fn render_model_list(
+    f: &mut Frame,
+    area: Rect,
+    state: &crate::model_list::ModelListState,
+    loaded_model: Option<&str>,
+    loaded_backend: Option<&str>,
+) {
+    // Build title with loaded model info
+    let title = if let Some(name) = loaded_model {
+        format!(
+            " Models (Enter: Load | Del: Delete | u: Unload) — Loaded: {} [{}] ",
+            name,
+            loaded_backend.unwrap_or("?")
+        )
+    } else {
+        " Models (Enter: Load | Del: Delete) — No model loaded ".to_string()
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            " Models (Enter: Load | Del: Delete) ",
+            title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(if loaded_model.is_some() {
+                    Color::Green
+                } else {
+                    Color::Cyan
+                })
                 .add_modifier(Modifier::BOLD),
         ))
         .border_style(Style::default().fg(Color::DarkGray));
@@ -333,14 +354,25 @@ pub fn render_model_list(f: &mut Frame, area: Rect, state: &crate::model_list::M
         return;
     }
 
+    let loaded_name = loaded_model.unwrap_or("");
+
     let items: Vec<ListItem> = state
         .models
         .iter()
         .map(|m| {
+            let is_loaded = m.name == loaded_name;
+            let name_color = if is_loaded {
+                Color::Green
+            } else {
+                Color::White
+            };
             let mut spans = vec![Span::styled(
                 m.name.clone(),
-                Style::default().fg(Color::White),
+                Style::default().fg(name_color),
             )];
+            if is_loaded {
+                spans.push(Span::styled(" ● loaded", Style::default().fg(Color::Green)));
+            }
             if let Some(ref q) = m.quantization {
                 spans.push(Span::styled(
                     format!(" [{}]", q),

@@ -465,7 +465,13 @@ impl TuiApp {
                 );
             }
             AppMode::ModelList => {
-                components::render_model_list(f, content, &self.model_list_state);
+                components::render_model_list(
+                    f,
+                    content,
+                    &self.model_list_state,
+                    self.chat_state.current_model.as_deref(),
+                    self.chat_state.current_backend.as_deref(),
+                );
             }
             AppMode::Browser => {
                 components::render_model_browser(f, content, &self.browser_state);
@@ -570,6 +576,25 @@ impl TuiApp {
                             );
                         }
                     }
+                }
+            }
+            KeyCode::Char('u') => {
+                if self.backend.is_some() {
+                    let name = self.chat_state.current_model.clone().unwrap_or_default();
+                    let backend_name = self.chat_state.current_backend.clone().unwrap_or_default();
+                    // Drop the backend — this frees the model from memory
+                    self.backend = None;
+                    self.chat_state.current_model = None;
+                    self.chat_state.current_backend = None;
+                    // Stop any ongoing stream
+                    self.chat_stream_rx = None;
+                    self.chat_state.add_message(
+                        "system",
+                        &format!("Model '{}' [{}] unloaded from memory.", name, backend_name),
+                    );
+                } else {
+                    self.chat_state
+                        .add_message("system", "No model is currently loaded.");
                 }
             }
             KeyCode::Esc => {
