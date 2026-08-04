@@ -215,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
     // instead of writing to stderr (which would corrupt the terminal display).
     // For other modes, use the standard fmt subscriber.
     if is_tui {
-        let log_buffer = athenas_tui::log_buffer::LogBuffer::new(500);
+        let log_buffer = athenas_tui::log_buffer::LogBuffer::new(2000);
         let buffer_layer = athenas_tui::log_buffer::LogBufferLayer::new(log_buffer.clone());
 
         tracing_subscriber::registry()

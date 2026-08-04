@@ -527,11 +527,16 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
         ));
     }
 
-    // Auto-scroll to bottom
+    // Auto-scroll to bottom, or apply manual scroll offset
     let total_lines = lines.len() as u16;
     let visible_height = chunks[0].height.saturating_sub(2);
     let scroll = if state.auto_scroll && total_lines > visible_height {
         total_lines - visible_height
+    } else if state.scroll_offset > 0 {
+        // Scroll offset is from the bottom — show older logs
+        total_lines
+            .saturating_sub(visible_height)
+            .saturating_sub(state.scroll_offset)
     } else {
         0
     };
@@ -543,9 +548,9 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
     f.render_widget(p, chunks[0]);
 
     let status = if state.auto_scroll {
-        " Auto-scroll: ON | 'a' to toggle | 'c' to clear | Esc: Back "
+        " Auto-scroll: ON | ↑/↓: Scroll | PgUp/PgDn: Jump | End: Bottom | 'c': Clear | Esc: Back "
     } else {
-        " Auto-scroll: OFF | 'a' to toggle | 'c' to clear | Esc: Back "
+        " Auto-scroll: OFF | ↑/↓: Scroll | PgUp/PgDn: Jump | End: Bottom | 'c': Clear | Esc: Back "
     };
     let status_bar = Paragraph::new(status)
         .style(Style::default().fg(Color::Cyan).bg(Color::Black))

@@ -199,3 +199,35 @@ pub async fn ip_filter_middleware(
 
     next.run(req).await
 }
+
+/// Request logging middleware.
+///
+/// Logs every incoming HTTP request at INFO level with method, path, status
+/// code, latency, and client IP. This flows through the tracing subscriber
+/// so it appears in the TUI logs page (via LogBufferLayer) and in the
+/// detached server's log file.
+pub async fn request_logging_middleware(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let ip = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed();
+    let status = response.status().as_u16();
+
+    tracing::info!(
+        "{} {} {} {}ms from {}",
+        method,
+        path,
+        status,
+        elapsed.as_millis(),
+        ip
+    );
+
+    response
+}

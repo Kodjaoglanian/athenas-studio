@@ -97,6 +97,8 @@ pub struct TuiApp {
     server_start_task: ServerStartTask,
     // Logs page state
     logs_state: crate::log_buffer::LogsState,
+    // Background server log tailer task
+    server_log_tailer: Option<tokio::task::JoinHandle<()>>,
     // Background chat streaming state
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
 }
@@ -114,6 +116,15 @@ impl TuiApp {
 
         // Spawn a background health check to detect an already-running server
         let health_task = tokio::spawn(server_manager::check_running());
+
+        // Create the log buffer (in-memory, circular — never persisted to disk)
+        let log_buffer = crate::log_buffer::LogBuffer::new(2000);
+
+        // Spawn a background task that tails the detached server's log file
+        // and feeds new lines into the log buffer so they appear in the TUI
+        // logs page alongside the TUI process's own tracing events.
+        let tailer_buffer = log_buffer.clone();
+        let log_tailer = tokio::spawn(Self::run_server_log_tailer(tailer_buffer));
 
         Self {
             config,
@@ -137,7 +148,8 @@ impl TuiApp {
             additional_model_load_task: None,
             additional_model_name_hint: None,
             server_start_task: None,
-            logs_state: crate::log_buffer::LogsState::new(crate::log_buffer::LogBuffer::new(500)),
+            logs_state: crate::log_buffer::LogsState::new(log_buffer),
+            server_log_tailer: Some(log_tailer),
             chat_stream_rx: None,
         }
     }
@@ -148,8 +160,112 @@ impl TuiApp {
         log_buffer: crate::log_buffer::LogBuffer,
     ) -> Self {
         let mut app = Self::new(config, hardware);
+        // Replace the default buffer with the one provided by the caller
+        // (which already has a LogBufferLayer attached). The existing tailer
+        // task is still running with the old buffer, so we spawn a new one
+        // with the provided buffer and abort the old one.
+        if let Some(old_tailer) = app.server_log_tailer.take() {
+            old_tailer.abort();
+        }
+        let tailer_buffer = log_buffer.clone();
+        app.server_log_tailer = Some(tokio::spawn(Self::run_server_log_tailer(tailer_buffer)));
         app.logs_state = crate::log_buffer::LogsState::new(log_buffer);
         app
+    }
+
+    /// Background task that tails `~/.athenas/server.log` and pushes new
+    /// lines into the log buffer. This makes the detached server's logs
+    /// (including HTTP request logs) visible in the TUI logs page.
+    ///
+    /// The buffer is in-memory only — no logs are persisted by the TUI.
+    async fn run_server_log_tailer(buffer: crate::log_buffer::LogBuffer) {
+        let log_path = match dirs::home_dir() {
+            Some(h) => h.join(".athenas").join("server.log"),
+            None => return,
+        };
+
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+
+        // Wait for the log file to exist (the server may not have started yet)
+        loop {
+            if std::fs::File::open(&log_path).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+
+        // Read existing content from the beginning so the user sees all
+        // available server logs immediately.
+        if let Ok(file) = std::fs::File::open(&log_path) {
+            let mut reader = BufReader::new(file);
+            let mut buf = String::new();
+            loop {
+                buf.clear();
+                match reader.read_line(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = buf.trim_end();
+                        if !line.is_empty() {
+                            buffer.push_raw_line(line);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Now poll for new lines appended to the file
+        let mut last_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Check if the file was truncated/recreated (server restarted)
+            let current_size = match std::fs::metadata(&log_path) {
+                Ok(m) => m.len(),
+                Err(_) => {
+                    // File was deleted — wait for it to reappear
+                    loop {
+                        if std::fs::metadata(&log_path).is_ok() {
+                            last_size = 0;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            };
+
+            if current_size < last_size {
+                // File was truncated — server restarted, read from beginning
+                last_size = 0;
+            }
+
+            if current_size == last_size {
+                continue;
+            }
+
+            // Read new content
+            if let Ok(mut f) = std::fs::File::open(&log_path) {
+                let _ = f.seek(SeekFrom::Start(last_size));
+                let mut reader = BufReader::new(f);
+                let mut buf = String::new();
+                loop {
+                    buf.clear();
+                    match reader.read_line(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            let line = buf.trim_end();
+                            if !line.is_empty() {
+                                buffer.push_raw_line(line);
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                last_size = current_size;
+            }
+        }
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -162,6 +278,11 @@ impl TuiApp {
             Terminal::new(backend).map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
         let result = self.main_loop(&mut terminal).await;
+
+        // Abort the background server log tailer
+        if let Some(tailer) = self.server_log_tailer.take() {
+            tailer.abort();
+        }
 
         disable_raw_mode().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
         execute!(terminal.backend_mut(), LeaveAlternateScreen)
@@ -477,11 +598,29 @@ impl TuiApp {
 
     async fn handle_logs_key(&mut self, key: event::KeyEvent) {
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.logs_state.scroll_up(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.logs_state.scroll_down(1);
+            }
+            KeyCode::PageUp => {
+                self.logs_state.scroll_up(10);
+            }
+            KeyCode::PageDown => {
+                self.logs_state.scroll_down(10);
+            }
+            KeyCode::End => {
+                self.logs_state.scroll_to_bottom();
+            }
             KeyCode::Char('c') => {
                 self.logs_state.clear();
             }
             KeyCode::Char('a') => {
                 self.logs_state.auto_scroll = !self.logs_state.auto_scroll;
+                if self.logs_state.auto_scroll {
+                    self.logs_state.scroll_offset = 0;
+                }
             }
             KeyCode::Esc => {
                 self.mode = AppMode::Chat;

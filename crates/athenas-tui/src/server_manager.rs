@@ -103,6 +103,7 @@ pub fn start_detached(
 
     let mut cmd = std::process::Command::new(&binary);
     cmd.arg("serve")
+        .arg("--verbose")
         .arg(model)
         .arg("--host")
         .arg(host)

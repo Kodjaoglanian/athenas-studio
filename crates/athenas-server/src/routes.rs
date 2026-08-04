@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    middleware::from_fn_with_state,
+    middleware::{from_fn, from_fn_with_state},
     response::sse::{Event, KeepAlive},
     response::{IntoResponse, Response, Sse},
     routing::{get, post},
@@ -27,7 +27,8 @@ use crate::api_keys::{AuthResult, SharedApiKeyManager};
 use crate::audit_log::{AuditEntry, SharedAuditLogger};
 use crate::metrics::{metrics_middleware, SharedMetrics};
 use crate::middleware::{
-    ip_filter_middleware, rate_limit_middleware, IpFilterConfig, SharedRateLimiter,
+    ip_filter_middleware, rate_limit_middleware, request_logging_middleware, IpFilterConfig,
+    SharedRateLimiter,
 };
 use crate::model_manager::SharedModelManager;
 use crate::model_router::SharedModelRouter;
@@ -151,6 +152,7 @@ pub fn create_router(
             (config.max_body_size_mb as usize) * 1024 * 1024,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(from_fn(request_logging_middleware))
         .layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
         .layer(from_fn_with_state(metrics, metrics_middleware))
         .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
