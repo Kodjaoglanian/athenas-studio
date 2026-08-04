@@ -653,7 +653,9 @@ impl ServerPanelState {
             ConfigField::MetricsEnabled => "Expose /metrics endpoint (Prometheus)",
             ConfigField::CompressionEnabled => "gzip response compression",
             ConfigField::Backend => "auto, llama.cpp, or vllm",
-            ConfigField::GpuLayers => "-1 = all layers on GPU, 0 = CPU only",
+            ConfigField::GpuLayers => {
+                "-1 = all layers on GPU (CUDA/ROCm/Vulkan/Metal), 0 = CPU only"
+            }
             ConfigField::ContextSize => "Context window size in tokens",
             ConfigField::BatchSize => "Prompt processing batch size",
             ConfigField::Threads => "CPU threads (0 = auto)",

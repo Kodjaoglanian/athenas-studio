@@ -123,8 +123,13 @@ impl TuiApp {
         // Spawn a background task that tails the detached server's log file
         // and feeds new lines into the log buffer so they appear in the TUI
         // logs page alongside the TUI process's own tracing events.
+        //
+        // Uses spawn_blocking because the tailer does synchronous file I/O
+        // (std::fs, BufReader) which would block the tokio async runtime
+        // and freeze the TUI rendering if run in an async task.
         let tailer_buffer = log_buffer.clone();
-        let log_tailer = tokio::spawn(Self::run_server_log_tailer(tailer_buffer));
+        let log_tailer =
+            tokio::task::spawn_blocking(move || Self::run_server_log_tailer(tailer_buffer));
 
         Self {
             config,
@@ -168,17 +173,23 @@ impl TuiApp {
             old_tailer.abort();
         }
         let tailer_buffer = log_buffer.clone();
-        app.server_log_tailer = Some(tokio::spawn(Self::run_server_log_tailer(tailer_buffer)));
+        app.server_log_tailer = Some(tokio::task::spawn_blocking(move || {
+            Self::run_server_log_tailer(tailer_buffer)
+        }));
         app.logs_state = crate::log_buffer::LogsState::new(log_buffer);
         app
     }
 
-    /// Background task that tails `~/.athenas/server.log` and pushes new
+    /// Background thread that tails `~/.athenas/server.log` and pushes new
     /// lines into the log buffer. This makes the detached server's logs
     /// (including HTTP request logs) visible in the TUI logs page.
     ///
+    /// This is a **blocking** function — it must run on a blocking thread
+    /// (via `tokio::task::spawn_blocking`) so it doesn't freeze the async
+    /// runtime and TUI rendering.
+    ///
     /// The buffer is in-memory only — no logs are persisted by the TUI.
-    async fn run_server_log_tailer(buffer: crate::log_buffer::LogBuffer) {
+    fn run_server_log_tailer(buffer: crate::log_buffer::LogBuffer) {
         let log_path = match dirs::home_dir() {
             Some(h) => h.join(".athenas").join("server.log"),
             None => return,
@@ -191,7 +202,7 @@ impl TuiApp {
             if std::fs::File::open(&log_path).is_ok() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
         // Read existing content from the beginning so the user sees all
@@ -218,7 +229,7 @@ impl TuiApp {
         let mut last_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::thread::sleep(std::time::Duration::from_millis(200));
 
             // Check if the file was truncated/recreated (server restarted)
             let current_size = match std::fs::metadata(&log_path) {
@@ -230,7 +241,7 @@ impl TuiApp {
                             last_size = 0;
                             break;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                     continue;
                 }

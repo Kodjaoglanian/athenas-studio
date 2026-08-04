@@ -196,7 +196,15 @@ impl LlamaCppBackend {
 
         if config.gpu_layers >= 0 {
             cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
-        } else if self.hardware.has_cuda || self.hardware.has_rocm {
+        } else if self.hardware.has_cuda
+            || self.hardware.has_rocm
+            || self.hardware.has_vulkan
+            || self.hardware.has_metal
+        {
+            // Auto-offload all layers to GPU when gpu_layers is -1 and a
+            // supported GPU backend (CUDA, ROCm, Vulkan, or Metal) is
+            // available. The llama.cpp binary must have been compiled with
+            // the corresponding backend enabled.
             cmd.arg("--n-gpu-layers").arg("999");
         }
 
