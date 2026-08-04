@@ -628,9 +628,10 @@ impl TuiApp {
                 self.logs_state.clear();
             }
             KeyCode::Char('a') => {
-                self.logs_state.auto_scroll = !self.logs_state.auto_scroll;
                 if self.logs_state.auto_scroll {
-                    self.logs_state.scroll_offset = 0;
+                    self.logs_state.scroll_up(1);
+                } else {
+                    self.logs_state.scroll_to_bottom();
                 }
             }
             KeyCode::Esc => {

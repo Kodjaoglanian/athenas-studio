@@ -269,9 +269,11 @@ impl Visit for MessageVisitor {
 pub struct LogsState {
     pub buffer: LogBuffer,
     pub auto_scroll: bool,
-    /// Manual scroll offset (number of lines from the bottom). When non-zero,
-    /// auto-scroll is disabled.
-    pub scroll_offset: u16,
+    /// Absolute scroll position — the index of the first visible line from
+    /// the top of the log entries. Only used when `auto_scroll` is false.
+    /// When new logs arrive while scrolled up, this value doesn't change,
+    /// so the view stays frozen at the position the user chose.
+    pub scroll_top: u16,
 }
 
 impl LogsState {
@@ -279,7 +281,7 @@ impl LogsState {
         Self {
             buffer,
             auto_scroll: true,
-            scroll_offset: 0,
+            scroll_top: 0,
         }
     }
 
@@ -292,22 +294,43 @@ impl LogsState {
     }
 
     /// Scroll up (toward older logs) by `n` lines.
+    /// Sets auto_scroll to false and moves the view up by decrementing
+    /// scroll_top. The view will stay frozen at this position even as new
+    /// logs arrive.
     pub fn scroll_up(&mut self, n: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_add(n);
-        self.auto_scroll = false;
+        if self.auto_scroll {
+            // First time scrolling up from auto-scroll: start from the
+            // bottom and move up by n.
+            self.auto_scroll = false;
+            let total = self.buffer.entries().len() as u16;
+            let visible = 0u16; // will be clamped in render
+            let _ = visible;
+            self.scroll_top = total.saturating_sub(n + 1);
+        } else {
+            self.scroll_top = self.scroll_top.saturating_sub(n);
+        }
     }
 
     /// Scroll down (toward newer logs) by `n` lines.
+    /// If we reach the bottom, re-enable auto-scroll.
     pub fn scroll_down(&mut self, n: u16) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
-        if self.scroll_offset == 0 {
+        if self.auto_scroll {
+            return;
+        }
+        self.scroll_top = self.scroll_top.saturating_add(n);
+        // Check if we've reached the bottom — if so, re-enable auto-scroll.
+        // The exact threshold is checked in render, but we approximate here.
+        let total = self.buffer.entries().len() as u16;
+        let max_scroll = total.saturating_sub(1);
+        if self.scroll_top >= max_scroll {
             self.auto_scroll = true;
+            self.scroll_top = 0;
         }
     }
 
     /// Reset scroll to bottom and re-enable auto-scroll.
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = 0;
+        self.scroll_top = 0;
         self.auto_scroll = true;
     }
 }

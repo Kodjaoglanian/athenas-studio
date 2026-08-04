@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tower_http::{
     compression::CompressionLayer, cors::CorsLayer, limit::RequestBodyLimitLayer,
-    timeout::TimeoutLayer, trace::TraceLayer,
+    timeout::TimeoutLayer,
 };
 
 use athenas_core::ServerConfig;
@@ -151,7 +151,6 @@ pub fn create_router(
         .layer(RequestBodyLimitLayer::new(
             (config.max_body_size_mb as usize) * 1024 * 1024,
         ))
-        .layer(TraceLayer::new_for_http())
         .layer(from_fn(request_logging_middleware))
         .layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
         .layer(from_fn_with_state(metrics, metrics_middleware))

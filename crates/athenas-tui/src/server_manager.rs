@@ -129,7 +129,12 @@ pub fn start_detached(
         cmd.arg("--max-body-size").arg(bs.to_string());
     }
 
-    // Detach: redirect stdin to /dev/null, stdout to log file, stderr to log file
+    // Detach: redirect stdin to /dev/null, stdout to /dev/null, stderr to
+    // log file. Only stderr is captured because tracing_subscriber::fmt()
+    // writes to stderr. Redirecting stdout (println! output: banner,
+    // "Loading model:", etc.) to the same file as stderr causes
+    // interleaving corruption — the two file descriptors write
+    // independently and can overwrite each other mid-line.
     let log_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".athenas");
@@ -143,9 +148,7 @@ pub fn start_detached(
         .map_err(|e| format!("Failed to open server log: {}", e))?;
 
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::from(
-            log_file.try_clone().map_err(|e| e.to_string())?,
-        ))
+        .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
 
     #[cfg(unix)]

@@ -554,20 +554,19 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
         ));
     }
 
-    // Auto-scroll to bottom, or apply manual scroll offset.
+    // Auto-scroll to bottom, or use absolute scroll position.
     // Since we don't use Wrap, each Line is exactly one rendered row, so
     // lines.len() accurately reflects the number of visible rows.
     let total_lines = lines.len() as u16;
     let visible_height = chunks[0].height.saturating_sub(2);
-    let scroll = if state.auto_scroll && total_lines > visible_height {
-        total_lines - visible_height
-    } else if state.scroll_offset > 0 {
-        // Scroll offset is from the bottom — show older logs
-        total_lines
-            .saturating_sub(visible_height)
-            .saturating_sub(state.scroll_offset)
+    let max_scroll = total_lines.saturating_sub(visible_height);
+
+    let scroll = if state.auto_scroll {
+        max_scroll
     } else {
-        0
+        // Use absolute scroll position. Clamp to valid range in case
+        // entries were removed from the buffer (circular eviction).
+        state.scroll_top.min(max_scroll)
     };
 
     let p = Paragraph::new(lines).block(block).scroll((scroll, 0));
