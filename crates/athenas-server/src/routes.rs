@@ -1371,6 +1371,8 @@ async fn load_model_endpoint(
     let load_config = ModelLoadConfig {
         model_path: req.model_path.clone(),
         gpu_layers: req.gpu_layers.unwrap_or(-1),
+        gpu_runtime: athenas_core::GpuRuntime::Auto,
+        gpu_device: None,
         context_size: req.context_size.unwrap_or(4096),
         batch_size: req.batch_size.unwrap_or(512),
         threads: req.threads.unwrap_or(0),

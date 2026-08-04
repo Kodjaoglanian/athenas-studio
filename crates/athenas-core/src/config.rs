@@ -24,6 +24,12 @@ pub struct PathsConfig {
 pub struct InferenceConfig {
     pub default_backend: BackendType,
     pub default_gpu_layers: i32,
+    /// GPU runtime to use: auto, cuda, rocm, vulkan, metal, cpu
+    #[serde(default)]
+    pub gpu_runtime: GpuRuntime,
+    /// Which GPU device to use (0, 1, 2, ...). None = use default (usually 0).
+    #[serde(default)]
+    pub gpu_device: Option<u32>,
     pub default_context_size: u32,
     pub default_batch_size: u32,
     pub default_threads: u32,
@@ -213,6 +219,39 @@ impl std::fmt::Display for BackendType {
     }
 }
 
+/// GPU runtime to use for inference. Controls which backend library
+/// llama.cpp/vLLM uses for GPU acceleration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuRuntime {
+    /// Auto-detect based on available hardware (CUDA > ROCm > Vulkan > Metal > CPU)
+    #[default]
+    Auto,
+    /// NVIDIA CUDA
+    Cuda,
+    /// AMD ROCm
+    Rocm,
+    /// Vulkan (cross-vendor)
+    Vulkan,
+    /// Apple Metal
+    Metal,
+    /// CPU only (no GPU acceleration)
+    Cpu,
+}
+
+impl std::fmt::Display for GpuRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GpuRuntime::Auto => write!(f, "auto"),
+            GpuRuntime::Cuda => write!(f, "cuda"),
+            GpuRuntime::Rocm => write!(f, "rocm"),
+            GpuRuntime::Vulkan => write!(f, "vulkan"),
+            GpuRuntime::Metal => write!(f, "metal"),
+            GpuRuntime::Cpu => write!(f, "cpu"),
+        }
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -228,6 +267,8 @@ impl Default for AppConfig {
             inference: InferenceConfig {
                 default_backend: BackendType::Auto,
                 default_gpu_layers: -1,
+                gpu_runtime: GpuRuntime::Auto,
+                gpu_device: None,
                 default_context_size: 2048,
                 default_batch_size: 256,
                 default_threads: num_threads(),

@@ -159,6 +159,55 @@ impl LlamaCppBackend {
             cmd.env("LD_LIBRARY_PATH", new_ld_path);
         }
 
+        // === GPU runtime and device selection ===
+        // Set environment variables based on the chosen GPU runtime and
+        // device index. This controls which GPU the subprocess uses.
+        let effective_runtime = match config.gpu_runtime {
+            athenas_core::GpuRuntime::Auto => {
+                // Auto-detect: prefer CUDA > ROCm > Vulkan > Metal > CPU
+                if self.hardware.has_cuda {
+                    athenas_core::GpuRuntime::Cuda
+                } else if self.hardware.has_rocm {
+                    athenas_core::GpuRuntime::Rocm
+                } else if self.hardware.has_vulkan {
+                    athenas_core::GpuRuntime::Vulkan
+                } else if self.hardware.has_metal {
+                    athenas_core::GpuRuntime::Metal
+                } else {
+                    athenas_core::GpuRuntime::Cpu
+                }
+            }
+            other => other,
+        };
+
+        if let Some(device) = config.gpu_device {
+            match effective_runtime {
+                athenas_core::GpuRuntime::Cuda => {
+                    cmd.env("CUDA_VISIBLE_DEVICES", device.to_string());
+                }
+                athenas_core::GpuRuntime::Rocm => {
+                    // ROCm uses HIP_VISIBLE_DEVICES or ROCR_VISIBLE_DEVICES
+                    cmd.env("HIP_VISIBLE_DEVICES", device.to_string());
+                    cmd.env("ROCR_VISIBLE_DEVICES", device.to_string());
+                }
+                athenas_core::GpuRuntime::Vulkan => {
+                    // Vulkan doesn't have a standard env var for device
+                    // selection, but we can try GPU_SELECT_USE_FIRST_DEVICE
+                    // as a hint. The llama.cpp Vulkan backend typically
+                    // uses device 0 by default.
+                    cmd.env("GGML_VULKAN_DEVICE", device.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        // When runtime is explicitly CPU, force gpu_layers to 0
+        let effective_gpu_layers = if effective_runtime == athenas_core::GpuRuntime::Cpu {
+            0
+        } else {
+            config.gpu_layers
+        };
+
         cmd.arg("--model")
             .arg(&config.model_path)
             .arg("--ctx-size")
@@ -194,8 +243,9 @@ impl LlamaCppBackend {
             }
         }
 
-        if config.gpu_layers >= 0 {
-            cmd.arg("--n-gpu-layers").arg(config.gpu_layers.to_string());
+        if effective_gpu_layers >= 0 {
+            cmd.arg("--n-gpu-layers")
+                .arg(effective_gpu_layers.to_string());
         } else if self.hardware.has_cuda
             || self.hardware.has_rocm
             || self.hardware.has_vulkan

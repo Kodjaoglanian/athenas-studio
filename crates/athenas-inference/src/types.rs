@@ -226,6 +226,12 @@ pub struct StreamChunk {
 pub struct ModelLoadConfig {
     pub model_path: String,
     pub gpu_layers: i32,
+    /// GPU runtime to use: auto, cuda, rocm, vulkan, metal, cpu
+    #[serde(default)]
+    pub gpu_runtime: athenas_core::GpuRuntime,
+    /// Which GPU device to use (0, 1, 2, ...). None = use default.
+    #[serde(default)]
+    pub gpu_device: Option<u32>,
     pub context_size: u32,
     pub batch_size: u32,
     pub threads: u32,
@@ -257,6 +263,8 @@ impl Default for ModelLoadConfig {
         Self {
             model_path: String::new(),
             gpu_layers: -1,
+            gpu_runtime: athenas_core::GpuRuntime::Auto,
+            gpu_device: None,
             context_size: 2048,
             batch_size: 256,
             // Leave at least 1 core free for the system

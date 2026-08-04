@@ -9,6 +9,8 @@ pub async fn run(
     port: u16,
     backend_type: BackendType,
     gpu_layers: i32,
+    gpu_runtime: athenas_core::GpuRuntime,
+    gpu_device: Option<u32>,
     context_size: u32,
     max_concurrent: Option<u32>,
     rate_limit: Option<u32>,
@@ -45,6 +47,8 @@ pub async fn run(
     let load_config = ModelLoadConfig {
         model_path,
         gpu_layers,
+        gpu_runtime,
+        gpu_device,
         context_size,
         batch_size: config.inference.default_batch_size,
         threads: config.inference.default_threads,

@@ -49,6 +49,8 @@ pub enum ConfigField {
     CompressionEnabled,
     // Inference / optimization
     Backend,
+    GpuRuntime,
+    GpuDevice,
     GpuLayers,
     ContextSize,
     BatchSize,
@@ -104,6 +106,8 @@ impl ConfigField {
             ConfigField::MetricsEnabled,
             ConfigField::CompressionEnabled,
             ConfigField::Backend,
+            ConfigField::GpuRuntime,
+            ConfigField::GpuDevice,
             ConfigField::GpuLayers,
             ConfigField::ContextSize,
             ConfigField::BatchSize,
@@ -151,6 +155,8 @@ impl ConfigField {
             ConfigField::MetricsEnabled => "Metrics",
             ConfigField::CompressionEnabled => "Compression",
             ConfigField::Backend => "Backend",
+            ConfigField::GpuRuntime => "GPU Runtime",
+            ConfigField::GpuDevice => "GPU Device",
             ConfigField::GpuLayers => "GPU Layers",
             ConfigField::ContextSize => "Context Size",
             ConfigField::BatchSize => "Batch Size",
@@ -198,6 +204,8 @@ impl ConfigField {
             | ConfigField::MetricsEnabled
             | ConfigField::CompressionEnabled => "SERVER",
             ConfigField::Backend
+            | ConfigField::GpuRuntime
+            | ConfigField::GpuDevice
             | ConfigField::GpuLayers
             | ConfigField::ContextSize
             | ConfigField::BatchSize
@@ -304,6 +312,8 @@ pub struct ServerPanelState {
     // Optimization
     pub backend: BackendType,
     pub gpu_layers: i32,
+    pub gpu_runtime: athenas_core::GpuRuntime,
+    pub gpu_device: Option<u32>,
     pub context_size: u32,
     pub batch_size: u32,
     pub threads: u32,
@@ -388,6 +398,8 @@ impl ServerPanelState {
             compression_enabled: config.server.enable_compression,
             backend: config.inference.default_backend,
             gpu_layers: config.inference.default_gpu_layers,
+            gpu_runtime: config.inference.gpu_runtime,
+            gpu_device: config.inference.gpu_device,
             context_size: config.inference.default_context_size,
             batch_size: config.inference.default_batch_size,
             threads: config.inference.default_threads,
@@ -492,6 +504,11 @@ impl ServerPanelState {
             ConfigField::MetricsEnabled => on_off(self.metrics_enabled),
             ConfigField::CompressionEnabled => on_off(self.compression_enabled),
             ConfigField::Backend => self.backend.to_string(),
+            ConfigField::GpuRuntime => self.gpu_runtime.to_string(),
+            ConfigField::GpuDevice => match self.gpu_device {
+                Some(d) => d.to_string(),
+                None => "auto".to_string(),
+            },
             ConfigField::GpuLayers => {
                 if self.gpu_layers < 0 {
                     "all".to_string()
@@ -614,6 +631,8 @@ impl ServerPanelState {
             ConfigField::MetricsEnabled => "Expose /metrics endpoint (Prometheus)",
             ConfigField::CompressionEnabled => "gzip response compression",
             ConfigField::Backend => "auto, llama.cpp, or vllm",
+            ConfigField::GpuRuntime => "auto, cuda, rocm, vulkan, metal, or cpu",
+            ConfigField::GpuDevice => "GPU index (0, 1, 2, ...) or 'auto' for default",
             ConfigField::GpuLayers => {
                 "-1 = all layers on GPU (CUDA/ROCm/Vulkan/Metal), 0 = CPU only"
             }
@@ -711,6 +730,27 @@ impl ServerPanelState {
                     "vllm" => BackendType::Vllm,
                     _ => return Err("Must be: auto, llama.cpp, or vllm".to_string()),
                 };
+            }
+            ConfigField::GpuRuntime => {
+                self.gpu_runtime = match value.to_lowercase().as_str() {
+                    "auto" => athenas_core::GpuRuntime::Auto,
+                    "cuda" => athenas_core::GpuRuntime::Cuda,
+                    "rocm" => athenas_core::GpuRuntime::Rocm,
+                    "vulkan" => athenas_core::GpuRuntime::Vulkan,
+                    "metal" => athenas_core::GpuRuntime::Metal,
+                    "cpu" => athenas_core::GpuRuntime::Cpu,
+                    _ => return Err("Must be: auto, cuda, rocm, vulkan, metal, or cpu".to_string()),
+                };
+            }
+            ConfigField::GpuDevice => {
+                self.gpu_device =
+                    if value.is_empty() || value.to_lowercase() == "auto" {
+                        None
+                    } else {
+                        Some(value.parse::<u32>().map_err(|_| {
+                            "Must be a GPU index (0, 1, 2, ...) or 'auto'".to_string()
+                        })?)
+                    };
             }
             ConfigField::GpuLayers => {
                 self.gpu_layers = if value == "all" || value == "-1" {
@@ -898,6 +938,8 @@ impl ServerPanelState {
         ModelLoadConfig {
             model_path: model_path.to_string(),
             gpu_layers: self.gpu_layers,
+            gpu_runtime: self.gpu_runtime,
+            gpu_device: self.gpu_device,
             context_size: self.context_size,
             batch_size: self.batch_size,
             threads: self.threads,
@@ -938,6 +980,8 @@ impl ServerPanelState {
         config.server.enable_compression = self.compression_enabled;
         config.inference.default_backend = self.backend;
         config.inference.default_gpu_layers = self.gpu_layers;
+        config.inference.gpu_runtime = self.gpu_runtime;
+        config.inference.gpu_device = self.gpu_device;
         config.inference.default_context_size = self.context_size;
         config.inference.default_batch_size = self.batch_size;
         config.inference.default_threads = self.threads;

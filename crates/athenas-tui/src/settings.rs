@@ -5,6 +5,8 @@ pub enum SettingsField {
     HfToken,
     Backend,
     Device,
+    GpuRuntime,
+    GpuDevice,
     GpuLayers,
     ContextSize,
     BatchSize,
@@ -30,6 +32,8 @@ impl SettingsField {
             SettingsField::HfToken,
             SettingsField::Backend,
             SettingsField::Device,
+            SettingsField::GpuRuntime,
+            SettingsField::GpuDevice,
             SettingsField::GpuLayers,
             SettingsField::ContextSize,
             SettingsField::BatchSize,
@@ -55,6 +59,8 @@ impl SettingsField {
             SettingsField::HfToken => "HF Token",
             SettingsField::Backend => "Backend",
             SettingsField::Device => "Device",
+            SettingsField::GpuRuntime => "GPU Runtime",
+            SettingsField::GpuDevice => "GPU Device",
             SettingsField::GpuLayers => "GPU Layers",
             SettingsField::ContextSize => "Context Size",
             SettingsField::BatchSize => "Batch Size",
@@ -80,6 +86,8 @@ impl SettingsField {
             SettingsField::HfToken => "HuggingFace",
             SettingsField::Backend
             | SettingsField::Device
+            | SettingsField::GpuRuntime
+            | SettingsField::GpuDevice
             | SettingsField::GpuLayers
             | SettingsField::ContextSize
             | SettingsField::BatchSize
@@ -193,6 +201,27 @@ impl SettingsState {
                     _ => return Err("Use: cpu or gpu".to_string()),
                 }
             }
+            SettingsField::GpuRuntime => {
+                self.config.inference.gpu_runtime = match value.to_lowercase().as_str() {
+                    "auto" => athenas_core::GpuRuntime::Auto,
+                    "cuda" => athenas_core::GpuRuntime::Cuda,
+                    "rocm" => athenas_core::GpuRuntime::Rocm,
+                    "vulkan" => athenas_core::GpuRuntime::Vulkan,
+                    "metal" => athenas_core::GpuRuntime::Metal,
+                    "cpu" => athenas_core::GpuRuntime::Cpu,
+                    _ => return Err("Use: auto, cuda, rocm, vulkan, metal, or cpu".to_string()),
+                };
+            }
+            SettingsField::GpuDevice => {
+                self.config.inference.gpu_device =
+                    if value.is_empty() || value.to_lowercase() == "auto" {
+                        None
+                    } else {
+                        Some(value.parse::<u32>().map_err(|_| {
+                            "Must be a GPU index (0, 1, 2, ...) or 'auto'".to_string()
+                        })?)
+                    };
+            }
             SettingsField::GpuLayers => {
                 self.config.inference.default_gpu_layers = value
                     .parse()
@@ -292,6 +321,11 @@ impl SettingsState {
                     "GPU".to_string()
                 }
             }
+            SettingsField::GpuRuntime => self.config.inference.gpu_runtime.to_string(),
+            SettingsField::GpuDevice => match self.config.inference.gpu_device {
+                Some(d) => d.to_string(),
+                None => "auto".to_string(),
+            },
             SettingsField::GpuLayers => self.config.inference.default_gpu_layers.to_string(),
             SettingsField::ContextSize => self.config.inference.default_context_size.to_string(),
             SettingsField::BatchSize => self.config.inference.default_batch_size.to_string(),
@@ -347,6 +381,8 @@ impl SettingsState {
             SettingsField::HfToken => "Get token at huggingface.co/settings/tokens",
             SettingsField::Backend => "llama.cpp | vllm | auto",
             SettingsField::Device => "cpu | gpu (Enter to toggle)",
+            SettingsField::GpuRuntime => "auto, cuda, rocm, vulkan, metal, or cpu",
+            SettingsField::GpuDevice => "GPU index (0, 1, 2, ...) or 'auto' for default",
             SettingsField::GpuLayers => "-1 = all GPU, 0 = CPU only, N = N layers",
             SettingsField::ContextSize => "e.g. 4096",
             SettingsField::BatchSize => "e.g. 256 (larger = faster but more RAM)",

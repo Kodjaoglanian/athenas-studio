@@ -124,6 +124,8 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
         .load_model(ModelLoadConfig {
             model_path: model_path.clone(),
             gpu_layers: config.inference.default_gpu_layers,
+            gpu_runtime: config.inference.gpu_runtime,
+            gpu_device: config.inference.gpu_device,
             context_size: config.inference.default_context_size,
             batch_size: config.inference.default_batch_size,
             threads: config.inference.default_threads,

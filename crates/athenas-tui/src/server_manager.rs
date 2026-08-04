@@ -93,6 +93,8 @@ pub fn start_detached(
     port: u16,
     backend: &str,
     gpu_layers: i32,
+    gpu_runtime: &str,
+    gpu_device: Option<u32>,
     context_size: u32,
     max_concurrent: Option<u32>,
     rate_limit: Option<u32>,
@@ -150,6 +152,25 @@ pub fn start_detached(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log_file));
+
+    // Set GPU runtime environment variables based on the chosen runtime
+    // and device index. These are inherited by the child process and
+    // ultimately by the llama-server subprocess.
+    if let Some(device) = gpu_device {
+        match gpu_runtime {
+            "cuda" => {
+                cmd.env("CUDA_VISIBLE_DEVICES", device.to_string());
+            }
+            "rocm" => {
+                cmd.env("HIP_VISIBLE_DEVICES", device.to_string());
+                cmd.env("ROCR_VISIBLE_DEVICES", device.to_string());
+            }
+            "vulkan" => {
+                cmd.env("GGML_VULKAN_DEVICE", device.to_string());
+            }
+            _ => {}
+        }
+    }
 
     #[cfg(unix)]
     {

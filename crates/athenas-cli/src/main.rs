@@ -60,6 +60,12 @@ enum Commands {
         /// GPU layers to offload
         #[arg(long, default_value = "-1", allow_hyphen_values = true)]
         gpu_layers: i32,
+        /// GPU runtime to use (auto, cuda, rocm, vulkan, metal, cpu)
+        #[arg(long, value_enum, default_value = "auto")]
+        gpu_runtime: athenas_core::GpuRuntime,
+        /// GPU device index to use (0, 1, 2, ...)
+        #[arg(long)]
+        gpu_device: Option<u32>,
         /// Context size
         #[arg(long, default_value = "4096")]
         context_size: u32,
@@ -242,6 +248,8 @@ async fn main() -> anyhow::Result<()> {
                 port,
                 backend,
                 gpu_layers,
+                gpu_runtime,
+                gpu_device,
                 context_size,
                 max_concurrent,
                 rate_limit,
@@ -254,6 +262,8 @@ async fn main() -> anyhow::Result<()> {
                     port,
                     backend,
                     gpu_layers,
+                    gpu_runtime,
+                    gpu_device,
                     context_size,
                     max_concurrent,
                     rate_limit,

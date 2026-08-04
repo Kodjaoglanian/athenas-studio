@@ -631,7 +631,7 @@ impl TuiApp {
                     self.settings_state.status_message = None;
                 }
                 KeyCode::Enter => {
-                    // Device field is a toggle — flip between CPU and GPU
+                    // Device and GpuRuntime are toggles — cycle values
                     // directly on Enter without entering edit mode.
                     let field = self.settings_state.current_field().clone();
                     if field == crate::settings::SettingsField::Device {
@@ -646,6 +646,26 @@ impl TuiApp {
                             self.settings_state.status_message =
                                 Some(format!("Device set to {} — saved", device));
                             self.log(&format!("Device changed to {}", device));
+                        }
+                    } else if field == crate::settings::SettingsField::GpuRuntime {
+                        use athenas_core::GpuRuntime;
+                        let next = match self.settings_state.config.inference.gpu_runtime {
+                            GpuRuntime::Auto => GpuRuntime::Cuda,
+                            GpuRuntime::Cuda => GpuRuntime::Rocm,
+                            GpuRuntime::Rocm => GpuRuntime::Vulkan,
+                            GpuRuntime::Vulkan => GpuRuntime::Metal,
+                            GpuRuntime::Metal => GpuRuntime::Cpu,
+                            GpuRuntime::Cpu => GpuRuntime::Auto,
+                        };
+                        self.settings_state.config.inference.gpu_runtime = next;
+                        let rt_str = next.to_string();
+                        if let Err(e) = self.settings_state.config.save() {
+                            self.settings_state.status_message =
+                                Some(format!("Failed to save: {}", e));
+                        } else {
+                            self.settings_state.status_message =
+                                Some(format!("GPU runtime set to {} — saved", rt_str));
+                            self.log(&format!("GPU runtime changed to {}", rt_str));
                         }
                     } else {
                         self.settings_state.start_edit();
@@ -1366,6 +1386,8 @@ impl TuiApp {
         let load_config = ModelLoadConfig {
             model_path: path.to_string(),
             gpu_layers: self.config.inference.default_gpu_layers,
+            gpu_runtime: self.config.inference.gpu_runtime,
+            gpu_device: self.config.inference.gpu_device,
             context_size,
             batch_size,
             threads,
@@ -1492,6 +1514,20 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
+                    } else if field == ConfigField::GpuRuntime {
+                        // Cycle through GPU runtimes on Enter
+                        use athenas_core::GpuRuntime;
+                        let next = match self.server_panel_state.gpu_runtime {
+                            GpuRuntime::Auto => GpuRuntime::Cuda,
+                            GpuRuntime::Cuda => GpuRuntime::Rocm,
+                            GpuRuntime::Rocm => GpuRuntime::Vulkan,
+                            GpuRuntime::Vulkan => GpuRuntime::Metal,
+                            GpuRuntime::Metal => GpuRuntime::Cpu,
+                            GpuRuntime::Cpu => GpuRuntime::Auto,
+                        };
+                        self.server_panel_state.gpu_runtime = next;
+                        self.server_panel_state.status_message =
+                            Some(format!("GPU runtime: {} (saved on server start)", next));
                     } else if field.is_editable() {
                         self.server_panel_state.start_edit();
                     } else if field == ConfigField::StartServer {
@@ -1566,6 +1602,8 @@ impl TuiApp {
             athenas_core::BackendType::Vllm => "vllm",
         };
         let gpu_layers = self.server_panel_state.gpu_layers;
+        let gpu_runtime = self.server_panel_state.gpu_runtime.to_string();
+        let gpu_device = self.server_panel_state.gpu_device;
         let context_size = self.server_panel_state.context_size;
         let max_concurrent = Some(self.server_panel_state.max_concurrent);
         let rate_limit = Some(self.server_panel_state.rate_limit);
@@ -1579,6 +1617,8 @@ impl TuiApp {
             port,
             backend_str,
             gpu_layers,
+            &gpu_runtime,
+            gpu_device,
             context_size,
             max_concurrent,
             rate_limit,
