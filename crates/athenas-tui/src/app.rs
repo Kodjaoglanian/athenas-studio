@@ -101,6 +101,8 @@ pub struct TuiApp {
     server_log_tailer: Option<tokio::task::JoinHandle<()>>,
     // Background chat streaming state
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
+    // API Key management modal
+    api_key_modal: crate::api_key_modal::ApiKeyModalState,
 }
 
 impl TuiApp {
@@ -156,6 +158,7 @@ impl TuiApp {
             logs_state: crate::log_buffer::LogsState::new(log_buffer),
             server_log_tailer: Some(log_tailer),
             chat_stream_rx: None,
+            api_key_modal: crate::api_key_modal::ApiKeyModalState::new(),
         }
     }
 
@@ -384,12 +387,13 @@ impl TuiApp {
                         continue;
                     }
 
-                    // Global Tab cycling (skip when editing or in chat mode
-                    // where Tab is used for thinking toggle)
+                    // Global Tab cycling (skip when editing, in chat mode,
+                    // or when the API key modal is open)
                     if key.code == KeyCode::Tab
                         && self.mode != AppMode::Chat
                         && !(self.mode == AppMode::Settings && self.settings_state.editing)
                         && !(self.mode == AppMode::Server && self.server_panel_state.editing)
+                        && !self.api_key_modal.open
                     {
                         self.mode = match self.mode {
                             AppMode::Chat => AppMode::ModelList,
@@ -405,6 +409,12 @@ impl TuiApp {
                         if matches!(self.mode, AppMode::Server) {
                             self.server_panel_state.refresh_models(&self.config);
                         }
+                        continue;
+                    }
+
+                    // API key modal intercepts all keys when open
+                    if self.api_key_modal.open {
+                        self.handle_api_key_modal_key(key).await;
                         continue;
                     }
 
@@ -469,6 +479,11 @@ impl TuiApp {
             AppMode::Logs => {
                 components::render_logs(f, content, &self.logs_state);
             }
+        }
+
+        // Render API key modal on top of everything if open
+        if self.api_key_modal.open {
+            crate::api_key_modal::render_api_key_modal(f, &self.api_key_modal);
         }
     }
 
@@ -1396,63 +1411,6 @@ impl TuiApp {
                 }
                 _ => {}
             }
-        } else if self.server_panel_state.editing_key_field.is_some() {
-            // Handle input for the API key creation form
-            match key.code {
-                KeyCode::Esc => {
-                    self.server_panel_state.editing_key_field = None;
-                    self.server_panel_state.status_message =
-                        Some("API key creation cancelled".to_string());
-                }
-                KeyCode::Enter => {
-                    self.cycle_key_form_field().await;
-                }
-                KeyCode::Backspace => {
-                    let field = self.server_panel_state.editing_key_field.clone();
-                    if let Some(f) = field {
-                        match f {
-                            crate::server_panel::KeyEditField::Name => {
-                                self.server_panel_state.new_key_name.pop();
-                            }
-                            crate::server_panel::KeyEditField::RateLimit => {
-                                self.server_panel_state.new_key_rate_limit.pop();
-                            }
-                            crate::server_panel::KeyEditField::TokenLimit => {
-                                self.server_panel_state.new_key_token_limit.pop();
-                            }
-                            crate::server_panel::KeyEditField::AllowedModels => {
-                                self.server_panel_state.new_key_allowed_models.pop();
-                            }
-                        }
-                    }
-                    self.update_key_form_status();
-                }
-                KeyCode::Char(c) => {
-                    let field = self.server_panel_state.editing_key_field.clone();
-                    if let Some(f) = field {
-                        match f {
-                            crate::server_panel::KeyEditField::Name => {
-                                self.server_panel_state.new_key_name.push(c);
-                            }
-                            crate::server_panel::KeyEditField::RateLimit => {
-                                if c.is_ascii_digit() {
-                                    self.server_panel_state.new_key_rate_limit.push(c);
-                                }
-                            }
-                            crate::server_panel::KeyEditField::TokenLimit => {
-                                if c.is_ascii_digit() {
-                                    self.server_panel_state.new_key_token_limit.push(c);
-                                }
-                            }
-                            crate::server_panel::KeyEditField::AllowedModels => {
-                                self.server_panel_state.new_key_allowed_models.push(c);
-                            }
-                        }
-                    }
-                    self.update_key_form_status();
-                }
-                _ => {}
-            }
         } else {
             let field = self.server_panel_state.current_field().clone();
             match key.code {
@@ -1474,11 +1432,6 @@ impl TuiApp {
                     ConfigField::SetDefaultModel => {
                         self.server_panel_state.default_select_prev();
                     }
-                    ConfigField::ApiKeysList
-                    | ConfigField::RevokeApiKey
-                    | ConfigField::DeleteApiKey => {
-                        self.server_panel_state.api_key_select_prev();
-                    }
                     _ => {}
                 },
                 KeyCode::Right | KeyCode::Char('l') => match field {
@@ -1490,11 +1443,6 @@ impl TuiApp {
                     }
                     ConfigField::SetDefaultModel => {
                         self.server_panel_state.default_select_next();
-                    }
-                    ConfigField::ApiKeysList
-                    | ConfigField::RevokeApiKey
-                    | ConfigField::DeleteApiKey => {
-                        self.server_panel_state.api_key_select_next();
                     }
                     _ => {}
                 },
@@ -1513,23 +1461,9 @@ impl TuiApp {
                         self.unload_model_action().await;
                     } else if field == ConfigField::SetDefaultModel {
                         self.set_default_model_action().await;
-                    } else if field == ConfigField::ApiKeysList {
+                    } else if field == ConfigField::ManageApiKeys {
+                        self.api_key_modal.open();
                         self.refresh_api_keys().await;
-                    } else if field == ConfigField::CreateApiKey {
-                        if self.server_panel_state.editing_key_field.is_some() {
-                            // Cycle to next field or submit
-                            self.cycle_key_form_field().await;
-                        } else {
-                            self.server_panel_state.editing_key_field =
-                                Some(crate::server_panel::KeyEditField::Name);
-                            self.server_panel_state.new_key_name.clear();
-                            self.server_panel_state.status_message =
-                                Some("Creating API key — type name, Enter to proceed".to_string());
-                        }
-                    } else if field == ConfigField::RevokeApiKey {
-                        self.revoke_api_key_action().await;
-                    } else if field == ConfigField::DeleteApiKey {
-                        self.delete_api_key_action().await;
                     }
                 }
                 KeyCode::Esc => {
@@ -2336,36 +2270,282 @@ impl TuiApp {
         }
     }
 
-    /// Update status_message with the current form field and its value for visual feedback.
-    fn update_key_form_status(&mut self) {
-        use crate::server_panel::KeyEditField;
-        let Some(ref f) = self.server_panel_state.editing_key_field else {
-            return;
-        };
-        let (label, value) = match f {
-            KeyEditField::Name => ("Name", &self.server_panel_state.new_key_name),
-            KeyEditField::RateLimit => (
-                "Rate limit/min",
-                &self.server_panel_state.new_key_rate_limit,
-            ),
-            KeyEditField::TokenLimit => (
-                "Daily token limit",
-                &self.server_panel_state.new_key_token_limit,
-            ),
-            KeyEditField::AllowedModels => (
-                "Allowed models",
-                &self.server_panel_state.new_key_allowed_models,
-            ),
-        };
-        let display = if value.is_empty() {
-            "(empty)".to_string()
-        } else {
-            value.clone()
-        };
-        self.server_panel_state.status_message = Some(format!("{}: {}|", label, display));
+    /// Handle key events for the API key modal.
+    async fn handle_api_key_modal_key(&mut self, key: event::KeyEvent) {
+        use crate::api_key_modal::ApiKeyModalPhase;
+
+        match self.api_key_modal.phase.clone() {
+            ApiKeyModalPhase::List => match key.code {
+                KeyCode::Esc => {
+                    self.api_key_modal.close();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.api_key_modal.select_prev();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.api_key_modal.select_next();
+                }
+                KeyCode::Enter => {
+                    // Refresh key list
+                    self.refresh_api_keys().await;
+                }
+                KeyCode::Char('n') => {
+                    self.api_key_modal.start_create();
+                }
+                KeyCode::Char('r') => {
+                    self.api_key_modal.start_revoke();
+                }
+                KeyCode::Char('d') => {
+                    self.api_key_modal.start_delete();
+                }
+                _ => {}
+            },
+
+            ApiKeyModalPhase::CreateForm => match key.code {
+                KeyCode::Esc => {
+                    self.api_key_modal.cancel_create();
+                }
+                KeyCode::Enter => {
+                    let submitted = self.api_key_modal.advance_form();
+                    if submitted {
+                        self.submit_create_api_key_modal().await;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.api_key_modal.form_backspace();
+                }
+                KeyCode::Char(c) => {
+                    self.api_key_modal.form_input_char(c);
+                }
+                _ => {}
+            },
+
+            ApiKeyModalPhase::KeyRevealed => match key.code {
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.api_key_modal.dismiss_revealed();
+                    self.refresh_api_keys().await;
+                }
+                _ => {}
+            },
+
+            ApiKeyModalPhase::ConfirmRevoke => match key.code {
+                KeyCode::Enter => {
+                    if let Some(key_id) = self.api_key_modal.selected_key_id() {
+                        let key_name = self
+                            .api_key_modal
+                            .selected_key()
+                            .map(|k| k.name.clone())
+                            .unwrap_or_default();
+                        self.revoke_api_key_modal(key_id, key_name).await;
+                    }
+                }
+                KeyCode::Esc => {
+                    self.api_key_modal.cancel_confirm();
+                }
+                _ => {}
+            },
+
+            ApiKeyModalPhase::ConfirmDelete => match key.code {
+                KeyCode::Enter => {
+                    if let Some(key_id) = self.api_key_modal.selected_key_id() {
+                        let key_name = self
+                            .api_key_modal
+                            .selected_key()
+                            .map(|k| k.name.clone())
+                            .unwrap_or_default();
+                        self.delete_api_key_modal(key_id, key_name).await;
+                    }
+                }
+                KeyCode::Esc => {
+                    self.api_key_modal.cancel_confirm();
+                }
+                _ => {}
+            },
+        }
     }
 
-    /// Fetch the list of API keys from the running server via GET /v1/keys
+    /// Submit the API key creation request from the modal.
+    async fn submit_create_api_key_modal(&mut self) {
+        let Some(ref state) = self.server_state else {
+            self.api_key_modal
+                .set_error("Server not running".to_string());
+            return;
+        };
+        let host = state.host.clone();
+        let port = state.port;
+        let admin_key = if self.server_panel_state.api_key.is_empty() {
+            None
+        } else {
+            Some(self.server_panel_state.api_key.clone())
+        };
+        let (name, rate_limit, token_limit, allowed_models) = self.api_key_modal.form_values();
+
+        let result = tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://{}:{}/v1/keys", host, port);
+            let body = serde_json::json!({
+                "name": name,
+                "rate_limit_per_minute": rate_limit,
+                "daily_token_limit": token_limit,
+                "allowed_models": allowed_models,
+            });
+            let mut req = client.post(&url).json(&body);
+            if let Some(ref key) = admin_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Server returned {}", resp.status()));
+            }
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            Ok::<serde_json::Value, String>(json)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(json)) => {
+                let full_key = json
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let key_name = json
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                self.api_key_modal.reveal_key(key_name, full_key);
+            }
+            Ok(Err(e)) => {
+                self.api_key_modal
+                    .set_error(format!("Failed to create key: {}", e));
+            }
+            Err(e) => {
+                self.api_key_modal
+                    .set_error(format!("Request failed: {}", e));
+            }
+        }
+    }
+
+    /// Revoke an API key from the modal.
+    async fn revoke_api_key_modal(&mut self, key_id: String, key_name: String) {
+        let Some(ref state) = self.server_state else {
+            self.api_key_modal
+                .set_error("Server not running".to_string());
+            return;
+        };
+        let host = state.host.clone();
+        let port = state.port;
+        let admin_key = if self.server_panel_state.api_key.is_empty() {
+            None
+        } else {
+            Some(self.server_panel_state.api_key.clone())
+        };
+        let kid = key_id.clone();
+
+        let result = tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://{}:{}/v1/keys/{}/revoke", host, port, kid);
+            let mut req = client.post(&url);
+            if let Some(ref key) = admin_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Server returned {}", resp.status()));
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                self.api_key_modal.cancel_confirm();
+                self.api_key_modal
+                    .set_info(format!("Revoked key: {}", key_name));
+                self.refresh_api_keys().await;
+            }
+            Ok(Err(e)) => {
+                self.api_key_modal
+                    .set_error(format!("Failed to revoke: {}", e));
+            }
+            Err(e) => {
+                self.api_key_modal
+                    .set_error(format!("Request failed: {}", e));
+            }
+        }
+    }
+
+    /// Delete an API key from the modal.
+    async fn delete_api_key_modal(&mut self, key_id: String, key_name: String) {
+        let Some(ref state) = self.server_state else {
+            self.api_key_modal
+                .set_error("Server not running".to_string());
+            return;
+        };
+        let host = state.host.clone();
+        let port = state.port;
+        let admin_key = if self.server_panel_state.api_key.is_empty() {
+            None
+        } else {
+            Some(self.server_panel_state.api_key.clone())
+        };
+        let kid = key_id.clone();
+
+        let result = tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://{}:{}/v1/keys/{}", host, port, kid);
+            let mut req = client.delete(&url);
+            if let Some(ref key) = admin_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Server returned {}", resp.status()));
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                self.api_key_modal.cancel_confirm();
+                self.api_key_modal
+                    .set_info(format!("Deleted key: {}", key_name));
+                self.refresh_api_keys().await;
+            }
+            Ok(Err(e)) => {
+                self.api_key_modal
+                    .set_error(format!("Failed to delete: {}", e));
+            }
+            Err(e) => {
+                self.api_key_modal
+                    .set_error(format!("Request failed: {}", e));
+            }
+        }
+    }
+
     async fn refresh_api_keys(&mut self) {
         let Some(ref state) = self.server_state else {
             self.server_panel_state.status_message =
@@ -2454,7 +2634,7 @@ impl TuiApp {
                     }
                 }
                 let count = keys.len();
-                self.server_panel_state.api_keys = keys;
+                self.server_panel_state.api_keys = keys.clone();
                 if self.server_panel_state.api_key_selected
                     >= self.server_panel_state.api_keys.len()
                 {
@@ -2462,273 +2642,22 @@ impl TuiApp {
                 }
                 self.server_panel_state.status_message =
                     Some(format!("Loaded {} API key(s)", count));
+                // Also update the modal if it's open
+                self.api_key_modal.set_keys(keys);
             }
             Ok(Err(e)) => {
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to fetch API keys: {}", e));
-            }
-            Err(e) => {
-                self.server_panel_state.status_message = Some(format!("Request failed: {}", e));
-            }
-        }
-    }
-
-    /// Cycle through the API key creation form fields, or submit when done.
-    async fn cycle_key_form_field(&mut self) {
-        use crate::server_panel::KeyEditField;
-        let current = self.server_panel_state.editing_key_field.clone();
-        match current {
-            Some(KeyEditField::Name) => {
-                if self.server_panel_state.new_key_name.trim().is_empty() {
-                    self.server_panel_state.status_message =
-                        Some("Name cannot be empty".to_string());
-                    return;
+                let msg = format!("Failed to fetch API keys: {}", e);
+                self.server_panel_state.status_message = Some(msg.clone());
+                if self.api_key_modal.open {
+                    self.api_key_modal.set_error(msg);
                 }
-                self.server_panel_state.editing_key_field = Some(KeyEditField::RateLimit);
-                self.server_panel_state.status_message =
-                    Some("Rate limit/min (0=unlimited), Enter to proceed".to_string());
-            }
-            Some(KeyEditField::RateLimit) => {
-                self.server_panel_state.editing_key_field = Some(KeyEditField::TokenLimit);
-                self.server_panel_state.status_message =
-                    Some("Daily token limit (0=unlimited), Enter to proceed".to_string());
-            }
-            Some(KeyEditField::TokenLimit) => {
-                self.server_panel_state.editing_key_field = Some(KeyEditField::AllowedModels);
-                self.server_panel_state.status_message = Some(
-                    "Allowed models (comma-separated, empty=all), Enter to create".to_string(),
-                );
-            }
-            Some(KeyEditField::AllowedModels) => {
-                self.server_panel_state.editing_key_field = None;
-                self.submit_create_api_key().await;
-            }
-            None => {}
-        }
-    }
-
-    /// Submit the API key creation request to the running server.
-    async fn submit_create_api_key(&mut self) {
-        let Some(ref state) = self.server_state else {
-            self.server_panel_state.status_message = Some("Server not running".to_string());
-            return;
-        };
-        let host = state.host.clone();
-        let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
-        let name = self.server_panel_state.new_key_name.trim().to_string();
-        let rate_limit: u32 = self
-            .server_panel_state
-            .new_key_rate_limit
-            .trim()
-            .parse()
-            .unwrap_or(60);
-        let token_limit: u64 = self
-            .server_panel_state
-            .new_key_token_limit
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        let allowed_models: Vec<String> = if self
-            .server_panel_state
-            .new_key_allowed_models
-            .trim()
-            .is_empty()
-        {
-            Vec::new()
-        } else {
-            self.server_panel_state
-                .new_key_allowed_models
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-
-        let result = tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let url = format!("http://{}:{}/v1/keys", host, port);
-            let body = serde_json::json!({
-                "name": name,
-                "rate_limit_per_minute": rate_limit,
-                "daily_token_limit": token_limit,
-                "allowed_models": allowed_models,
-            });
-            let mut req = client.post(&url).json(&body);
-            if let Some(ref key) = admin_key {
-                req = req.header("Authorization", format!("Bearer {}", key));
-            }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("Server returned {}", resp.status()));
-            }
-            let json: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("Failed to parse response: {}", e))?;
-            Ok::<serde_json::Value, String>(json)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(json)) => {
-                let new_key = json
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                let key_name = json
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                self.server_panel_state.generated_key_display = Some(new_key.clone());
-                self.server_panel_state.status_message = Some(format!(
-                    "Key '{}' created: {} (copy it now!)",
-                    key_name, new_key
-                ));
-                // Reset form
-                self.server_panel_state.new_key_name.clear();
-                self.server_panel_state.new_key_rate_limit = "60".to_string();
-                self.server_panel_state.new_key_token_limit = "0".to_string();
-                self.server_panel_state.new_key_allowed_models.clear();
-                // Refresh key list
-                self.refresh_api_keys().await;
-            }
-            Ok(Err(e)) => {
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to create key: {}", e));
             }
             Err(e) => {
-                self.server_panel_state.status_message = Some(format!("Request failed: {}", e));
-            }
-        }
-    }
-
-    /// Revoke the selected API key.
-    async fn revoke_api_key_action(&mut self) {
-        let Some(key) = self.server_panel_state.selected_api_key() else {
-            self.server_panel_state.status_message = Some("No API key selected".to_string());
-            return;
-        };
-        if !key.active {
-            self.server_panel_state.status_message = Some("Key is already revoked".to_string());
-            return;
-        }
-        let key_id = key.key_id.clone();
-        let key_name = key.name.clone();
-
-        let Some(ref state) = self.server_state else {
-            self.server_panel_state.status_message = Some("Server not running".to_string());
-            return;
-        };
-        let host = state.host.clone();
-        let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
-        let kid = key_id.clone();
-
-        let result = tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let url = format!("http://{}:{}/v1/keys/{}/revoke", host, port, kid);
-            let mut req = client.post(&url);
-            if let Some(ref key) = admin_key {
-                req = req.header("Authorization", format!("Bearer {}", key));
-            }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("Server returned {}", resp.status()));
-            }
-            Ok::<(), String>(())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                self.server_panel_state.status_message = Some(format!("Revoked key: {}", key_name));
-                self.refresh_api_keys().await;
-            }
-            Ok(Err(e)) => {
-                self.server_panel_state.status_message = Some(format!("Failed to revoke: {}", e));
-            }
-            Err(e) => {
-                self.server_panel_state.status_message = Some(format!("Request failed: {}", e));
-            }
-        }
-    }
-
-    /// Delete the selected API key.
-    async fn delete_api_key_action(&mut self) {
-        let Some(key) = self.server_panel_state.selected_api_key() else {
-            self.server_panel_state.status_message = Some("No API key selected".to_string());
-            return;
-        };
-        let key_id = key.key_id.clone();
-        let key_name = key.name.clone();
-
-        let Some(ref state) = self.server_state else {
-            self.server_panel_state.status_message = Some("Server not running".to_string());
-            return;
-        };
-        let host = state.host.clone();
-        let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
-        let kid = key_id.clone();
-
-        let result = tokio::spawn(async move {
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .map_err(|e| e.to_string())?;
-            let url = format!("http://{}:{}/v1/keys/{}", host, port, kid);
-            let mut req = client.delete(&url);
-            if let Some(ref key) = admin_key {
-                req = req.header("Authorization", format!("Bearer {}", key));
-            }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
-            if !resp.status().is_success() {
-                return Err(format!("Server returned {}", resp.status()));
-            }
-            Ok::<(), String>(())
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                self.server_panel_state.status_message = Some(format!("Deleted key: {}", key_name));
-                self.refresh_api_keys().await;
-            }
-            Ok(Err(e)) => {
-                self.server_panel_state.status_message = Some(format!("Failed to delete: {}", e));
-            }
-            Err(e) => {
-                self.server_panel_state.status_message = Some(format!("Request failed: {}", e));
+                let msg = format!("Request failed: {}", e);
+                self.server_panel_state.status_message = Some(msg.clone());
+                if self.api_key_modal.open {
+                    self.api_key_modal.set_error(msg);
+                }
             }
         }
     }

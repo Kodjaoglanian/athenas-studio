@@ -1,3 +1,4 @@
+pub mod api_key_modal;
 pub mod app;
 pub mod chat;
 pub mod components;

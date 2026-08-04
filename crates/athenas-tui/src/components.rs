@@ -1073,45 +1073,14 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                         .min(state.loaded_models.len() - 1)];
                     (Color::Cyan, format!("★ Default: {}", m.name))
                 }
-            } else if *field == ConfigField::ApiKeysList {
+            } else if *field == ConfigField::ManageApiKeys {
                 if state.api_keys.is_empty() {
-                    (Color::Cyan, "📋 API Keys (press Enter to load)".to_string())
+                    (Color::Cyan, "📋 API Keys (Enter to manage)".to_string())
                 } else {
-                    let k = &state.api_keys[state.api_key_selected.min(state.api_keys.len() - 1)];
-                    let status = if k.active { "active" } else { "revoked" };
                     (
                         Color::Cyan,
-                        format!(
-                            "📋 [{}] {} ({})",
-                            state.api_key_selected + 1,
-                            k.name,
-                            status
-                        ),
+                        format!("📋 {} key(s) (Enter to manage)", state.api_keys.len()),
                     )
-                }
-            } else if *field == ConfigField::CreateApiKey {
-                if state.editing_key_field.is_some() {
-                    (Color::Green, "▶ Create API Key (editing...)".to_string())
-                } else {
-                    (Color::Green, "▶ Create API Key".to_string())
-                }
-            } else if *field == ConfigField::RevokeApiKey {
-                if state.api_keys.is_empty() {
-                    (Color::DarkGray, "○ No keys to revoke".to_string())
-                } else {
-                    let k = &state.api_keys[state.api_key_selected.min(state.api_keys.len() - 1)];
-                    if k.active {
-                        (Color::Yellow, format!("⚠ Revoke: {}", k.name))
-                    } else {
-                        (Color::DarkGray, format!("○ Already revoked: {}", k.name))
-                    }
-                }
-            } else if *field == ConfigField::DeleteApiKey {
-                if state.api_keys.is_empty() {
-                    (Color::DarkGray, "○ No keys to delete".to_string())
-                } else {
-                    let k = &state.api_keys[state.api_key_selected.min(state.api_keys.len() - 1)];
-                    (Color::Red, format!("✖ Delete: {}", k.name))
                 }
             } else {
                 (Color::Gray, String::new())
@@ -1137,126 +1106,13 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
                     ConfigField::SetDefaultModel => {
                         "Left/Right to pick model, Enter to set default"
                     }
-                    ConfigField::ApiKeysList => {
-                        if state.api_keys.is_empty() {
-                            "Enter to fetch keys from server (server must be running)"
-                        } else {
-                            "Left/Right to select, Enter to refresh"
-                        }
-                    }
-                    ConfigField::CreateApiKey => {
-                        if state.editing_key_field.is_some() {
-                            "Type value, Enter to proceed to next field, Esc to cancel"
-                        } else {
-                            "Enter to start creating a new key with custom limits"
-                        }
-                    }
-                    ConfigField::RevokeApiKey => {
-                        "Left/Right to select key, Enter to revoke (deactivate)"
-                    }
-                    ConfigField::DeleteApiKey => {
-                        "Left/Right to select key, Enter to permanently delete"
-                    }
+                    ConfigField::ManageApiKeys => "Enter to open the API key management modal",
                     _ => "",
                 };
                 if !hint.is_empty() {
                     lines.push(Line::styled(
                         format!("     hint: {}", hint),
                         Style::default().fg(Color::DarkGray),
-                    ));
-                }
-            }
-            continue;
-        }
-
-        // Show API key details when ApiKeysList is selected and has keys
-        if *field == ConfigField::ApiKeysList
-            && is_selected
-            && !state.editing
-            && !state.api_keys.is_empty()
-        {
-            let k = &state.api_keys[state.api_key_selected.min(state.api_keys.len() - 1)];
-            let active_color = if k.active { Color::Green } else { Color::Red };
-            lines.push(Line::styled(
-                format!("     key_id: {}", k.key_id),
-                Style::default().fg(Color::DarkGray),
-            ));
-            lines.push(Line::styled(
-                format!("     api_key: {}", k.api_key),
-                Style::default().fg(Color::Cyan),
-            ));
-            lines.push(Line::from(vec![
-                Span::styled("     status: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    if k.active { "active" } else { "revoked" },
-                    Style::default().fg(active_color),
-                ),
-            ]));
-            lines.push(Line::styled(
-                format!(
-                    "     rate_limit: {}/min, daily_tokens: {}",
-                    k.rate_limit_per_minute, k.daily_token_limit
-                ),
-                Style::default().fg(Color::DarkGray),
-            ));
-            let models_str = if k.allowed_models.is_empty() {
-                "all models".to_string()
-            } else {
-                k.allowed_models.join(", ")
-            };
-            lines.push(Line::styled(
-                format!("     allowed_models: {}", models_str),
-                Style::default().fg(Color::DarkGray),
-            ));
-            lines.push(Line::styled(
-                format!("     created: {}", k.created_at),
-                Style::default().fg(Color::DarkGray),
-            ));
-            continue;
-        }
-
-        // Show creation form when CreateApiKey is selected and form is active
-        if *field == ConfigField::CreateApiKey && is_selected && !state.editing {
-            if let Some(ref edit_field) = state.editing_key_field {
-                use crate::server_panel::KeyEditField;
-                let fields: [(&str, &String, KeyEditField); 4] = [
-                    ("Name", &state.new_key_name, KeyEditField::Name),
-                    (
-                        "Rate/min",
-                        &state.new_key_rate_limit,
-                        KeyEditField::RateLimit,
-                    ),
-                    (
-                        "Daily tokens",
-                        &state.new_key_token_limit,
-                        KeyEditField::TokenLimit,
-                    ),
-                    (
-                        "Allowed models",
-                        &state.new_key_allowed_models,
-                        KeyEditField::AllowedModels,
-                    ),
-                ];
-                for (label, value, kf) in &fields {
-                    let is_current = *edit_field == *kf;
-                    let prefix = if is_current { " ► " } else { "   " };
-                    let display = if is_current {
-                        format!("{}|", value)
-                    } else if value.is_empty() {
-                        "(empty)".to_string()
-                    } else {
-                        value.to_string()
-                    };
-                    let style = if is_current {
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    lines.push(Line::styled(
-                        format!("   {}{: <16}: {}", prefix, label, display),
-                        style,
                     ));
                 }
             }

@@ -85,11 +85,8 @@ pub enum ConfigField {
     LoadAdditionalModel,
     UnloadModel,
     SetDefaultModel,
-    // API Key Management (multi-tenant)
-    ApiKeysList,
-    CreateApiKey,
-    RevokeApiKey,
-    DeleteApiKey,
+    // API Key Management (multi-tenant) — opens a modal
+    ManageApiKeys,
 }
 
 impl ConfigField {
@@ -136,10 +133,7 @@ impl ConfigField {
             ConfigField::LoadAdditionalModel,
             ConfigField::UnloadModel,
             ConfigField::SetDefaultModel,
-            ConfigField::ApiKeysList,
-            ConfigField::CreateApiKey,
-            ConfigField::RevokeApiKey,
-            ConfigField::DeleteApiKey,
+            ConfigField::ManageApiKeys,
         ]
     }
 
@@ -186,10 +180,7 @@ impl ConfigField {
             ConfigField::LoadAdditionalModel => "Load Additional Model",
             ConfigField::UnloadModel => "Unload Model",
             ConfigField::SetDefaultModel => "Set Default Model",
-            ConfigField::ApiKeysList => "API Keys",
-            ConfigField::CreateApiKey => "Create API Key",
-            ConfigField::RevokeApiKey => "Revoke API Key",
-            ConfigField::DeleteApiKey => "Delete API Key",
+            ConfigField::ManageApiKeys => "Manage API Keys",
         }
     }
 
@@ -235,10 +226,7 @@ impl ConfigField {
             | ConfigField::LoadAdditionalModel
             | ConfigField::UnloadModel
             | ConfigField::SetDefaultModel => "ACTION",
-            ConfigField::ApiKeysList
-            | ConfigField::CreateApiKey
-            | ConfigField::RevokeApiKey
-            | ConfigField::DeleteApiKey => "API KEYS",
+            ConfigField::ManageApiKeys => "API KEYS",
         }
     }
 
@@ -251,10 +239,7 @@ impl ConfigField {
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
                 | ConfigField::SetDefaultModel
-                | ConfigField::ApiKeysList
-                | ConfigField::CreateApiKey
-                | ConfigField::RevokeApiKey
-                | ConfigField::DeleteApiKey
+                | ConfigField::ManageApiKeys
         )
     }
 
@@ -280,10 +265,7 @@ impl ConfigField {
                 | ConfigField::LoadAdditionalModel
                 | ConfigField::UnloadModel
                 | ConfigField::SetDefaultModel
-                | ConfigField::ApiKeysList
-                | ConfigField::CreateApiKey
-                | ConfigField::RevokeApiKey
-                | ConfigField::DeleteApiKey
+                | ConfigField::ManageApiKeys
         )
     }
 }
@@ -608,32 +590,11 @@ impl ServerPanelState {
                     format!("{} (Left/Right to select)", m.name)
                 }
             }
-            ConfigField::ApiKeysList => {
+            ConfigField::ManageApiKeys => {
                 if self.api_keys.is_empty() {
-                    "Press Enter to load from server".to_string()
+                    "Press Enter to open manager".to_string()
                 } else {
-                    format!("{} key(s) loaded", self.api_keys.len())
-                }
-            }
-            ConfigField::CreateApiKey => {
-                if self.editing_key_field.is_some() {
-                    "Editing form — type and press Enter".to_string()
-                } else {
-                    "Press Enter to create with custom limits".to_string()
-                }
-            }
-            ConfigField::RevokeApiKey => {
-                if self.api_keys.is_empty() {
-                    "No keys loaded".to_string()
-                } else {
-                    "Press Enter to revoke selected".to_string()
-                }
-            }
-            ConfigField::DeleteApiKey => {
-                if self.api_keys.is_empty() {
-                    "No keys loaded".to_string()
-                } else {
-                    "Press Enter to delete selected".to_string()
+                    format!("{} key(s) — Enter to manage", self.api_keys.len())
                 }
             }
         }
@@ -684,12 +645,7 @@ impl ServerPanelState {
             ConfigField::LoadAdditionalModel => "Load another model while server is running",
             ConfigField::UnloadModel => "Unload a model from memory (Left/Right to pick)",
             ConfigField::SetDefaultModel => "Set which model handles requests without model field",
-            ConfigField::ApiKeysList => {
-                "View all API keys (Left/Right to select, Enter to refresh)"
-            }
-            ConfigField::CreateApiKey => "Create a new API key with custom limits",
-            ConfigField::RevokeApiKey => "Revoke (deactivate) the selected API key",
-            ConfigField::DeleteApiKey => "Permanently delete the selected API key",
+            ConfigField::ManageApiKeys => "Open the API key management modal",
         }
     }
 
