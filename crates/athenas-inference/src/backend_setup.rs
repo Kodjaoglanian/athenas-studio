@@ -28,32 +28,31 @@ fn platform_asset_name() -> Option<String> {
     match (os, arch) {
         // Linux x86_64
         ("linux", "x86_64") => {
-            if has_nvidia {
-                // No CUDA prebuilt for Linux — use Vulkan (works with NVIDIA)
-                if has_vulkan {
-                    info!("NVIDIA GPU detected, using Vulkan binary for GPU acceleration");
-                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
-                }
-                // No Vulkan support — try ROCm fallback (unlikely for NVIDIA)
-                warn!("NVIDIA GPU detected but no Vulkan — falling back to CPU binary");
-            }
-            if has_amd {
-                // AMD: prefer ROCm, fall back to Vulkan
-                if detect_rocm() {
-                    info!("AMD GPU detected, using ROCm binary for GPU acceleration");
-                    return Some("bin-ubuntu-rocm-7.2-x64.tar.gz".to_string());
-                }
-                if has_vulkan {
-                    info!("AMD GPU detected, using Vulkan binary for GPU acceleration");
-                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
-                }
-                warn!("AMD GPU detected but no ROCm/Vulkan — falling back to CPU binary");
-            }
+            // On Linux, always prefer Vulkan because:
+            // 1. There is no CUDA prebuilt for Linux from llama.cpp
+            // 2. Many AMD APUs (Barcelo, Renoir, etc.) have rocm-smi
+            //    installed but don't actually support ROCm compute
+            // 3. Vulkan works with NVIDIA, AMD, and Intel GPUs
             if has_vulkan {
-                info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
+                if has_nvidia {
+                    info!("NVIDIA GPU detected, using Vulkan binary for GPU acceleration");
+                } else if has_amd {
+                    info!("AMD GPU detected, using Vulkan binary for GPU acceleration");
+                } else {
+                    info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
+                }
                 return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
             }
-            info!("No GPU detected, using CPU-only binary");
+            // No Vulkan — try ROCm as fallback (AMD only)
+            if has_amd && detect_rocm() {
+                info!("AMD GPU detected with ROCm (no Vulkan), using ROCm binary");
+                return Some("bin-ubuntu-rocm-7.2-x64.tar.gz".to_string());
+            }
+            // No Vulkan, no ROCm — try CUDA (custom build)
+            if has_nvidia {
+                warn!("NVIDIA GPU detected but no Vulkan — falling back to CPU binary");
+            }
+            info!("No GPU/Vulkan detected, using CPU-only binary");
             Some("bin-ubuntu-x64.tar.gz".to_string())
         }
         // Linux aarch64

@@ -114,7 +114,9 @@ impl LlamaCppBackend {
                     config.gpu_layers != 0 && config.gpu_runtime != athenas_core::GpuRuntime::Cpu;
                 let variant_marker = parent.join(".llama-server-variant");
                 let current_variant = std::fs::read_to_string(&variant_marker).unwrap_or_default();
-                let variant_is_cpu = current_variant.contains("bin-ubuntu-x64")
+                // No marker = old install (before v0.7.22) = CPU-only binary
+                let variant_is_cpu = current_variant.trim().is_empty()
+                    || current_variant.contains("bin-ubuntu-x64")
                     || current_variant.contains("bin-win-cpu");
                 let needs_redownload_for_gpu =
                     needs_gpu && variant_is_cpu && path.contains(".athenas");
@@ -193,15 +195,19 @@ impl LlamaCppBackend {
                     athenas_core::GpuRuntime::Metal
                 } else if cfg!(target_os = "linux") {
                     // Linux: we download Vulkan binary (no CUDA prebuilt)
-                    // Prefer ROCm if available (AMD), then Vulkan (NVIDIA/Intel/AMD)
-                    if self.hardware.has_rocm {
-                        athenas_core::GpuRuntime::Rocm
-                    } else if self.hardware.has_vulkan {
+                    // Prefer Vulkan over ROCm because:
+                    // 1. We download the Vulkan binary, not ROCm
+                    // 2. Many AMD APUs (Barcelo, Renoir, etc.) have rocm-smi
+                    //    but don't actually support ROCm compute
+                    // 3. Vulkan works with NVIDIA, AMD, and Intel
+                    if self.hardware.has_vulkan {
                         athenas_core::GpuRuntime::Vulkan
                     } else if self.hardware.has_cuda {
-                        // CUDA detected but no Vulkan — this means the user
-                        // has a custom CUDA build. Use CUDA.
+                        // CUDA detected but no Vulkan — custom CUDA build
                         athenas_core::GpuRuntime::Cuda
+                    } else if self.hardware.has_rocm {
+                        // ROCm without Vulkan — unlikely but handle it
+                        athenas_core::GpuRuntime::Rocm
                     } else {
                         athenas_core::GpuRuntime::Cpu
                     }
