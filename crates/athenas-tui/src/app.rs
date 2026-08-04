@@ -620,6 +620,10 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if let Err(e) = self.settings_state.save_edit() {
                         self.settings_state.status_message = Some(e);
+                    } else {
+                        // Sync settings_state.config back to self.config
+                        // so that load_model uses the updated values
+                        self.config = self.settings_state.config.clone();
                     }
                 }
                 KeyCode::Backspace => {
@@ -659,6 +663,8 @@ impl TuiApp {
                             self.settings_state.status_message =
                                 Some(format!("Device set to {} — saved", device));
                             self.log(&format!("Device changed to {}", device));
+                            // Sync back to self.config so load_model uses it
+                            self.config = self.settings_state.config.clone();
                         }
                     } else if field == crate::settings::SettingsField::GpuRuntime {
                         use athenas_core::GpuRuntime;
@@ -679,6 +685,8 @@ impl TuiApp {
                             self.settings_state.status_message =
                                 Some(format!("GPU runtime set to {} — saved", rt_str));
                             self.log(&format!("GPU runtime changed to {}", rt_str));
+                            // Sync back to self.config so load_model uses it
+                            self.config = self.settings_state.config.clone();
                         }
                     } else {
                         self.settings_state.start_edit();
