@@ -535,6 +535,7 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
             "INFO" => Color::Green,
             "DEBUG" => Color::Blue,
             "TRACE" => Color::DarkGray,
+            "LOG" => Color::Cyan,
             _ => Color::White,
         };
 

@@ -183,6 +183,11 @@ impl TuiApp {
         app
     }
 
+    /// Log a TUI event to the tracing system (appears in the logs page).
+    fn log(&self, msg: &str) {
+        tracing::info!("{}", msg);
+    }
+
     /// Background thread that tails `~/.athenas/server.log` and pushes new
     /// lines into the log buffer. This makes the detached server's logs
     /// (including HTTP request logs) visible in the TUI logs page.
@@ -192,6 +197,11 @@ impl TuiApp {
     /// runtime and TUI rendering.
     ///
     /// The buffer is in-memory only — no logs are persisted by the TUI.
+    ///
+    /// Unlike the previous version, this does NOT block waiting for the log
+    /// file to exist. If the file doesn't exist (no server running), it just
+    /// polls periodically. This means the TUI's own tracing events still
+    /// appear in the logs page even when no server is running.
     fn run_server_log_tailer(buffer: crate::log_buffer::LogBuffer) {
         let log_path = match dirs::home_dir() {
             Some(h) => h.join(".athenas").join("server.log"),
@@ -200,58 +210,37 @@ impl TuiApp {
 
         use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-        // Wait for the log file to exist (the server may not have started yet)
-        loop {
-            if std::fs::File::open(&log_path).is_ok() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-
-        // Read existing content from the beginning so the user sees all
-        // available server logs immediately.
-        if let Ok(file) = std::fs::File::open(&log_path) {
-            let mut reader = BufReader::new(file);
-            let mut buf = String::new();
-            loop {
-                buf.clear();
-                match reader.read_line(&mut buf) {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        let line = buf.trim_end();
-                        if !line.is_empty() {
-                            buffer.push_raw_line(line);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        // Now poll for new lines appended to the file
-        let mut last_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+        // Track the file size we've already read. 0 means we haven't read
+        // anything yet (or the file was truncated/recreated).
+        let mut last_size: u64 = 0;
+        // Track whether we've done the initial read of the file
+        let mut initialized = false;
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            // Check if the file was truncated/recreated (server restarted)
+            // Try to get file metadata. If the file doesn't exist, just
+            // continue polling — don't block.
             let current_size = match std::fs::metadata(&log_path) {
                 Ok(m) => m.len(),
                 Err(_) => {
-                    // File was deleted — wait for it to reappear
-                    loop {
-                        if std::fs::metadata(&log_path).is_ok() {
-                            last_size = 0;
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
+                    // File doesn't exist (no server running). Reset state
+                    // so that when the file appears, we read from the start.
+                    initialized = false;
+                    last_size = 0;
                     continue;
                 }
             };
 
+            if !initialized {
+                // First time the file exists — read from the beginning
+                // so the user sees all available server logs immediately.
+                initialized = true;
+                last_size = 0;
+            }
+
+            // Check if the file was truncated/recreated (server restarted)
             if current_size < last_size {
-                // File was truncated — server restarted, read from beginning
                 last_size = 0;
             }
 
@@ -259,7 +248,7 @@ impl TuiApp {
                 continue;
             }
 
-            // Read new content
+            // Read new content from last_size onwards
             if let Ok(mut f) = std::fs::File::open(&log_path) {
                 let _ = f.seek(SeekFrom::Start(last_size));
                 let mut reader = BufReader::new(f);
@@ -555,6 +544,7 @@ impl TuiApp {
                     .selected()
                     .map(|m| m.file_path.to_string_lossy().to_string())
                 {
+                    self.log(&format!("Loading model from {}", path));
                     self.load_model(&path).await;
                     self.mode = AppMode::Chat;
                 }
@@ -588,6 +578,10 @@ impl TuiApp {
                     self.chat_state.current_backend = None;
                     // Stop any ongoing stream
                     self.chat_stream_rx = None;
+                    self.log(&format!(
+                        "Model '{}' [{}] unloaded from memory",
+                        name, backend_name
+                    ));
                     self.chat_state.add_message(
                         "system",
                         &format!("Model '{}' [{}] unloaded from memory.", name, backend_name),
@@ -637,7 +631,25 @@ impl TuiApp {
                     self.settings_state.status_message = None;
                 }
                 KeyCode::Enter => {
-                    self.settings_state.start_edit();
+                    // Device field is a toggle — flip between CPU and GPU
+                    // directly on Enter without entering edit mode.
+                    let field = self.settings_state.current_field().clone();
+                    if field == crate::settings::SettingsField::Device {
+                        let current = self.settings_state.config.inference.default_gpu_layers;
+                        let new_val = if current == 0 { -1 } else { 0 };
+                        self.settings_state.config.inference.default_gpu_layers = new_val;
+                        let device = if new_val == 0 { "CPU" } else { "GPU" };
+                        if let Err(e) = self.settings_state.config.save() {
+                            self.settings_state.status_message =
+                                Some(format!("Failed to save: {}", e));
+                        } else {
+                            self.settings_state.status_message =
+                                Some(format!("Device set to {} — saved", device));
+                            self.log(&format!("Device changed to {}", device));
+                        }
+                    } else {
+                        self.settings_state.start_edit();
+                    }
                 }
                 KeyCode::Esc => {
                     self.mode = AppMode::Chat;
@@ -1394,6 +1406,10 @@ impl TuiApp {
                     if let Some(ref i) = info {
                         self.chat_state.current_model = Some(i.name.clone());
                         self.chat_state.current_backend = Some(i.backend_name.clone());
+                        self.log(&format!(
+                            "Model '{}' loaded successfully [{}]",
+                            i.name, i.backend_name
+                        ));
                     }
                     self.chat_state
                         .add_message("system", "Model loaded successfully!");
@@ -1401,11 +1417,13 @@ impl TuiApp {
                     self.is_loading_model = false;
                 }
                 Ok(Err(e)) => {
+                    self.log(&format!("Failed to load model: {}", e));
                     self.chat_state
                         .add_message("system", &format!("Failed to load model: {}", e));
                     self.is_loading_model = false;
                 }
                 Err(e) => {
+                    self.log(&format!("Model loading task crashed: {}", e));
                     self.chat_state
                         .add_message("system", &format!("Model loading task crashed: {}", e));
                     self.is_loading_model = false;
@@ -1700,6 +1718,7 @@ impl TuiApp {
                 self.server_panel_state.status_message = None;
 
                 self.server_handle = Some(server_handle);
+                self.log(&format!("Server started on {}:{}", host, port));
 
                 // Update chat state to show server model is available
                 if self.backend.is_none() {
@@ -1717,11 +1736,13 @@ impl TuiApp {
                 self.server_panel_state.phase = ServerPhase::Error;
                 self.server_panel_state.status_message =
                     Some(format!("Failed to start server: {}", e));
+                self.log(&format!("Failed to start server: {}", e));
             }
             Err(e) => {
                 self.server_panel_state.phase = ServerPhase::Error;
                 self.server_panel_state.status_message =
                     Some(format!("Server start task crashed: {}", e));
+                self.log(&format!("Server start task crashed: {}", e));
             }
         }
     }
@@ -1770,6 +1791,7 @@ impl TuiApp {
         self.shared_model_manager = None;
         self.server_state = None;
         self.server_panel_state.status_message = Some("Server stopped".to_string());
+        self.log("Server stopped");
 
         // Clear chat model info if chat was using server model
         if self.backend.is_none() {

@@ -45,9 +45,9 @@ impl LogBuffer {
     }
 
     /// Push a raw log line (e.g. from the detached server's log file) into
-    /// the buffer. Only tracing-formatted lines (starting with an RFC3339
-    /// timestamp) are accepted. `println!` output (server banner, "Loading
-    /// model:", etc.) and box-drawing lines are silently skipped.
+    /// the buffer. ALL non-empty lines are accepted — no filtering. Lines
+    /// that parse as tracing output get structured fields; everything else
+    /// gets stored with level "LOG" so the user can see it.
     pub fn push_raw_line(&self, line: &str) {
         let line = line.trim_end();
         if line.is_empty() {
@@ -59,13 +59,22 @@ impl LogBuffer {
         if clean.is_empty() {
             return;
         }
-        // Only accept lines that look like tracing output: they start with
-        // an RFC3339 timestamp (contains 'T' and ends with 'Z' or has tz).
-        if !is_tracing_log_line(&clean) {
-            return;
+
+        // Try to parse as a tracing log line. If it parses, we get a nice
+        // structured entry. If not, store it as a raw line so the user
+        // still sees it.
+        if is_tracing_log_line(&clean) {
+            let entry = parse_server_log_line(&clean);
+            self.push(entry);
+        } else {
+            // Not a tracing line — store as-is with a "LOG" level
+            self.push(LogEntry {
+                timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
+                level: "LOG".to_string(),
+                target: "server".to_string(),
+                message: clean,
+            });
         }
-        let entry = parse_server_log_line(&clean);
-        self.push(entry);
     }
 
     pub fn entries(&self) -> Vec<LogEntry> {
@@ -79,6 +88,14 @@ impl LogBuffer {
         if let Ok(mut buf) = self.inner.write() {
             buf.clear();
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.read().map(|buf| buf.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -109,7 +126,6 @@ fn strip_ansi(s: &str) -> String {
 
 /// Check if a line looks like a tracing log line. Tracing `fmt` output
 /// starts with an RFC3339 timestamp like "2024-08-04T16:33:43.768Z".
-/// `println!` output (server banner, "Loading model:", etc.) does not.
 fn is_tracing_log_line(line: &str) -> bool {
     // The timestamp is the first token (up to first space)
     let ts_end = line.find(' ').unwrap_or(line.len());
@@ -128,10 +144,6 @@ fn is_tracing_log_line(line: &str) -> bool {
 /// ```text
 /// 2024-08-04T16:33:43.768Z  INFO athenas_server::middleware: GET /v1/health 200 1ms from 127.0.0.1
 /// ```
-///
-/// The level is right-aligned to 5 chars by tracing_subscriber, so "INFO"
-/// appears as " INFO" (with a leading space). After trim_start on the
-/// remainder, we get the level without padding.
 fn parse_server_log_line(line: &str) -> LogEntry {
     // <timestamp>  <LEVEL> <target>: <message>
     let ts_end = line.find(' ').unwrap_or(line.len());
@@ -294,17 +306,10 @@ impl LogsState {
     }
 
     /// Scroll up (toward older logs) by `n` lines.
-    /// Sets auto_scroll to false and moves the view up by decrementing
-    /// scroll_top. The view will stay frozen at this position even as new
-    /// logs arrive.
     pub fn scroll_up(&mut self, n: u16) {
         if self.auto_scroll {
-            // First time scrolling up from auto-scroll: start from the
-            // bottom and move up by n.
             self.auto_scroll = false;
             let total = self.buffer.entries().len() as u16;
-            let visible = 0u16; // will be clamped in render
-            let _ = visible;
             self.scroll_top = total.saturating_sub(n + 1);
         } else {
             self.scroll_top = self.scroll_top.saturating_sub(n);
@@ -318,8 +323,6 @@ impl LogsState {
             return;
         }
         self.scroll_top = self.scroll_top.saturating_add(n);
-        // Check if we've reached the bottom — if so, re-enable auto-scroll.
-        // The exact threshold is checked in render, but we approximate here.
         let total = self.buffer.entries().len() as u16;
         let max_scroll = total.saturating_sub(1);
         if self.scroll_top >= max_scroll {

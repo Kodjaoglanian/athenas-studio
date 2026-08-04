@@ -4,6 +4,7 @@ use athenas_core::AppConfig;
 pub enum SettingsField {
     HfToken,
     Backend,
+    Device,
     GpuLayers,
     ContextSize,
     BatchSize,
@@ -28,6 +29,7 @@ impl SettingsField {
         vec![
             SettingsField::HfToken,
             SettingsField::Backend,
+            SettingsField::Device,
             SettingsField::GpuLayers,
             SettingsField::ContextSize,
             SettingsField::BatchSize,
@@ -52,6 +54,7 @@ impl SettingsField {
         match self {
             SettingsField::HfToken => "HF Token",
             SettingsField::Backend => "Backend",
+            SettingsField::Device => "Device",
             SettingsField::GpuLayers => "GPU Layers",
             SettingsField::ContextSize => "Context Size",
             SettingsField::BatchSize => "Batch Size",
@@ -76,6 +79,7 @@ impl SettingsField {
         match self {
             SettingsField::HfToken => "HuggingFace",
             SettingsField::Backend
+            | SettingsField::Device
             | SettingsField::GpuLayers
             | SettingsField::ContextSize
             | SettingsField::BatchSize
@@ -175,6 +179,20 @@ impl SettingsState {
                     _ => return Err("Use: llama.cpp, vllm, or auto".to_string()),
                 };
             }
+            SettingsField::Device => {
+                match value.to_lowercase().as_str() {
+                    "cpu" => {
+                        self.config.inference.default_gpu_layers = 0;
+                    }
+                    "gpu" => {
+                        // Set to -1 (auto-offload all layers) if currently 0
+                        if self.config.inference.default_gpu_layers == 0 {
+                            self.config.inference.default_gpu_layers = -1;
+                        }
+                    }
+                    _ => return Err("Use: cpu or gpu".to_string()),
+                }
+            }
             SettingsField::GpuLayers => {
                 self.config.inference.default_gpu_layers = value
                     .parse()
@@ -267,6 +285,13 @@ impl SettingsState {
                 }
             }
             SettingsField::Backend => self.config.inference.default_backend.to_string(),
+            SettingsField::Device => {
+                if self.config.inference.default_gpu_layers == 0 {
+                    "CPU".to_string()
+                } else {
+                    "GPU".to_string()
+                }
+            }
             SettingsField::GpuLayers => self.config.inference.default_gpu_layers.to_string(),
             SettingsField::ContextSize => self.config.inference.default_context_size.to_string(),
             SettingsField::BatchSize => self.config.inference.default_batch_size.to_string(),
@@ -321,7 +346,8 @@ impl SettingsState {
         match field {
             SettingsField::HfToken => "Get token at huggingface.co/settings/tokens",
             SettingsField::Backend => "llama.cpp | vllm | auto",
-            SettingsField::GpuLayers => "-1 for all GPU layers",
+            SettingsField::Device => "cpu | gpu (Enter to toggle)",
+            SettingsField::GpuLayers => "-1 = all GPU, 0 = CPU only, N = N layers",
             SettingsField::ContextSize => "e.g. 4096",
             SettingsField::BatchSize => "e.g. 256 (larger = faster but more RAM)",
             SettingsField::Threads => "0 = auto (uses CPU count - 1)",
