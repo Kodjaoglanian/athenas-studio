@@ -44,11 +44,18 @@ pub async fn run(
     let mut backend = BackendFactory::create(backend_type, &hardware)?;
 
     println!("Loading model: {}", model_path);
+    // Fall back to config values when CLI args are at defaults
+    let effective_gpu_runtime = if gpu_runtime == athenas_core::GpuRuntime::Auto {
+        config.inference.gpu_runtime
+    } else {
+        gpu_runtime
+    };
+    let effective_gpu_device = gpu_device.or(config.inference.gpu_device);
     let load_config = ModelLoadConfig {
         model_path,
         gpu_layers,
-        gpu_runtime,
-        gpu_device,
+        gpu_runtime: effective_gpu_runtime,
+        gpu_device: effective_gpu_device,
         context_size,
         batch_size: config.inference.default_batch_size,
         threads: config.inference.default_threads,

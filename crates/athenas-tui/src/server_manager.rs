@@ -115,8 +115,14 @@ pub fn start_detached(
         .arg(backend)
         .arg("--gpu-layers")
         .arg(gpu_layers.to_string())
+        .arg("--gpu-runtime")
+        .arg(gpu_runtime)
         .arg("--context-size")
         .arg(context_size.to_string());
+
+    if let Some(device) = gpu_device {
+        cmd.arg("--gpu-device").arg(device.to_string());
+    }
 
     if let Some(mc) = max_concurrent {
         cmd.arg("--max-concurrent").arg(mc.to_string());

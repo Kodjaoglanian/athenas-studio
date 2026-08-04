@@ -39,6 +39,14 @@ fn render_messages(
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
+    // Available width inside the block borders. We pre-wrap text to this
+    // width so that lines.len() accurately reflects the number of rendered
+    // rows. This fixes the scroll bug where wrapped lines weren't counted.
+    //
+    // -2 for left/right borders, -2 for the "  " indent prefix on content.
+    let content_width = area.width.saturating_sub(4) as usize;
+    let reasoning_width = area.width.saturating_sub(6) as usize; // "    " prefix
+
     let mut lines: Vec<Line> = Vec::new();
 
     for msg in &state.messages {
@@ -64,12 +72,14 @@ fn render_messages(
                         .add_modifier(Modifier::DIM),
                 ));
                 for line in msg.reasoning.lines() {
-                    lines.push(Line::styled(
-                        format!("    {}", line),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ));
+                    for wrapped in wrap_text(line, reasoning_width) {
+                        lines.push(Line::styled(
+                            format!("    {}", wrapped),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
                 }
                 lines.push(Line::styled(
                     "  [/Thinking]",
@@ -95,7 +105,9 @@ fn render_messages(
         }
 
         for line in msg.content.lines() {
-            lines.push(Line::from(format!("  {}", line)));
+            for wrapped in wrap_text(line, content_width) {
+                lines.push(Line::from(format!("  {}", wrapped)));
+            }
         }
         lines.push(Line::from(""));
     }
@@ -153,12 +165,14 @@ fn render_messages(
                         .add_modifier(Modifier::DIM),
                 ));
                 for line in state.streaming_reasoning.lines() {
-                    lines.push(Line::styled(
-                        format!("    {}", line),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::DIM),
-                    ));
+                    for wrapped in wrap_text(line, reasoning_width) {
+                        lines.push(Line::styled(
+                            format!("    {}", wrapped),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
                 }
                 lines.push(Line::styled(
                     "  [/Thinking]",
@@ -168,7 +182,9 @@ fn render_messages(
                 ));
             }
             for line in state.streaming_text.lines() {
-                lines.push(Line::from(format!("  {}", line)));
+                for wrapped in wrap_text(line, content_width) {
+                    lines.push(Line::from(format!("  {}", wrapped)));
+                }
             }
             // Show live elapsed + tok/s during streaming
             if elapsed > 2 {
@@ -249,12 +265,87 @@ fn render_messages(
         ))
         .border_style(Style::default().fg(Color::DarkGray));
 
+    // No .wrap() — we pre-wrapped the text ourselves so lines.len()
+    // matches the actual rendered row count, making scroll accurate.
     let paragraph = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0));
 
     f.render_widget(paragraph, area);
+}
+
+/// Wrap a single line of text to fit within `width` display columns.
+/// Respects word boundaries — breaks at spaces when possible, and breaks
+/// mid-word when a single word is longer than `width`.
+///
+/// Returns one or more strings, each fitting within `width` columns.
+/// If the input is empty, returns a single empty string.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut result: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len: usize = 0;
+
+    for word in text.split(' ') {
+        let word_len = word.chars().count();
+
+        if current.is_empty() {
+            // First word on this line
+            if word_len <= width {
+                current = word.to_string();
+                current_len = word_len;
+            } else {
+                // Word is longer than width — break it character by character
+                let mut chars: Vec<char> = word.chars().collect();
+                while chars.len() > width {
+                    let chunk: String = chars.drain(..width).collect();
+                    result.push(chunk);
+                }
+                if !chars.is_empty() {
+                    current = chars.iter().collect();
+                    current_len = chars.len();
+                }
+            }
+        } else if current_len + 1 + word_len <= width {
+            // Word fits on current line
+            current.push(' ');
+            current.push_str(word);
+            current_len += 1 + word_len;
+        } else {
+            // Word doesn't fit — flush current line and start new one
+            result.push(current.clone());
+            current.clear();
+            current_len = 0;
+
+            if word_len <= width {
+                current = word.to_string();
+                current_len = word_len;
+            } else {
+                // Word is longer than width — break it
+                let mut chars: Vec<char> = word.chars().collect();
+                while chars.len() > width {
+                    let chunk: String = chars.drain(..width).collect();
+                    result.push(chunk);
+                }
+                if !chars.is_empty() {
+                    current = chars.iter().collect();
+                    current_len = chars.len();
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() || result.is_empty() {
+        result.push(current);
+    }
+
+    result
 }
 
 fn render_input(f: &mut Frame, area: Rect, state: &ChatState) {
