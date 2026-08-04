@@ -46,9 +46,14 @@ impl LogBuffer {
 
     /// Push a raw log line (e.g. from the detached server's log file) into
     /// the buffer. The line is parsed to extract timestamp, level, target,
-    /// and message. If parsing fails, the whole line is stored as the message
-    /// with a "server" target.
+    /// and message. Lines that don't look like tracing log output (e.g.
+    /// server startup banner printed via `println!`) are silently skipped
+    /// to avoid polluting the log viewer.
     pub fn push_raw_line(&self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() || !is_tracing_log_line(line) {
+            return;
+        }
         let entry = parse_server_log_line(line);
         self.push(entry);
     }
@@ -67,26 +72,40 @@ impl LogBuffer {
     }
 }
 
+/// Check if a line looks like a tracing log line (starts with an RFC3339
+/// timestamp followed by a log level). This filters out `println!` output
+/// like the server startup banner.
+fn is_tracing_log_line(line: &str) -> bool {
+    // Tracing fmt output: "2024-01-15T10:30:45.123456Z  INFO target: message"
+    // The timestamp ends at the first space, then after trimming spaces we
+    // expect one of: TRACE, DEBUG, INFO, WARN, ERROR
+    let ts_end = match line.find(' ') {
+        Some(i) => i,
+        None => return false,
+    };
+    let timestamp = &line[..ts_end];
+    // Must contain 'T' (RFC3339 date-time separator)
+    if !timestamp.contains('T') {
+        return false;
+    }
+    let rest = line[ts_end..].trim_start();
+    // Check if it starts with a known log level
+    for level in ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"] {
+        if rest.starts_with(level) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parse a line from the detached server's log file (tracing `fmt` output).
 ///
 /// The default `tracing_subscriber::fmt()` format is:
 /// ```text
 /// 2024-01-15T10:30:45.123456Z  INFO athenas_server::middleware: GET /v1/health 200 1ms from 127.0.0.1
 /// ```
-/// This function extracts the timestamp, level, target, and message. If the
-/// line doesn't match the expected format, it is stored wholesale as the
-/// message with a "server" target.
+/// This function extracts the timestamp, level, target, and message.
 fn parse_server_log_line(line: &str) -> LogEntry {
-    let line = line.trim_end();
-    if line.is_empty() {
-        return LogEntry {
-            timestamp: Local::now().format("%H:%M:%S%.3f").to_string(),
-            level: "INFO".to_string(),
-            target: "server".to_string(),
-            message: String::new(),
-        };
-    }
-
     // Try to split: <timestamp>  <LEVEL> <target>: <message>
     // The timestamp ends at the first space. Then there are 1-2 spaces, then
     // the level (5 chars, left-aligned), then a space, then target, then ": ".

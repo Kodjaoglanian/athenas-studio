@@ -488,6 +488,11 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
         ))
         .border_style(Style::default().fg(Color::DarkGray));
 
+    // Inner width of the log area (minus borders). Each log line is truncated
+    // to this width so long lines (e.g. server startup banner) don't wrap and
+    // break the layout.
+    let inner_width = chunks[0].width.saturating_sub(2) as usize;
+
     let entries = state.entries();
     let mut lines: Vec<Line> = Vec::new();
 
@@ -499,6 +504,28 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
             "DEBUG" => Color::Blue,
             "TRACE" => Color::DarkGray,
             _ => Color::White,
+        };
+
+        // Fixed-width prefix: " HH:MM:SS.mmm LEVEL " = 14 + 6 = 20 chars
+        let prefix_len = 20usize;
+        // Truncate target to at most 25 chars to leave room for the message
+        let max_target = 25usize;
+        let target_display: String = if entry.target.chars().count() > max_target {
+            entry.target.chars().take(max_target).collect()
+        } else {
+            entry.target.clone()
+        };
+        // target span + trailing space
+        let target_span_len = target_display.chars().count() + 1;
+        // Remaining width for the message
+        let max_msg = inner_width.saturating_sub(prefix_len + target_span_len);
+
+        let message_display = if entry.message.chars().count() > max_msg && max_msg > 3 {
+            // Truncate with ellipsis
+            let truncated: String = entry.message.chars().take(max_msg - 3).collect();
+            format!("{}...", truncated)
+        } else {
+            entry.message.clone()
         };
 
         lines.push(Line::from(vec![
@@ -513,10 +540,10 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{} ", entry.target),
+                format!("{} ", target_display),
                 Style::default().fg(Color::DarkGray),
             ),
-            Span::styled(entry.message.clone(), Style::default().fg(Color::White)),
+            Span::styled(message_display, Style::default().fg(Color::White)),
         ]));
     }
 
@@ -527,7 +554,9 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
         ));
     }
 
-    // Auto-scroll to bottom, or apply manual scroll offset
+    // Auto-scroll to bottom, or apply manual scroll offset.
+    // Since we don't use Wrap, each Line is exactly one rendered row, so
+    // lines.len() accurately reflects the number of visible rows.
     let total_lines = lines.len() as u16;
     let visible_height = chunks[0].height.saturating_sub(2);
     let scroll = if state.auto_scroll && total_lines > visible_height {
@@ -541,10 +570,7 @@ pub fn render_logs(f: &mut Frame, area: Rect, state: &crate::log_buffer::LogsSta
         0
     };
 
-    let p = Paragraph::new(lines)
-        .block(block)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines).block(block).scroll((scroll, 0));
     f.render_widget(p, chunks[0]);
 
     let status = if state.auto_scroll {
