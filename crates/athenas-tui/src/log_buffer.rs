@@ -45,22 +45,26 @@ impl LogBuffer {
     }
 
     /// Push a raw log line (e.g. from the detached server's log file) into
-    /// the buffer. The line is parsed to extract timestamp, level, target,
-    /// and message. Lines that don't look like tracing log output (e.g.
-    /// server startup banner printed via `println!`) are stored with a
-    /// "server" target so they're still visible but don't break the layout.
+    /// the buffer. Only tracing-formatted lines (starting with an RFC3339
+    /// timestamp) are accepted. `println!` output (server banner, "Loading
+    /// model:", etc.) and box-drawing lines are silently skipped.
     pub fn push_raw_line(&self, line: &str) {
         let line = line.trim_end();
         if line.is_empty() {
             return;
         }
-        // Skip pure box-drawing / decoration lines (server startup banner)
-        // These contain only borders, corners, and whitespace — no useful info
-        let has_alnum = line.chars().any(|c| c.is_alphanumeric());
-        if !has_alnum {
+        // Strip ANSI escape codes (the server's tracing subscriber may emit
+        // them even to a file if with_ansi wasn't disabled at the time)
+        let clean = strip_ansi(line);
+        if clean.is_empty() {
             return;
         }
-        let entry = parse_server_log_line(line);
+        // Only accept lines that look like tracing output: they start with
+        // an RFC3339 timestamp (contains 'T' and ends with 'Z' or has tz).
+        if !is_tracing_log_line(&clean) {
+            return;
+        }
+        let entry = parse_server_log_line(&clean);
         self.push(entry);
     }
 
@@ -78,22 +82,62 @@ impl LogBuffer {
     }
 }
 
-/// Parse a line from the detached server's log file (tracing `fmt` output).
+/// Strip ANSI escape codes from a string.
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // ESC sequence: skip until we find a letter (the final byte)
+            // Common patterns: \x1b[...m, \x1b[...H, etc.
+            // Skip the '[' or other intermediate byte
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            // Skip until we find a letter in 0x40-0x7E range
+            for inner in chars.by_ref() {
+                if inner.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Check if a line looks like a tracing log line. Tracing `fmt` output
+/// starts with an RFC3339 timestamp like "2024-08-04T16:33:43.768Z".
+/// `println!` output (server banner, "Loading model:", etc.) does not.
+fn is_tracing_log_line(line: &str) -> bool {
+    // The timestamp is the first token (up to first space)
+    let ts_end = line.find(' ').unwrap_or(line.len());
+    let timestamp = &line[..ts_end];
+    // RFC3339 timestamps contain 'T' (date/time separator)
+    if !timestamp.contains('T') {
+        return false;
+    }
+    // And end with 'Z' (UTC) or contain a timezone offset (+/-)
+    timestamp.ends_with('Z') || timestamp.contains('+') || timestamp.contains('-')
+}
+
+/// Parse a tracing `fmt` log line into a LogEntry.
 ///
-/// The default `tracing_subscriber::fmt()` format is:
+/// Expected format (after ANSI stripping):
 /// ```text
-/// 2024-01-15T10:30:45.123456Z  INFO athenas_server::middleware: GET /v1/health 200 1ms from 127.0.0.1
+/// 2024-08-04T16:33:43.768Z  INFO athenas_server::middleware: GET /v1/health 200 1ms from 127.0.0.1
 /// ```
-/// This function extracts the timestamp, level, target, and message.
+///
+/// The level is right-aligned to 5 chars by tracing_subscriber, so "INFO"
+/// appears as " INFO" (with a leading space). After trim_start on the
+/// remainder, we get the level without padding.
 fn parse_server_log_line(line: &str) -> LogEntry {
-    // Try to split: <timestamp>  <LEVEL> <target>: <message>
-    // The timestamp ends at the first space. Then there are 1-2 spaces, then
-    // the level (5 chars, left-aligned), then a space, then target, then ": ".
-    // Find end of timestamp (first space)
+    // <timestamp>  <LEVEL> <target>: <message>
     let ts_end = line.find(' ').unwrap_or(line.len());
     let timestamp_raw = &line[..ts_end];
 
-    // Skip spaces after timestamp
+    // Skip spaces after timestamp (there are 2+ spaces due to level padding)
     let rest = line[ts_end..].trim_start();
 
     // Level is the first token (up to next space)

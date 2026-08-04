@@ -13,8 +13,11 @@ use tracing_subscriber::EnvFilter;
 /// Initialize OpenTelemetry tracing and return a guard for cleanup.
 pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
     if !config.enabled {
-        // Just initialize basic tracing
+        // Just initialize basic tracing.
+        // Disable ANSI colors so the log file output is clean and parseable
+        // by the TUI log tailer.
         let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
             .with_env_filter(
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
             )
@@ -60,7 +63,7 @@ pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
 
     let _ = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .with(otel_layer)
         .try_init();
 
