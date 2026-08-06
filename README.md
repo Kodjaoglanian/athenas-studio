@@ -25,6 +25,7 @@
 - **Multimodal Model Support** — Automatic mmproj (multimodal projector) detection and download for vision models (llama.cpp)
 - **CLI Commands** — Full command-line interface for scripting and automation
 - **Multiple Backends** — llama.cpp (CUDA/ROCm/Vulkan/CPU) and vLLM (CUDA/ROCm)
+- **GPU Auto-Download** — Automatically downloads the correct GPU-accelerated llama-server binary (Vulkan for Linux, CUDA for Windows, Metal for macOS) based on detected hardware
 - **HuggingFace Integration** — Search, download, and manage models from HuggingFace Hub with automatic mmproj download
 - **OpenAI-Compatible API Server** — Drop-in replacement for OpenAI API endpoints with multi-model support
 - **Reasoning/Thinking Mode** — Support for reasoning models (Qwen3.5, DeepSeek R1, etc.) with configurable thinking budget
@@ -82,9 +83,27 @@ cargo build --release
 
 ### Prerequisites
 
-- **Rust** 1.70+ (install via [rustup](https://rustup.rs))
-- **llama.cpp** — Install and ensure `llama-server` is in PATH (for llama.cpp backend)
+- **Rust** 1.70+ (install via [rustup](https://rustup.rs)) — only needed for building from source
+- **llama.cpp** — **Automatically downloaded** on first run. The correct GPU-accelerated binary (Vulkan/CUDA/ROCm/Metal) is selected based on your hardware. You can also install `llama-server` manually in PATH if you prefer a custom build.
 - **vLLM** — `pip install vllm` (for vLLM backend, requires CUDA or ROCm)
+
+#### GPU Support on Linux
+
+On Linux, athenas-studio downloads the **Vulkan** binary from llama.cpp releases (no CUDA prebuilt available for Linux). Vulkan works with NVIDIA, AMD, and Intel GPUs.
+
+Make sure you have Vulkan libraries installed:
+```bash
+# Ubuntu/Debian
+sudo apt install -y libvulkan1 mesa-vulkan-drivers
+
+# Fedora
+sudo dnf install -y vulkan-loader
+
+# Arch
+sudo pacman -S vulkan-icd-loader
+```
+
+For NVIDIA GPUs, also ensure your driver supports Vulkan (driver >= 390.x).
 
 ### Global Flags
 
@@ -102,12 +121,32 @@ All commands support these optional flags:
 athenas
 ```
 
-The TUI provides:
-- **Chat panel** — Interactive chat with streaming responses
-- **Model browser** — Search and download models from HuggingFace (F3)
-- **Server panel** — Configure and manage the API server with multi-model support
+The TUI provides 6 tabs (F1–F6):
 
-#### TUI Server Panel — Multi-Model Management
+| Key | Tab | Description |
+|-----|-----|-------------|
+| F1 | Chat | Interactive chat with streaming responses |
+| F2 | Models | List local models, load/unload models |
+| F3 | Browser | Search and download models from HuggingFace |
+| F4 | Server | Configure and manage the API server with multi-model support |
+| F5 | Settings | Edit inference settings (GPU, temperature, threads, etc.) |
+| F6 | Logs | Live server logs and tracing output |
+
+You can also use **Tab** to cycle between tabs.
+
+#### TUI Settings (F5)
+
+The settings page lets you configure all inference parameters:
+- **Device** — Toggle between CPU and GPU (Enter to toggle)
+- **GPU Runtime** — Cycle through Auto/CUDA/ROCm/Vulkan/Metal/CPU (Enter to cycle)
+- **GPU Layers** — Number of layers to offload to GPU (-1 = all)
+- **Temperature, Top-P, Max Tokens** — Sampling parameters
+- **Context Size, Batch Size, Threads** — Performance tuning
+- **Flash Attention, Streaming, Reasoning** — Feature toggles
+
+All changes are saved to `~/.athenas/config.toml` and applied immediately.
+
+#### TUI Server Panel — Multi-Model Management (F4)
 
 When the server is running, you can:
 1. Use **Left/Right** on the **Model** field to select a different model
@@ -116,9 +155,9 @@ When the server is running, you can:
 4. Use **★ Default** (Left/Right to select, Enter to set) to choose which model handles requests without a `model` field
 5. The **LOADED MODELS** section shows all active models with their IDs, backends, and default status (★)
 
-#### TUI Server Panel — Enterprise Configuration
+#### TUI Server Panel — Enterprise Configuration (F4)
 
-The server panel (F5) also provides full configuration for enterprise features:
+The server panel (F4) also provides full configuration for enterprise features:
 
 - **ADVANCED:** Parallel Slots, LoRA Adapters (comma-separated paths)
 - **VECTOR STORE:** Enable/disable, Max Documents, Default Top-K
@@ -358,7 +397,9 @@ data_dir = "~/.athenas/data"
 
 [inference]
 default_backend = "auto"        # auto, llama.cpp, vllm
-default_gpu_layers = -1         # -1 = all
+default_gpu_layers = -1         # -1 = all, 0 = CPU only
+gpu_runtime = "auto"            # auto, cuda, rocm, vulkan, metal, cpu
+# gpu_device = 0                # GPU index (0, 1, 2, ...). None = auto
 default_context_size = 4096
 default_batch_size = 512
 default_threads = 0             # 0 = auto-detect (leaves 1 core free)
@@ -419,7 +460,19 @@ file_logging = false
 - **Best for:** Single-user inference, GGUF models, CPU/GPU mix, multimodal models
 - **GPU support:** CUDA, ROCm, Vulkan, Metal
 - **Multimodal:** Automatically detects and uses mmproj files for vision models
-- **Install:** Build [llama.cpp](https://github.com/ggerganov/llama.cpp) and add `llama-server` to PATH
+- **Install:** **Automatic** — the correct GPU-accelerated `llama-server` binary is downloaded on first run based on your OS and GPU. You can also build [llama.cpp](https://github.com/ggml-org/llama.cpp) manually and add `llama-server` to PATH.
+
+| Platform | GPU | Binary downloaded |
+|----------|-----|--------------------|
+| Linux + NVIDIA | Yes | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Linux + AMD | Yes | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Linux + Intel | Yes | `bin-ubuntu-vulkan-x64.tar.gz` |
+| Linux | None | `bin-ubuntu-x64.tar.gz` (CPU-only) |
+| Windows + NVIDIA | Yes | `bin-win-cuda-12.4-x64.zip` |
+| Windows + AMD | Yes | `bin-win-hip-radeon-x64.zip` |
+| macOS | Apple Silicon | Metal (built into all macOS binaries) |
+
+**Note:** On Linux, there is no CUDA prebuilt binary from llama.cpp. We use Vulkan instead, which works with all GPU vendors. Performance is comparable to CUDA for inference.
 
 ### vLLM
 - **Best for:** High-throughput serving, multi-user, PagedAttention

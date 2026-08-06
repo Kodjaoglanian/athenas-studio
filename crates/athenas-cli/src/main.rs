@@ -7,9 +7,9 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "athenas",
-    about = "Athenas Studio — CLI/TUI for LLM inference (CUDA/ROCm/vLLM)",
+    about = "Athenas Studio — CLI/TUI for LLM inference (CUDA/ROCm/Vulkan/Metal)",
     version,
-    long_about = "A powerful CLI/TUI tool for running LLM models locally with CUDA, ROCm, and vLLM support. Compatible with HuggingFace model hub and OpenAI API."
+    long_about = "A powerful CLI/TUI tool for running LLM models locally with CUDA, ROCm, Vulkan, Metal, and vLLM support. Compatible with HuggingFace model hub and OpenAI API."
 )]
 struct Cli {
     /// Enable verbose logging
