@@ -170,17 +170,53 @@ fn detect_vulkan_support() -> bool {
 }
 
 /// Query GitHub API for the latest llama.cpp release tag.
-async fn get_latest_release_tag() -> Result<String> {
-    let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
-        LLAMA_CPP_REPO
-    );
-
+/// If `required_asset` is provided, searches recent releases for one
+/// that contains an asset with the given suffix (e.g. "bin-ubuntu-vulkan-x64.tar.gz").
+/// This is needed because the latest release sometimes doesn't have all assets.
+async fn get_latest_release_tag(required_asset: Option<&str>) -> Result<String> {
     let client = reqwest::Client::builder()
         .user_agent("athenas-studio")
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| AthenasError::Backend(format!("Failed to create HTTP client: {}", e)))?;
+
+    // If no specific asset is needed, just get the latest release
+    if required_asset.is_none() {
+        let url = format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            LLAMA_CPP_REPO
+        );
+        let resp = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("GitHub API request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(AthenasError::Backend(format!(
+                "GitHub API returned {}",
+                resp.status()
+            )));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            AthenasError::Backend(format!("Failed to parse GitHub response: {}", e))
+        })?;
+
+        let tag = json["tag_name"]
+            .as_str()
+            .ok_or_else(|| AthenasError::Backend("No tag_name in GitHub response".into()))?;
+
+        return Ok(tag.to_string());
+    }
+
+    // Search recent releases for one that has the required asset
+    let required = required_asset.unwrap();
+    let url = format!(
+        "https://api.github.com/repos/{}/releases?per_page=10",
+        LLAMA_CPP_REPO
+    );
 
     let resp = client
         .get(&url)
@@ -196,16 +232,37 @@ async fn get_latest_release_tag() -> Result<String> {
         )));
     }
 
-    let json: serde_json::Value = resp
+    let releases: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| AthenasError::Backend(format!("Failed to parse GitHub response: {}", e)))?;
 
-    let tag = json["tag_name"]
-        .as_str()
-        .ok_or_else(|| AthenasError::Backend("No tag_name in GitHub response".into()))?;
+    let releases_arr = releases
+        .as_array()
+        .ok_or_else(|| AthenasError::Backend("Expected array of releases".into()))?;
 
-    Ok(tag.to_string())
+    for release in releases_arr {
+        let tag = release["tag_name"]
+            .as_str()
+            .ok_or_else(|| AthenasError::Backend("No tag_name in release".into()))?;
+
+        if let Some(assets) = release["assets"].as_array() {
+            for asset in assets {
+                if let Some(name) = asset["name"].as_str() {
+                    if name.contains(required) {
+                        info!("Found release {} with asset matching '{}'", tag, required);
+                        return Ok(tag.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Err(AthenasError::Backend(format!(
+        "No release found with asset containing '{}'. \
+         The llama.cpp releases may have changed format.",
+        required
+    )))
 }
 
 /// Get the athenas bin directory (~/.athenas/bin).
@@ -450,8 +507,10 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
 
     info!("llama-server not found or needs update, auto-downloading...");
 
-    let tag = get_latest_release_tag().await?;
-    info!("Latest llama.cpp release: {}", tag);
+    // Search for a release that has the asset we need.
+    // The latest release sometimes doesn't have all platform assets.
+    let tag = get_latest_release_tag(Some(&desired_asset_suffix)).await?;
+    info!("Using llama.cpp release: {}", tag);
 
     let asset_name = format!("llama-{}-{}", tag, desired_asset_suffix);
     let download_url = format!(
