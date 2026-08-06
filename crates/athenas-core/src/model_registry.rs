@@ -169,10 +169,23 @@ fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()>
         if path.is_dir() {
             scan_dir_for_models(&path, models)?;
         } else if let Some(ext) = path.extension() {
-            if ext == "gguf" {
+            let filename_lower = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            // Skip multimodal projector files — they are not standalone
+            // models and will cause "unsupported model architecture: 'clip'"
+            // errors if loaded directly. They should be loaded via --mmproj.
+            let is_mmproj = filename_lower.contains("mmproj")
+                || filename_lower.contains("mmproj-")
+                || filename_lower.contains("-mmproj");
+
+            if ext == "gguf" && !is_mmproj {
                 let model = create_model_info_from_file(&path, ModelFormat::Gguf)?;
                 models.push(model);
-            } else if ext == "safetensors" {
+            } else if ext == "safetensors" && !is_mmproj {
                 let model = create_model_info_from_file(&path, ModelFormat::Safetensors)?;
                 models.push(model);
             }

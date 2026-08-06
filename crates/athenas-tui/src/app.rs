@@ -1324,6 +1324,23 @@ impl TuiApp {
             return;
         }
 
+        // Reject multimodal projector files — they are not standalone models
+        let filename_lower = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if filename_lower.contains("mmproj") {
+            self.chat_state.add_message(
+                "system",
+                "Error: This is a multimodal projector file (-mmproj.gguf), \
+                 not a standalone model.\n\
+                 Select the main model file (e.g. Q4_K_M.gguf, F16.gguf) instead.\n\
+                 The mmproj file is used automatically for vision models.",
+            );
+            return;
+        }
+
         // === Resource protections ===
 
         // Skip auto-capping if user disabled it
@@ -1616,6 +1633,21 @@ impl TuiApp {
             }
         };
 
+        // Reject multimodal projector files
+        let model_name_lower = std::path::Path::new(&model_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if model_name_lower.contains("mmproj") {
+            self.server_panel_state.status_message = Some(
+                "Error: This is a multimodal projector (-mmproj), not a standalone model.\n\
+                 Select the main model file (e.g. Q4_K_M.gguf) instead."
+                    .to_string(),
+            );
+            return;
+        }
+
         // Get model name for display
         let model_name = self
             .server_panel_state
@@ -1902,6 +1934,21 @@ impl TuiApp {
                 return;
             }
         };
+
+        // Reject multimodal projector files
+        let model_name_lower = std::path::Path::new(&model_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if model_name_lower.contains("mmproj") {
+            self.server_panel_state.status_message = Some(
+                "Error: This is a multimodal projector (-mmproj), not a standalone model.\n\
+                 Select the main model file (e.g. Q4_K_M.gguf) instead."
+                    .to_string(),
+            );
+            return;
+        }
 
         let model_name = std::path::Path::new(&model_path)
             .file_stem()
