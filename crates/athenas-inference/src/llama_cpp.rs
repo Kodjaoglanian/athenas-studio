@@ -361,7 +361,10 @@ impl LlamaCppBackend {
 
         // Wait for server to be ready
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        for _attempt in 0..60 {
+        // Poll for up to 120 seconds (240 attempts * 500ms interval).
+        // Large models with GPU offload can take a while to load,
+        // especially on Vulkan where shader compilation is slow.
+        for _attempt in 0..240 {
             // Check if process exited early
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
@@ -464,7 +467,7 @@ impl LlamaCppBackend {
         self.server_handle = None;
 
         Err(AthenasError::Backend(
-            "llama-server failed to start within 30 seconds".to_string(),
+            "llama-server failed to start within 120 seconds".to_string(),
         ))
     }
 

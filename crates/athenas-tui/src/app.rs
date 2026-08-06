@@ -1591,7 +1591,7 @@ impl TuiApp {
                     } else if field == ConfigField::StartServer {
                         self.start_server().await;
                     } else if field == ConfigField::StopServer {
-                        self.stop_server();
+                        self.stop_server().await;
                     } else if field == ConfigField::LoadAdditionalModel {
                         self.load_additional_model().await;
                     } else if field == ConfigField::UnloadModel {
@@ -1617,11 +1617,30 @@ impl TuiApp {
             return;
         }
 
-        // Don't start if already loading
-        if self.server_start_task.is_some() {
+        // Don't start if already loading — check BOTH the legacy in-process
+        // task AND the detached health task. The detached path uses
+        // server_health_task, not server_start_task.
+        if self.server_start_task.is_some() || self.server_health_task.is_some() {
             self.server_panel_state.status_message =
                 Some("Server is already starting, please wait...".to_string());
             return;
+        }
+
+        // If phase is Error or LoadingModel from a previous attempt, make
+        // sure any leftover process is killed before starting a new one.
+        if self.server_panel_state.phase == ServerPhase::Error
+            || self.server_panel_state.phase == ServerPhase::LoadingModel
+        {
+            if let Some(ref state) = self.server_state {
+                let pid = state.pid;
+                // Kill in background to avoid blocking the TUI
+                let stale_pid = pid;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = server_manager::stop_by_pid(stale_pid);
+                })
+                .await;
+            }
+            self.server_state = None;
         }
 
         let model_path = match self.server_panel_state.selected_model_path() {
@@ -1682,6 +1701,17 @@ impl TuiApp {
         let rate_limit = Some(self.server_panel_state.rate_limit);
         let timeout_secs = Some(self.server_panel_state.timeout_secs);
         let max_body_size_mb = Some(self.server_panel_state.max_body_size);
+
+        // Check if the port is already in use — if so, fail early
+        // instead of starting a process that will fail later
+        if std::net::TcpListener::bind((host.as_str(), port)).is_err() {
+            self.server_panel_state.phase = ServerPhase::Error;
+            self.server_panel_state.status_message = Some(format!(
+                "Port {} is already in use. Stop the existing server or change the port.",
+                port
+            ));
+            return;
+        }
 
         // Start the server as a detached child process
         match server_manager::start_detached(
@@ -1860,36 +1890,50 @@ impl TuiApp {
         }
     }
 
-    fn stop_server(&mut self) {
-        if self.server_panel_state.phase == ServerPhase::Running {
-            // Stop the detached server process by PID
-            if let Some(ref state) = self.server_state {
-                match server_manager::stop_by_pid(state.pid) {
-                    Ok(()) => {}
-                    Err(e) => {
+    async fn stop_server(&mut self) {
+        // Always try to kill the detached process, regardless of phase.
+        // This handles Running, LoadingModel, AND Error states.
+        let mut had_process = false;
+
+        // Cancel any health check task
+        if let Some(task) = self.server_health_task.take() {
+            task.abort();
+        }
+        // Cancel any legacy in-process start task
+        if let Some(task) = self.server_start_task.take() {
+            task.abort();
+        }
+        // Abort legacy in-process server handle
+        if let Some(handle) = self.server_handle.take() {
+            handle.abort();
+        }
+
+        // Kill the detached process by PID (in background to avoid
+        // blocking the TUI — stop_by_pid does std::thread::sleep)
+        if let Some(ref state) = self.server_state {
+            had_process = true;
+            let pid = state.pid;
+            let result =
+                tokio::task::spawn_blocking(move || server_manager::stop_by_pid(pid)).await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if !e.contains("not running") {
                         self.server_panel_state.status_message =
                             Some(format!("Error stopping server: {}", e));
                     }
                 }
+                Err(e) => {
+                    tracing::warn!("stop_by_pid task failed: {}", e);
+                }
             }
-            // Also abort any in-process server handle (legacy path)
-            if let Some(handle) = self.server_handle.take() {
-                handle.abort();
-            }
-        } else if self.server_panel_state.phase == ServerPhase::LoadingModel {
-            // Cancel the server start task (legacy in-process path)
-            if let Some(task) = self.server_start_task.take() {
-                task.abort();
-            }
-            // Cancel the health check polling task
-            if let Some(task) = self.server_health_task.take() {
-                task.abort();
-            }
-            // Kill the detached process if it was started
-            if let Some(ref state) = self.server_state {
-                let _ = server_manager::stop_by_pid(state.pid);
-            }
-        } else {
+        }
+
+        if !had_process
+            && self.server_panel_state.phase != ServerPhase::Running
+            && self.server_panel_state.phase != ServerPhase::LoadingModel
+            && self.server_panel_state.phase != ServerPhase::Error
+        {
             self.server_panel_state.status_message = Some("Server is not running".to_string());
             return;
         }
