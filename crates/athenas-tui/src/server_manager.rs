@@ -148,10 +148,21 @@ pub fn start_detached(
         .join(".athenas");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("server.log");
+
+    // Rotate: if the existing log file is > 10 MB, move it to server.log.old
+    // This preserves the previous session's logs for debugging.
+    if let Ok(metadata) = std::fs::metadata(&log_path) {
+        if metadata.len() > 10 * 1024 * 1024 {
+            let _ = std::fs::rename(&log_path, log_dir.join("server.log.old"));
+        }
+    }
+
+    // Append to the log file instead of truncating, so logs from multiple
+    // sessions accumulate. The log tailer in the TUI handles file rotation
+    // by detecting when the file size shrinks.
     let log_file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&log_path)
         .map_err(|e| format!("Failed to open server log: {}", e))?;
 

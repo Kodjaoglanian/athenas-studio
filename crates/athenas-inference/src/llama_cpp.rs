@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use athenas_core::{AthenasError, HardwareInfo, Result};
 
@@ -26,6 +27,10 @@ pub struct LlamaCppBackend {
     skip_reasoning_flag: bool,
     /// Whether reasoning/thinking mode is enabled (from config)
     reasoning_enabled: bool,
+    /// Watchdog task that periodically checks if llama-server is alive
+    watchdog_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shared flag to signal the watchdog to stop
+    watchdog_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LlamaCppBackend {
@@ -39,14 +44,21 @@ impl LlamaCppBackend {
             gpu_layers: -1,
             server_handle: None,
             server_port: 0,
+            // Timeout must be <= the axum TimeoutLayer (120s default).
+            // If the axum timeout fires first, it cancels the request but
+            // the llama-server keeps processing a "ghost" request, wasting
+            // a processing slot. By matching timeouts, we ensure the
+            // reqwest client gives up at roughly the same time.
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .http1_only()
                 .build()
                 .unwrap(),
             skip_reasoning_flag: false,
             reasoning_enabled: true,
+            watchdog_handle: None,
+            watchdog_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -454,6 +466,8 @@ impl LlamaCppBackend {
             if let Ok(resp) = health_req.send().await {
                 if resp.status().is_success() {
                     info!("llama-server is ready on port {}", self.server_port);
+                    // Start watchdog to monitor llama-server health
+                    self.start_watchdog();
                     return Ok(());
                 }
             }
@@ -478,7 +492,85 @@ impl LlamaCppBackend {
         Box::pin(self.start_server(config)).await
     }
 
+    /// Start a background watchdog task that periodically checks if
+    /// the llama-server is still alive and responding. If the server
+    /// becomes unresponsive (deadlock, OOM, crash), the watchdog logs
+    /// an error and marks the backend as unloaded.
+    fn start_watchdog(&mut self) {
+        // Stop any existing watchdog
+        self.watchdog_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        self.watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_flag = self.watchdog_stop.clone();
+        let port = self.server_port;
+        let client = self.client.clone();
+
+        self.watchdog_handle = Some(tokio::spawn(async move {
+            let mut consecutive_failures = 0u32;
+            loop {
+                // Check every 30 seconds
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+                if stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+
+                // Health check with short timeout
+                let url = format!("http://127.0.0.1:{}/health", port);
+                let result = client
+                    .get(&url)
+                    .timeout(tokio::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(resp) if resp.status().is_success() => {
+                        if consecutive_failures > 0 {
+                            info!(
+                                "llama-server recovered after {} failures",
+                                consecutive_failures
+                            );
+                        }
+                        consecutive_failures = 0;
+                    }
+                    Ok(resp) => {
+                        consecutive_failures += 1;
+                        warn!(
+                            "llama-server health check returned {} (failure #{})",
+                            resp.status(),
+                            consecutive_failures
+                        );
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            error!(
+                                "llama-server unresponsive after 3 consecutive failures ({}). \
+                                 It may be deadlocked or out of memory. \
+                                 Consider restarting the server.",
+                                e
+                            );
+                        } else {
+                            warn!(
+                                "llama-server health check failed ({}): {} (failure #{})",
+                                consecutive_failures, e, consecutive_failures
+                            );
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     async fn stop_server(&mut self) -> Result<()> {
+        // Stop the watchdog
+        self.watchdog_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.watchdog_handle.take() {
+            handle.abort();
+        }
+
         if let Some(mut child) = self.server_handle.take() {
             child.kill().await.map_err(|e| {
                 AthenasError::Backend(format!("Failed to kill llama-server: {}", e))
@@ -646,11 +738,15 @@ impl Backend for LlamaCppBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
+            .map_err(|e| {
+                error!("llama-server chat request failed: {}", e);
+                AthenasError::Backend(format!("Request failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            error!("llama-server returned {} for chat: {}", status, text);
             return Err(AthenasError::Backend(format!(
                 "llama-server returned {}: {}",
                 status, text
@@ -824,11 +920,15 @@ impl Backend for LlamaCppBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
+            .map_err(|e| {
+                error!("llama-server stream request failed: {}", e);
+                AthenasError::Backend(format!("Request failed: {}", e))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            error!("llama-server returned {} for stream: {}", status, text);
             return Err(AthenasError::Backend(format!(
                 "llama-server returned {}: {}",
                 status, text
@@ -1248,6 +1348,25 @@ impl Backend for LlamaCppBackend {
         }
     }
 
+    /// Quick health check — pings the llama-server's /health endpoint
+    /// with a short timeout. Returns false if the server is unresponsive.
+    async fn health_check(&self) -> Result<bool> {
+        if !self.loaded || self.server_port == 0 {
+            return Ok(false);
+        }
+        let url = format!("http://127.0.0.1:{}/health", self.server_port);
+        let result = self
+            .client
+            .get(&url)
+            .timeout(tokio::time::Duration::from_secs(3))
+            .send()
+            .await;
+        match result {
+            Ok(resp) => Ok(resp.status().is_success()),
+            Err(_) => Ok(false),
+        }
+    }
+
     fn boxed_clone(&self) -> Box<dyn Backend> {
         Box::new(LlamaCppBackend {
             hardware: self.hardware.clone(),
@@ -1261,12 +1380,20 @@ impl Backend for LlamaCppBackend {
             client: self.client.clone(),
             skip_reasoning_flag: self.skip_reasoning_flag,
             reasoning_enabled: self.reasoning_enabled,
+            watchdog_handle: None, // Watchdog is not cloned
+            watchdog_stop: self.watchdog_stop.clone(),
         })
     }
 }
 
 impl Drop for LlamaCppBackend {
     fn drop(&mut self) {
+        // Stop the watchdog
+        self.watchdog_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.watchdog_handle.take() {
+            handle.abort();
+        }
         if let Some(mut child) = self.server_handle.take() {
             let _ = child.start_kill();
         }

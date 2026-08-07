@@ -233,13 +233,19 @@ impl TuiApp {
             };
 
             if !initialized {
-                // First time the file exists — read from the beginning
-                // so the user sees all available server logs immediately.
+                // First time the file exists — read from the end (last ~50KB)
+                // to avoid loading a huge log file on startup. If the file
+                // is small, read from the beginning.
                 initialized = true;
-                last_size = 0;
+                if current_size > 50_000 {
+                    last_size = current_size - 50_000;
+                } else {
+                    last_size = 0;
+                }
             }
 
-            // Check if the file was truncated/recreated (server restarted)
+            // Check if the file was truncated/recreated (server restarted
+            // with log rotation, or file was deleted and recreated)
             if current_size < last_size {
                 last_size = 0;
             }

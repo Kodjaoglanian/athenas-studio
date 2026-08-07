@@ -316,13 +316,37 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
     let models = mgr.list();
 
+    // Check if the backend is actually responsive by doing a quick
+    // health check on the underlying llama-server. This detects cases
+    // where the axum server is alive but the backend is deadlocked.
+    let backend_healthy = if mgr.has_models() {
+        if let Some(backend) = mgr.get(None) {
+            // The backend's health check is backend-specific
+            // (llama-server pings its own /health endpoint with a 3s timeout)
+            backend.health_check().await.unwrap_or(false)
+        } else {
+            true // No backend to check
+        }
+    } else {
+        true // No models loaded, nothing to check
+    };
+
+    let status = if backend_healthy { "ok" } else { "degraded" };
+
     let mut json = serde_json::json!({
-        "status": "ok",
+        "status": status,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime,
         "models_loaded": mgr.count(),
         "default_model": mgr.default_id(),
+        "backend_healthy": backend_healthy,
     });
+
+    if !backend_healthy {
+        json["warning"] = serde_json::json!(
+            "Backend is not responding. The inference server may be deadlocked or out of memory."
+        );
+    }
 
     if !models.is_empty() {
         json["models"] = serde_json::json!(models

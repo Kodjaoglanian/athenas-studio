@@ -36,6 +36,14 @@ pub trait Backend: Send + Sync {
 
     fn model_info(&self) -> Option<ModelInfo>;
 
+    /// Check if the backend's inference server is alive and responsive.
+    /// Default implementation returns true (assumes healthy).
+    /// Backends with a subprocess (like llama-server) should override
+    /// this to do a quick health check.
+    async fn health_check(&self) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Clone into a boxed trait object (for spawning background tasks).
     /// Only needs to support read-only operations (chat, complete, stream).
     fn boxed_clone(&self) -> Box<dyn Backend>;
