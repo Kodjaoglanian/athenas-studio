@@ -589,22 +589,38 @@ impl LlamaCppBackend {
         format!("http://127.0.0.1:{}", self.server_port)
     }
 
-    /// Quick check if the llama-server is alive and responding.
-    /// Uses a 2s timeout — does NOT test inference, just connectivity.
-    /// This is called before every inference request to fail fast
-    /// instead of hanging for the full 120s timeout.
+    /// Quick check if the llama-server is alive and can process inference.
+    /// Sends a minimal completion request (1 token) with a short timeout.
+    /// This is more reliable than checking /health, which responds even
+    /// when all inference slots are stuck (llama.cpp issue #7071).
     async fn check_server_alive(&self) -> bool {
         if self.server_port == 0 {
             return false;
         }
-        let url = format!("http://127.0.0.1:{}/health", self.server_port);
-        self.client
-            .get(&url)
-            .timeout(tokio::time::Duration::from_secs(2))
+        // Try a minimal tokenization request first (fast, doesn't need a slot)
+        let url = format!("http://127.0.0.1:{}/tokenize", self.server_port);
+        let body = serde_json::json!({"content": "test"});
+        match self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(tokio::time::Duration::from_secs(3))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        {
+            Ok(resp) if resp.status().is_success() => true,
+            _ => {
+                // Fallback: try /health endpoint
+                let health_url = format!("http://127.0.0.1:{}/health", self.server_port);
+                self.client
+                    .get(&health_url)
+                    .timeout(tokio::time::Duration::from_secs(2))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+            }
+        }
     }
 }
 
@@ -764,16 +780,31 @@ impl Backend for LlamaCppBackend {
         }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
+        tracing::info!("Sending chat request to llama-server at {}", url);
+        // Wrap the request in a timeout shorter than the axum TimeoutLayer.
+        // If the llama-server doesn't respond in 30s, it's likely stuck
+        // (all slots occupied by dead requests). Fail fast instead of
+        // hanging for 120s and exhausting the axum semaphore.
+        let send_future = self.client.post(&url).json(&body).send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
                 error!("llama-server chat request failed: {}", e);
-                AthenasError::Backend(format!("Request failed: {}", e))
-            })?;
+                return Err(AthenasError::Backend(format!("Request failed: {}", e)));
+            }
+            Err(_) => {
+                error!(
+                    "llama-server did not respond within 30s — likely all inference slots are stuck. \
+                     Consider restarting the server."
+                );
+                return Err(AthenasError::Backend(
+                    "llama-server did not respond within 30s. All inference slots may be stuck. \
+                     Please restart the server."
+                        .to_string(),
+                ));
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -953,18 +984,34 @@ impl Backend for LlamaCppBackend {
         }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
-        let resp = self
+        tracing::info!("Sending stream request to llama-server at {}", url);
+        // Wrap in a 30s timeout for the initial connection. Once streaming
+        // starts, the stream itself has no timeout (tokens can take time).
+        let send_future = self
             .client
             .post(&url)
             .header("Accept-Encoding", "identity")
-            .timeout(std::time::Duration::from_secs(120))
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
+            .send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
                 error!("llama-server stream request failed: {}", e);
-                AthenasError::Backend(format!("Request failed: {}", e))
-            })?;
+                return Err(AthenasError::Backend(format!("Request failed: {}", e)));
+            }
+            Err(_) => {
+                error!(
+                    "llama-server did not respond to stream request within 30s — \
+                     likely all inference slots are stuck. Consider restarting the server."
+                );
+                return Err(AthenasError::Backend(
+                    "llama-server did not respond within 30s. All inference slots may be stuck. \
+                     Please restart the server."
+                        .to_string(),
+                ));
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -1222,17 +1269,32 @@ impl Backend for LlamaCppBackend {
         }
 
         let url = format!("{}/completion", self.server_url());
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AthenasError::Backend(format!("Request failed: {}", e)))?;
+        tracing::info!("Sending completion request to llama-server at {}", url);
+        let send_future = self.client.post(&url).json(&body).send();
+        let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                error!("llama-server completion request failed: {}", e);
+                return Err(AthenasError::Backend(format!("Request failed: {}", e)));
+            }
+            Err(_) => {
+                error!(
+                    "llama-server did not respond to completion within 30s — \
+                     likely all inference slots are stuck."
+                );
+                return Err(AthenasError::Backend(
+                    "llama-server did not respond within 30s. All inference slots may be stuck. \
+                     Please restart the server."
+                        .to_string(),
+                ));
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            error!("llama-server returned {} for completion: {}", status, text);
             return Err(AthenasError::Backend(format!(
                 "llama-server returned {}: {}",
                 status, text
