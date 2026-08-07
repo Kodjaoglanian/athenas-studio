@@ -283,7 +283,7 @@ impl Default for AppConfig {
                 cpu_reserve_cores: 1,
                 auto_resource_limits: true,
                 lora_paths: Vec::new(),
-                parallel_slots: 1,
+                parallel_slots: 4,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),

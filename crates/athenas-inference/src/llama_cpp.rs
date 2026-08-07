@@ -290,6 +290,11 @@ impl LlamaCppBackend {
             .arg("127.0.0.1")
             .arg("--parallel")
             .arg(config.parallel_slots.to_string())
+            // Server read/write timeout — closes idle connections after 60s.
+            // This does NOT cancel in-flight inference (llama_decode can't be
+            // interrupted), but it frees up slots from clients that disconnected.
+            .arg("--timeout")
+            .arg("60")
             // Enterprise performance flags
             .arg("--cont-batching")
             .arg("--cache-prompt")
@@ -583,6 +588,24 @@ impl LlamaCppBackend {
     fn server_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.server_port)
     }
+
+    /// Quick check if the llama-server is alive and responding.
+    /// Uses a 2s timeout — does NOT test inference, just connectivity.
+    /// This is called before every inference request to fail fast
+    /// instead of hanging for the full 120s timeout.
+    async fn check_server_alive(&self) -> bool {
+        if self.server_port == 0 {
+            return false;
+        }
+        let url = format!("http://127.0.0.1:{}/health", self.server_port);
+        self.client
+            .get(&url)
+            .timeout(tokio::time::Duration::from_secs(2))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+    }
 }
 
 /// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems
@@ -685,6 +708,15 @@ impl Backend for LlamaCppBackend {
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        // Quick health check — if the llama-server is not responding,
+        // fail fast instead of hanging for 120s.
+        if !self.check_server_alive().await {
+            error!("llama-server is not responding — inference impossible");
+            return Err(AthenasError::Backend(
+                "llama-server is not responding. Please restart the server.".to_string(),
+            ));
         }
 
         let messages: Vec<serde_json::Value> = request
@@ -863,6 +895,15 @@ impl Backend for LlamaCppBackend {
     async fn chat_stream(&self, request: ChatRequest, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        // Quick health check — if the llama-server is not responding,
+        // fail fast instead of hanging for 120s.
+        if !self.check_server_alive().await {
+            error!("llama-server is not responding — stream impossible");
+            return Err(AthenasError::Backend(
+                "llama-server is not responding. Please restart the server.".to_string(),
+            ));
         }
 
         let messages: Vec<serde_json::Value> = request
@@ -1155,6 +1196,13 @@ impl Backend for LlamaCppBackend {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        if !self.check_server_alive().await {
+            error!("llama-server is not responding — completion impossible");
+            return Err(AthenasError::Backend(
+                "llama-server is not responding. Please restart the server.".to_string(),
+            ));
         }
 
         let mut body = serde_json::json!({
