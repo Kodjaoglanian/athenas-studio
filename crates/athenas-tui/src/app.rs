@@ -103,6 +103,10 @@ pub struct TuiApp {
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
     // API Key management modal
     api_key_modal: crate::api_key_modal::ApiKeyModalState,
+    // Periodic system memory refresh (keeps the server panel's
+    // "Est. load" verdict honest — available RAM changes over time)
+    mem_refresh_task: Option<tokio::task::JoinHandle<(u64, u64)>>,
+    last_mem_refresh: std::time::Instant,
 }
 
 impl TuiApp {
@@ -159,6 +163,11 @@ impl TuiApp {
             server_log_tailer: Some(log_tailer),
             chat_stream_rx: None,
             api_key_modal: crate::api_key_modal::ApiKeyModalState::new(),
+            mem_refresh_task: None,
+            // Start stale so the first server-tab visit refreshes immediately
+            last_mem_refresh: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(60))
+                .unwrap_or_else(std::time::Instant::now),
         }
     }
 
@@ -370,6 +379,9 @@ impl TuiApp {
 
             // Poll server start task (server panel)
             self.poll_server_start_task().await;
+
+            // Poll/spawn periodic memory refresh (server panel estimate)
+            self.poll_mem_refresh().await;
 
             // Poll chat stream
             self.poll_chat_stream().await;
@@ -1405,10 +1417,12 @@ impl TuiApp {
         let avail_mb = self.hardware.memory_available_mb;
         let total_mb = self.hardware.memory_total_mb;
 
-        // Model needs roughly 1.5x its file size in RAM (weights + KV cache + overhead)
-        // For Q4 models: file size ≈ weights, context adds ~ctx_size * 2KB * layers
-        let estimated_needed_mb =
-            model_size_mb + ((self.config.inference.default_context_size as u64 / 1024) * 64);
+        // Shared heuristic: file size (weights, mmap'd) + context/KV-cache
+        // overhead that scales with the configured context size.
+        let estimated_needed_mb = athenas_core::estimate_model_ram_mb(
+            model_size_mb,
+            self.config.inference.default_context_size,
+        );
 
         if auto_limits && avail_mb > 0 && estimated_needed_mb > avail_mb {
             self.chat_state.add_message(
@@ -1569,18 +1583,19 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.server_panel_state.cancel_edit();
                 }
-                KeyCode::Enter => {
-                    if let Err(e) = self.server_panel_state.save_edit() {
-                        self.server_panel_state.status_message = Some(e);
+                KeyCode::Enter => match self.server_panel_state.save_edit() {
+                    Err(e) => self.server_panel_state.set_error(e),
+                    Ok(()) => {
+                        if self.server_panel_state.phase == ServerPhase::Running {
+                            self.server_panel_state
+                                .set_status("Saved — applies on next server start");
+                        }
                     }
-                }
+                },
                 KeyCode::Backspace => {
                     self.server_panel_state.edit_buffer.pop();
                 }
                 KeyCode::Char(c) => {
-                    if self.server_panel_state.edit_buffer == "[type to replace]" {
-                        self.server_panel_state.edit_buffer.clear();
-                    }
                     self.server_panel_state.edit_buffer.push(c);
                 }
                 _ => {}
@@ -1590,11 +1605,19 @@ impl TuiApp {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.server_panel_state.next();
-                    self.server_panel_state.status_message = None;
+                    self.server_panel_state.clear_status();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.server_panel_state.previous();
-                    self.server_panel_state.status_message = None;
+                    self.server_panel_state.clear_status();
+                }
+                KeyCode::PageDown => {
+                    self.server_panel_state.jump_forward(10);
+                    self.server_panel_state.clear_status();
+                }
+                KeyCode::PageUp => {
+                    self.server_panel_state.jump_back(10);
+                    self.server_panel_state.clear_status();
                 }
                 KeyCode::Left | KeyCode::Char('h') => match field {
                     ConfigField::ModelSelection => {
@@ -1620,9 +1643,30 @@ impl TuiApp {
                     }
                     _ => {}
                 },
+                // Generate a random admin API key (OS entropy)
+                KeyCode::Char('g') | KeyCode::Char('G') if field == ConfigField::ApiKey => {
+                    self.server_panel_state.generate_api_key();
+                    let key = self
+                        .server_panel_state
+                        .generated_key_display
+                        .clone()
+                        .unwrap_or_default();
+                    self.server_panel_state
+                        .set_status(format!("Generated key: {} — saved on server start", key));
+                }
+                // Clear the admin API key (disables auth)
+                KeyCode::Char('x') | KeyCode::Char('X') if field == ConfigField::ApiKey => {
+                    self.server_panel_state.clear_api_key();
+                    self.server_panel_state
+                        .set_status("API key cleared — auth disabled on next start");
+                }
                 KeyCode::Enter => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
+                        if self.server_panel_state.phase == ServerPhase::Running {
+                            self.server_panel_state
+                                .set_status("Toggled — applies on next server start");
+                        }
                     } else if field == ConfigField::GpuRuntime {
                         // Cycle through GPU runtimes on Enter
                         use athenas_core::GpuRuntime;
@@ -1635,8 +1679,8 @@ impl TuiApp {
                             GpuRuntime::Cpu => GpuRuntime::Auto,
                         };
                         self.server_panel_state.gpu_runtime = next;
-                        self.server_panel_state.status_message =
-                            Some(format!("GPU runtime: {} (saved on server start)", next));
+                        self.server_panel_state
+                            .set_status(format!("GPU runtime: {} (saved on server start)", next));
                     } else if field.is_editable() {
                         self.server_panel_state.start_edit();
                     } else if field == ConfigField::StartServer {
@@ -1651,7 +1695,13 @@ impl TuiApp {
                         self.set_default_model_action().await;
                     } else if field == ConfigField::ManageApiKeys {
                         self.api_key_modal.open();
-                        self.refresh_api_keys().await;
+                        if self.server_state.is_none() {
+                            self.api_key_modal.set_error(
+                                "Server not running — start it to manage keys".to_string(),
+                            );
+                        } else {
+                            self.refresh_api_keys().await;
+                        }
                     }
                 }
                 KeyCode::Esc => {
@@ -1664,7 +1714,8 @@ impl TuiApp {
 
     async fn start_server(&mut self) {
         if self.server_panel_state.phase == ServerPhase::Running {
-            self.server_panel_state.status_message = Some("Server is already running".to_string());
+            self.server_panel_state
+                .set_status("Server is already running");
             return;
         }
 
@@ -1672,8 +1723,8 @@ impl TuiApp {
         // task AND the detached health task. The detached path uses
         // server_health_task, not server_start_task.
         if self.server_start_task.is_some() || self.server_health_task.is_some() {
-            self.server_panel_state.status_message =
-                Some("Server is already starting, please wait...".to_string());
+            self.server_panel_state
+                .set_status("Server is already starting, please wait...");
             return;
         }
 
@@ -1697,8 +1748,8 @@ impl TuiApp {
         let model_path = match self.server_panel_state.selected_model_path() {
             Some(p) => p,
             None => {
-                self.server_panel_state.status_message =
-                    Some("No model selected. Use Left/Right to pick a model.".to_string());
+                self.server_panel_state
+                    .set_error("No model selected. Use Left/Right to pick a model.");
                 return;
             }
         };
@@ -1710,12 +1761,60 @@ impl TuiApp {
             .unwrap_or("")
             .to_lowercase();
         if model_name_lower.contains("mmproj") {
-            self.server_panel_state.status_message = Some(
-                "Error: This is a multimodal projector (-mmproj), not a standalone model.\n\
-                 Select the main model file (e.g. Q4_K_M.gguf) instead."
-                    .to_string(),
+            self.server_panel_state.set_error(
+                "Error: This is a multimodal projector (-mmproj), not a standalone model. \
+                 Select the main model file (e.g. Q4_K_M.gguf) instead.",
             );
             return;
+        }
+
+        // Check if the port is already in use — fail early, BEFORE any
+        // state/config changes, instead of spawning a doomed process.
+        let host = self.server_panel_state.host.clone();
+        let port = self.server_panel_state.port;
+        if std::net::TcpListener::bind((host.as_str(), port)).is_err() {
+            self.server_panel_state.phase = ServerPhase::Error;
+            self.server_panel_state.set_error(format!(
+                "Port {} is already in use. Stop the existing server or change the port.",
+                port
+            ));
+            return;
+        }
+
+        // Pre-flight memory check — refuse to start when the model clearly
+        // does not fit in the available RAM/VRAM. Uses fresh memory data.
+        {
+            let (total, avail) = tokio::task::spawn_blocking(athenas_core::detect_memory_mb)
+                .await
+                .unwrap_or((0, 0));
+            if total > 0 {
+                self.server_panel_state.hardware.memory_total_mb = total;
+                self.hardware.memory_total_mb = total;
+            }
+            if avail > 0 {
+                self.server_panel_state.hardware.memory_available_mb = avail;
+                self.hardware.memory_available_mb = avail;
+            }
+        }
+        if self.server_panel_state.auto_resource_limits {
+            if let Some(est) = self.server_panel_state.estimate_selected_model_load() {
+                if !est.fits {
+                    let (need, avail) = if est.full_gpu_offload {
+                        (est.vram_mb.unwrap_or(0), est.vram_free_mb.unwrap_or(0))
+                    } else {
+                        (est.ram_mb, est.ram_available_mb)
+                    };
+                    self.server_panel_state.phase = ServerPhase::Error;
+                    self.server_panel_state.set_error(format!(
+                        "Not enough memory: estimated need ~{:.1} GB, only {:.1} GB available. \
+                         Use a smaller model/quant, lower Context Size, or turn off \
+                         Auto Resource Limits to override.",
+                        need as f64 / 1024.0,
+                        avail as f64 / 1024.0,
+                    ));
+                    return;
+                }
+            }
         }
 
         // Get model name for display
@@ -1727,8 +1826,8 @@ impl TuiApp {
             .unwrap_or_else(|| model_path.clone());
 
         self.server_panel_state.phase = ServerPhase::LoadingModel;
-        self.server_panel_state.status_message =
-            Some(format!("Starting server with model: {}...", model_name));
+        self.server_panel_state
+            .set_status(format!("Starting server with model: {}...", model_name));
 
         // Save server config so it persists across restarts
         let server_config = self.server_panel_state.build_app_config(&self.config);
@@ -1737,8 +1836,6 @@ impl TuiApp {
         }
         self.config = server_config;
 
-        let host = self.server_panel_state.host.clone();
-        let port = self.server_panel_state.port;
         let backend_str = match self.server_panel_state.backend {
             athenas_core::BackendType::Auto => "auto",
             athenas_core::BackendType::LlamaCpp => "llama.cpp",
@@ -1752,17 +1849,6 @@ impl TuiApp {
         let rate_limit = Some(self.server_panel_state.rate_limit);
         let timeout_secs = Some(self.server_panel_state.timeout_secs);
         let max_body_size_mb = Some(self.server_panel_state.max_body_size);
-
-        // Check if the port is already in use — if so, fail early
-        // instead of starting a process that will fail later
-        if std::net::TcpListener::bind((host.as_str(), port)).is_err() {
-            self.server_panel_state.phase = ServerPhase::Error;
-            self.server_panel_state.status_message = Some(format!(
-                "Port {} is already in use. Stop the existing server or change the port.",
-                port
-            ));
-            return;
-        }
 
         // Start the server as a detached child process
         match server_manager::start_detached(
@@ -1784,8 +1870,8 @@ impl TuiApp {
                 // Keep LoadingModel phase — the detached process is still loading the model.
                 // We'll poll the health endpoint until it responds, then switch to Running.
                 let health_pid = state.pid;
-                self.server_panel_state.status_message =
-                    Some(format!("Loading model (PID: {})...", health_pid));
+                self.server_panel_state
+                    .set_status(format!("Loading model (PID: {})...", health_pid));
                 self.server_panel_state.loaded_model_name = Some(model_name.clone());
                 self.server_panel_state.loaded_backend_name = Some(backend_str.to_string());
                 self.server_state = Some(state);
@@ -1826,8 +1912,8 @@ impl TuiApp {
             }
             Err(e) => {
                 self.server_panel_state.phase = ServerPhase::Error;
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to start server: {}", e));
+                self.server_panel_state
+                    .set_error(format!("Failed to start server: {}", e));
             }
         }
     }
@@ -1851,8 +1937,8 @@ impl TuiApp {
                     Some(format!("http://{}:{}", state.host, state.port));
                 self.server_panel_state.loaded_model_name = Some(state.model.clone());
                 self.server_panel_state.loaded_backend_name = Some(state.backend.clone());
-                self.server_panel_state.status_message =
-                    Some(format!("Server running (PID: {})", state.pid));
+                self.server_panel_state
+                    .set_status(format!("Server running (PID: {})", state.pid));
                 self.chat_state.current_model = Some(state.model);
                 self.chat_state.current_backend = Some(state.backend);
                 // Fetch loaded models list from the detached server
@@ -1863,9 +1949,8 @@ impl TuiApp {
                 if self.server_panel_state.phase == ServerPhase::LoadingModel {
                     // We were waiting for a server we started — it timed out
                     self.server_panel_state.phase = ServerPhase::Error;
-                    self.server_panel_state.status_message = Some(
-                        "Server failed to start. Check ~/.athenas/server.log for details."
-                            .to_string(),
+                    self.server_panel_state.set_error(
+                        "Server failed to start. Check ~/.athenas/server.log for details.",
                     );
                     self.server_state = None;
                 }
@@ -1909,7 +1994,7 @@ impl TuiApp {
 
                 self.server_panel_state.server_url = Some(format!("http://{}:{}", host, port));
                 self.server_panel_state.phase = ServerPhase::Running;
-                self.server_panel_state.status_message = None;
+                self.server_panel_state.clear_status();
 
                 self.server_handle = Some(server_handle);
                 self.log(&format!("Server started on {}:{}", host, port));
@@ -1928,14 +2013,14 @@ impl TuiApp {
             }
             Ok(Err(e)) => {
                 self.server_panel_state.phase = ServerPhase::Error;
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to start server: {}", e));
+                self.server_panel_state
+                    .set_error(format!("Failed to start server: {}", e));
                 self.log(&format!("Failed to start server: {}", e));
             }
             Err(e) => {
                 self.server_panel_state.phase = ServerPhase::Error;
-                self.server_panel_state.status_message =
-                    Some(format!("Server start task crashed: {}", e));
+                self.server_panel_state
+                    .set_error(format!("Server start task crashed: {}", e));
                 self.log(&format!("Server start task crashed: {}", e));
             }
         }
@@ -1970,8 +2055,8 @@ impl TuiApp {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     if !e.contains("not running") {
-                        self.server_panel_state.status_message =
-                            Some(format!("Error stopping server: {}", e));
+                        self.server_panel_state
+                            .set_error(format!("Error stopping server: {}", e));
                     }
                 }
                 Err(e) => {
@@ -1985,7 +2070,7 @@ impl TuiApp {
             && self.server_panel_state.phase != ServerPhase::LoadingModel
             && self.server_panel_state.phase != ServerPhase::Error
         {
-            self.server_panel_state.status_message = Some("Server is not running".to_string());
+            self.server_panel_state.set_status("Server is not running");
             return;
         }
 
@@ -1998,7 +2083,7 @@ impl TuiApp {
         self.server_panel_state.default_model_selected = 0;
         self.shared_model_manager = None;
         self.server_state = None;
-        self.server_panel_state.status_message = Some("Server stopped".to_string());
+        self.server_panel_state.set_status("Server stopped");
         self.log("Server stopped");
 
         // Clear chat model info if chat was using server model
@@ -2010,22 +2095,22 @@ impl TuiApp {
 
     async fn load_additional_model(&mut self) {
         if self.server_panel_state.phase != ServerPhase::Running {
-            self.server_panel_state.status_message = Some("Start the server first".to_string());
+            self.server_panel_state.set_error("Start the server first");
             return;
         }
 
         // Don't start if already loading
         if self.additional_model_load_task.is_some() {
-            self.server_panel_state.status_message =
-                Some("Already loading a model, please wait...".to_string());
+            self.server_panel_state
+                .set_status("Already loading a model, please wait...");
             return;
         }
 
         let model_path = match self.server_panel_state.selected_model_path() {
             Some(p) => p,
             None => {
-                self.server_panel_state.status_message =
-                    Some("No model selected. Use Left/Right to pick a model.".to_string());
+                self.server_panel_state
+                    .set_error("No model selected. Use Left/Right to pick a model.");
                 return;
             }
         };
@@ -2037,10 +2122,9 @@ impl TuiApp {
             .unwrap_or("")
             .to_lowercase();
         if model_name_lower.contains("mmproj") {
-            self.server_panel_state.status_message = Some(
-                "Error: This is a multimodal projector (-mmproj), not a standalone model.\n\
-                 Select the main model file (e.g. Q4_K_M.gguf) instead."
-                    .to_string(),
+            self.server_panel_state.set_error(
+                "Error: This is a multimodal projector (-mmproj), not a standalone model. \
+                 Select the main model file (e.g. Q4_K_M.gguf) instead.",
             );
             return;
         }
@@ -2052,8 +2136,8 @@ impl TuiApp {
             .to_string();
 
         self.server_panel_state.phase = ServerPhase::LoadingModel;
-        self.server_panel_state.status_message =
-            Some(format!("Loading additional model: {}...", model_name));
+        self.server_panel_state
+            .set_status(format!("Loading additional model: {}...", model_name));
         self.additional_model_name_hint = Some(model_name.clone());
 
         // If detached server, use HTTP API to load model
@@ -2195,7 +2279,7 @@ impl TuiApp {
                         })
                         .collect();
 
-                    self.server_panel_state.status_message = Some(format!(
+                    self.server_panel_state.set_status(format!(
                         "Loaded '{}' on {} (id: {})",
                         model_name, backend_name, model_id
                     ));
@@ -2210,12 +2294,12 @@ impl TuiApp {
             }
             Ok(AdditionalModelLoadResult::InProcess(Err((e, name, _)))) => {
                 self.server_panel_state.phase = ServerPhase::Running;
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to load '{}': {}", name, e));
+                self.server_panel_state
+                    .set_error(format!("Failed to load '{}': {}", name, e));
             }
             Ok(AdditionalModelLoadResult::Detached(Ok(model_id))) => {
                 let model_name = hint.unwrap_or_else(|| "unknown".to_string());
-                self.server_panel_state.status_message = Some(format!(
+                self.server_panel_state.set_status(format!(
                     "Loaded '{}' on remote server (id: {})",
                     model_name, model_id
                 ));
@@ -2225,20 +2309,20 @@ impl TuiApp {
             }
             Ok(AdditionalModelLoadResult::Detached(Err(e))) => {
                 self.server_panel_state.phase = ServerPhase::Running;
-                self.server_panel_state.status_message =
-                    Some(format!("Failed to load model on remote server: {}", e));
+                self.server_panel_state
+                    .set_error(format!("Failed to load model on remote server: {}", e));
             }
             Err(e) => {
                 self.server_panel_state.phase = ServerPhase::Running;
-                self.server_panel_state.status_message =
-                    Some(format!("Model loading task crashed: {}", e));
+                self.server_panel_state
+                    .set_error(format!("Model loading task crashed: {}", e));
             }
         }
     }
 
     async fn unload_model_action(&mut self) {
         if self.server_panel_state.loaded_models.is_empty() {
-            self.server_panel_state.status_message = Some("No models to unload".to_string());
+            self.server_panel_state.set_error("No models to unload");
             return;
         }
 
@@ -2282,14 +2366,15 @@ impl TuiApp {
             match result {
                 Ok(Ok(())) => {
                     self.refresh_remote_loaded_models().await;
-                    self.server_panel_state.status_message =
-                        Some(format!("Unloaded model: {}", model_id));
+                    self.server_panel_state
+                        .set_status(format!("Unloaded model: {}", model_id));
                 }
                 Ok(Err(e)) => {
-                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                    self.server_panel_state.set_error(format!("Error: {}", e));
                 }
                 Err(e) => {
-                    self.server_panel_state.status_message = Some(format!("Task crashed: {}", e));
+                    self.server_panel_state
+                        .set_error(format!("Task crashed: {}", e));
                 }
             }
             return;
@@ -2328,11 +2413,11 @@ impl TuiApp {
                         }
                     }
 
-                    self.server_panel_state.status_message =
-                        Some(format!("Unloaded model: {}", model_id));
+                    self.server_panel_state
+                        .set_status(format!("Unloaded model: {}", model_id));
                 }
                 Err(e) => {
-                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                    self.server_panel_state.set_error(format!("Error: {}", e));
                 }
             }
         }
@@ -2340,7 +2425,7 @@ impl TuiApp {
 
     async fn set_default_model_action(&mut self) {
         if self.server_panel_state.loaded_models.is_empty() {
-            self.server_panel_state.status_message = Some("No models loaded".to_string());
+            self.server_panel_state.set_error("No models loaded");
             return;
         }
 
@@ -2384,14 +2469,15 @@ impl TuiApp {
             match result {
                 Ok(Ok(())) => {
                     self.refresh_remote_loaded_models().await;
-                    self.server_panel_state.status_message =
-                        Some(format!("Default model set to: {}", model_id));
+                    self.server_panel_state
+                        .set_status(format!("Default model set to: {}", model_id));
                 }
                 Ok(Err(e)) => {
-                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                    self.server_panel_state.set_error(format!("Error: {}", e));
                 }
                 Err(e) => {
-                    self.server_panel_state.status_message = Some(format!("Task crashed: {}", e));
+                    self.server_panel_state
+                        .set_error(format!("Task crashed: {}", e));
                 }
             }
             return;
@@ -2413,11 +2499,11 @@ impl TuiApp {
                         })
                         .collect();
 
-                    self.server_panel_state.status_message =
-                        Some(format!("Default model set to: {}", model_id));
+                    self.server_panel_state
+                        .set_status(format!("Default model set to: {}", model_id));
                 }
                 Err(e) => {
-                    self.server_panel_state.status_message = Some(format!("Error: {}", e));
+                    self.server_panel_state.set_error(format!("Error: {}", e));
                 }
             }
         }
@@ -2502,6 +2588,38 @@ impl TuiApp {
         }
     }
 
+    /// Keep the server panel's memory numbers fresh: while the server tab
+    /// is open, re-read OS memory every 5s on a blocking thread (file I/O
+    /// must not run on the async runtime — it would freeze the TUI).
+    async fn poll_mem_refresh(&mut self) {
+        // Collect a finished refresh first
+        if let Some(task) = self.mem_refresh_task.take() {
+            if task.is_finished() {
+                if let Ok((total, avail)) = task.await {
+                    if total > 0 {
+                        self.hardware.memory_total_mb = total;
+                        self.server_panel_state.hardware.memory_total_mb = total;
+                    }
+                    if avail > 0 {
+                        self.hardware.memory_available_mb = avail;
+                        self.server_panel_state.hardware.memory_available_mb = avail;
+                    }
+                }
+            } else {
+                self.mem_refresh_task = Some(task);
+                return; // still running — don't spawn another
+            }
+        }
+
+        if self.mode == AppMode::Server
+            && self.last_mem_refresh.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.last_mem_refresh = std::time::Instant::now();
+            self.mem_refresh_task =
+                Some(tokio::task::spawn_blocking(athenas_core::detect_memory_mb));
+        }
+    }
+
     async fn poll_server_status(&mut self) {
         if let Some(handle) = &mut self.server_handle {
             if handle.is_finished() {
@@ -2514,7 +2632,7 @@ impl TuiApp {
                         self.server_panel_state.server_url = None;
                         self.server_panel_state.loaded_models.clear();
                         self.shared_model_manager = None;
-                        self.server_panel_state.status_message = Some("Server stopped".to_string());
+                        self.server_panel_state.set_status("Server stopped");
                         if self.backend.is_none() {
                             self.chat_state.current_model = None;
                             self.chat_state.current_backend = None;
@@ -2525,8 +2643,8 @@ impl TuiApp {
                         self.server_panel_state.server_url = None;
                         self.server_panel_state.loaded_models.clear();
                         self.shared_model_manager = None;
-                        self.server_panel_state.status_message =
-                            Some(format!("Server error: {}", e));
+                        self.server_panel_state
+                            .set_error(format!("Server error: {}", e));
                         if self.backend.is_none() {
                             self.chat_state.current_model = None;
                             self.chat_state.current_backend = None;
@@ -2818,8 +2936,8 @@ impl TuiApp {
 
     async fn refresh_api_keys(&mut self) {
         let Some(ref state) = self.server_state else {
-            self.server_panel_state.status_message =
-                Some("Server not running — start it first".to_string());
+            self.server_panel_state
+                .set_error("Server not running — start it first");
             return;
         };
         let host = state.host.clone();
@@ -2910,21 +3028,21 @@ impl TuiApp {
                 {
                     self.server_panel_state.api_key_selected = 0;
                 }
-                self.server_panel_state.status_message =
-                    Some(format!("Loaded {} API key(s)", count));
+                self.server_panel_state
+                    .set_status(format!("Loaded {} API key(s)", count));
                 // Also update the modal if it's open
                 self.api_key_modal.set_keys(keys);
             }
             Ok(Err(e)) => {
                 let msg = format!("Failed to fetch API keys: {}", e);
-                self.server_panel_state.status_message = Some(msg.clone());
+                self.server_panel_state.set_error(msg.clone());
                 if self.api_key_modal.open {
                     self.api_key_modal.set_error(msg);
                 }
             }
             Err(e) => {
                 let msg = format!("Request failed: {}", e);
-                self.server_panel_state.status_message = Some(msg.clone());
+                self.server_panel_state.set_error(msg.clone());
                 if self.api_key_modal.open {
                     self.api_key_modal.set_error(msg);
                 }
