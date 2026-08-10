@@ -267,11 +267,10 @@ async fn get_latest_release_tag(required_asset: Option<&str>) -> Result<String> 
 
 /// Get the athenas bin directory (~/.athenas/bin).
 fn athenas_bin_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| AthenasError::Backend("Cannot determine home directory".into()))?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| AthenasError::Backend("Cannot determine home directory".into()))?;
 
-    let bin_dir = PathBuf::from(home).join(".athenas").join("bin");
+    let bin_dir = home.join(".athenas").join("bin");
     std::fs::create_dir_all(&bin_dir)
         .map_err(|e| AthenasError::Backend(format!("Failed to create bin dir: {}", e)))?;
     Ok(bin_dir)
@@ -552,7 +551,17 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    // Set LD_LIBRARY_PATH so it finds shared libs in the same dir
+    // On Windows, prevent a console window from popping up during verification
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        verify_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    // Set LD_LIBRARY_PATH (Unix) so it finds shared libs in the same dir.
+    // On Windows, DLLs are found via the executable's directory automatically.
+    #[cfg(unix)]
     if let Some(parent) = extracted_path.parent() {
         let lib_path = parent.to_string_lossy().to_string();
         let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();

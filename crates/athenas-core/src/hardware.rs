@@ -229,6 +229,21 @@ fn detect_memory() -> (u64, u64) {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        unsafe {
+            let mut mem_status: MEMORYSTATUSEX = std::mem::zeroed();
+            mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+            if GlobalMemoryStatusEx(&mut mem_status) != 0 {
+                let total_mb = mem_status.ullTotalPhys / (1024 * 1024);
+                let avail_mb = mem_status.ullAvailPhys / (1024 * 1024);
+                return (total_mb, avail_mb);
+            }
+        }
+    }
+
     (0, 0)
 }
 

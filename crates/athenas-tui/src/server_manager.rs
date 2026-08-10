@@ -52,15 +52,34 @@ impl ServerState {
 
 /// Check if a process with the given PID is still running.
 pub fn is_process_alive(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) doesn't send a signal — it just checks existence.
-    // On Unix, this is safe. On Windows, we'd need a different approach.
     #[cfg(unix)]
     {
+        // SAFETY: kill(pid, 0) doesn't send a signal — it just checks existence.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Fallback for non-Unix: assume alive if state file exists
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle == 0 {
+                // Can't open — process doesn't exist or no access
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            // ok is non-zero on success; STILL_ACTIVE means the process is running
+            ok != 0 && exit_code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Unknown platform: assume alive
         true
     }
 }
@@ -200,6 +219,18 @@ pub fn start_detached(
         }
     }
 
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW (0x08000000) prevents a console window from
+        // popping up when the server is started from the TUI.
+        // CREATE_NEW_PROCESS_GROUP (0x00000200) makes it independent
+        // so Ctrl-C in the TUI doesn't kill the server.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start server: {}", e))?;
@@ -243,12 +274,12 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // On non-Unix, try to kill via the OS
+        // /T = kill child processes (llama-server), /F = force
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .spawn();
+            .status();
     }
 
     // Wait a moment for graceful shutdown
@@ -264,6 +295,13 @@ pub fn stop_by_pid(pid: u32) -> Result<(), String> {
                 // Also try individual PID as fallback
                 libc::kill(pid as i32, libc::SIGKILL);
             }
+        }
+        #[cfg(windows)]
+        {
+            // taskkill /F already forces, but try again in case
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status();
         }
     }
 

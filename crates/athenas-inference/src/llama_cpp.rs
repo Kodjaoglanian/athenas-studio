@@ -62,32 +62,46 @@ impl LlamaCppBackend {
     }
 
     fn find_llama_server(&self) -> Option<String> {
-        let home = std::env::var("HOME").unwrap_or_default();
+        // Use dirs::home_dir() which works on all platforms
+        // (returns USERPROFILE on Windows, HOME on Unix)
+        let home = dirs::home_dir()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Binary name with extension (llama-server.exe on Windows)
+        let server_name = if std::env::consts::OS == "windows" {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
 
         // 1. Check ~/.athenas/bin first (our auto-installed version)
-        let athenas_path = format!("{}/.athenas/bin/llama-server", home);
+        let athenas_path = format!("{}/.athenas/bin/{}", home, server_name);
         if std::path::Path::new(&athenas_path).exists() {
             return Some(athenas_path);
         }
 
-        // 2. Check PATH
+        // 2. Check PATH (which::which adds .exe automatically on Windows)
         for cmd in &["llama-server", "llama_server", "server"] {
             if which::which(cmd).is_ok() {
                 return Some(cmd.to_string());
             }
         }
 
-        // 3. Check common install locations
-        let candidates = [
-            format!("{}/.local/bin/llama-server", home),
-            "/usr/local/bin/llama-server".to_string(),
-            "/usr/bin/llama-server".to_string(),
-            "/opt/llama.cpp/build/bin/llama-server".to_string(),
-        ];
+        // 3. Check common install locations (Unix-only paths)
+        #[cfg(unix)]
+        {
+            let candidates = [
+                format!("{}/.local/bin/llama-server", home),
+                "/usr/local/bin/llama-server".to_string(),
+                "/usr/bin/llama-server".to_string(),
+                "/opt/llama.cpp/build/bin/llama-server".to_string(),
+            ];
 
-        for path in &candidates {
-            if std::path::Path::new(path).exists() {
-                return Some(path.clone());
+            for path in &candidates {
+                if std::path::Path::new(path).exists() {
+                    return Some(path.clone());
+                }
             }
         }
 
@@ -177,8 +191,10 @@ impl LlamaCppBackend {
 
         let mut cmd = tokio::process::Command::new(&server_bin);
 
-        // Set LD_LIBRARY_PATH to the directory containing llama-server
+        // Set LD_LIBRARY_PATH (Unix) to the directory containing llama-server
         // so it can find shared libraries (libllama-server-impl.so, etc.)
+        // On Windows, DLLs are found via the executable's directory automatically.
+        #[cfg(unix)]
         if let Some(parent) = std::path::Path::new(&server_bin).parent() {
             let lib_path = parent.to_string_lossy().to_string();
             let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -366,7 +382,9 @@ impl LlamaCppBackend {
         // BLOCK on write() and become unresponsive. By writing to a
         // file, the llama-server can always write without blocking.
         let llama_log_path = {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let home = dirs::home_dir()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
             let dir = format!("{}/.athenas", home);
             let _ = std::fs::create_dir_all(&dir);
             format!("{}/llama-server.log", dir)
@@ -387,6 +405,14 @@ impl LlamaCppBackend {
         cmd.stdout(std::process::Stdio::from(llama_log))
             .stderr(std::process::Stdio::from(llama_log_clone))
             .kill_on_drop(true);
+
+        // On Windows, prevent a console window from popping up
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         info!(
             "Starting llama-server on port {} with model: {} (gpu_layers={}, runtime={})",
@@ -646,6 +672,12 @@ impl LlamaCppBackend {
 
 /// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems
 async fn try_install_libgomp() -> bool {
+    // libgomp is a Linux-only dependency; on Windows/macOS it's not needed
+    #[cfg(not(target_os = "linux"))]
+    {
+        return false;
+    }
+
     // Detect package manager and install
     let managers = [
         ("apt-get", vec!["apt-get", "install", "-y", "libgomp1"]),
