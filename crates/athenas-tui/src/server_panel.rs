@@ -1,5 +1,6 @@
 use athenas_core::{
-    AppConfig, BackendType, HardwareInfo, ModelInfo as RegistryModelInfo, ModelRegistry,
+    estimate_model_ram_mb, AppConfig, BackendType, HardwareInfo, ModelInfo as RegistryModelInfo,
+    ModelRegistry,
 };
 use athenas_inference::{Backend, BackendFactory, ModelLoadConfig};
 
@@ -287,6 +288,33 @@ pub enum KeyEditField {
     AllowedModels,
 }
 
+/// Estimated memory footprint for loading the currently selected model
+/// with the panel's current GPU/context settings. Shown in the hardware
+/// banner so the user knows the cost *before* starting the server.
+#[derive(Debug, Clone)]
+pub struct LoadEstimate {
+    /// Model file size in MB
+    pub model_size_mb: u64,
+    /// Estimated host RAM needed in MB
+    pub ram_mb: u64,
+    /// Estimated VRAM needed in MB (None = CPU-only load)
+    pub vram_mb: Option<u64>,
+    /// Available system RAM in MB (0 = detection failed)
+    pub ram_available_mb: u64,
+    /// Free VRAM in MB on the target GPU (when offloading)
+    pub vram_free_mb: Option<u64>,
+    /// True when the model is fully offloaded to the GPU (gpu_layers = -1)
+    pub full_gpu_offload: bool,
+    /// True when some layers are offloaded (0 < gpu_layers)
+    pub partial_gpu_offload: bool,
+    /// GPU layers setting the estimate is based on
+    pub gpu_layers: i32,
+    /// Whether the estimate fits in the available memory
+    pub fits: bool,
+    /// Whether it fits but with little headroom (>= 90% of available RAM)
+    pub tight: bool,
+}
+
 pub struct ServerPanelState {
     pub fields: Vec<ConfigField>,
     pub selected: usize,
@@ -353,6 +381,8 @@ pub struct ServerPanelState {
     // Runtime state
     pub phase: ServerPhase,
     pub status_message: Option<String>,
+    /// Whether the status message is an error (red) or info (cyan/green)
+    pub status_is_error: bool,
     pub server_url: Option<String>,
     pub loaded_model_name: Option<String>,
     pub loaded_backend_name: Option<String>,
@@ -425,6 +455,7 @@ impl ServerPanelState {
             ip_denylist: config.server.ip_denylist.join(", "),
             phase: ServerPhase::Configuring,
             status_message: None,
+            status_is_error: false,
             server_url: None,
             loaded_model_name: None,
             loaded_backend_name: None,
@@ -446,6 +477,31 @@ impl ServerPanelState {
     pub fn refresh_models(&mut self, config: &AppConfig) {
         let registry = ModelRegistry::new(config.paths.models_dir.clone());
         self.models = registry.list_local_models().unwrap_or_default();
+        // Keep the selection in bounds — models may have been deleted
+        // or added since the last scan.
+        if self.models.is_empty() {
+            self.model_selected = 0;
+        } else if self.model_selected >= self.models.len() {
+            self.model_selected = self.models.len() - 1;
+        }
+    }
+
+    /// Set an informational status message (cyan/green in the status bar).
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_is_error = false;
+    }
+
+    /// Set an error status message (red in the status bar).
+    pub fn set_error(&mut self, msg: impl Into<String>) {
+        self.status_message = Some(msg.into());
+        self.status_is_error = true;
+    }
+
+    /// Clear the status message.
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
+        self.status_is_error = false;
     }
 
     pub fn next(&mut self) {
@@ -461,6 +517,20 @@ impl ServerPanelState {
             } else {
                 self.selected -= 1;
             }
+        }
+    }
+
+    /// Jump forward `n` fields (PageDown) — stops at the last field.
+    pub fn jump_forward(&mut self, n: usize) {
+        if !self.editing {
+            self.selected = (self.selected + n).min(self.fields.len() - 1);
+        }
+    }
+
+    /// Jump backward `n` fields (PageUp) — stops at the first field.
+    pub fn jump_back(&mut self, n: usize) {
+        if !self.editing {
+            self.selected = self.selected.saturating_sub(n);
         }
     }
 
@@ -491,9 +561,9 @@ impl ServerPanelState {
             ConfigField::Port => self.port.to_string(),
             ConfigField::ApiKey => {
                 if self.api_key.is_empty() {
-                    "(none — no auth)".to_string()
+                    "(not set — no auth)".to_string()
                 } else {
-                    self.api_key.clone()
+                    mask_secret(&self.api_key)
                 }
             }
             ConfigField::MaxConcurrent => self.max_concurrent.to_string(),
@@ -622,7 +692,9 @@ impl ServerPanelState {
             ConfigField::ModelSelection => "Up/Down to select from local models",
             ConfigField::Host => "0.0.0.0 for all interfaces, 127.0.0.1 for local",
             ConfigField::Port => "Port number (e.g. 8080)",
-            ConfigField::ApiKey => "Static admin key for server auth. Editable — empty = no auth",
+            ConfigField::ApiKey => {
+                "Static admin key. Enter: edit | G: generate random | X: clear (no auth)"
+            }
             ConfigField::MaxConcurrent => "Max simultaneous inference requests",
             ConfigField::RateLimit => "Token bucket: requests per second per IP",
             ConfigField::TimeoutSecs => "Kill stuck requests after N seconds",
@@ -668,12 +740,34 @@ impl ServerPanelState {
         }
     }
 
+    /// Raw value used to pre-fill the edit buffer. Unlike `field_value`,
+    /// this never returns display placeholders ("(none)", "unlimited",
+    /// masked secrets, ...) — those would otherwise be saved literally
+    /// into the config when the user presses Enter.
+    pub fn edit_value(&self, field: &ConfigField) -> String {
+        match field {
+            ConfigField::ApiKey => self.api_key.clone(),
+            ConfigField::GpuDevice => match self.gpu_device {
+                Some(d) => d.to_string(),
+                None => String::new(),
+            },
+            ConfigField::GpuLayers => self.gpu_layers.to_string(),
+            ConfigField::VectorStoreMaxDocs => self.vs_max_documents.to_string(),
+            ConfigField::LoraPaths => self.lora_paths.clone(),
+            ConfigField::OtelEndpoint => self.otel_endpoint.clone(),
+            ConfigField::IpAllowlist => self.ip_allowlist.clone(),
+            ConfigField::IpDenylist => self.ip_denylist.clone(),
+            // Booleans are toggled, not edited — but keep a sane default.
+            _ => self.field_value(field),
+        }
+    }
+
     pub fn start_edit(&mut self) {
         let field = self.current_field().clone();
         if !field.is_editable() {
             return;
         }
-        self.edit_buffer = self.field_value(&field);
+        self.edit_buffer = self.edit_value(&field);
         self.editing = true;
     }
 
@@ -686,13 +780,6 @@ impl ServerPanelState {
         let field = self.current_field().clone();
         let value = self.edit_buffer.trim().to_string();
 
-        // Don't save if it's the placeholder
-        if value == "[type to replace]" {
-            self.editing = false;
-            self.edit_buffer.clear();
-            return Ok(());
-        }
-
         match field {
             ConfigField::Host => {
                 if value.is_empty() {
@@ -701,17 +788,31 @@ impl ServerPanelState {
                 self.host = value;
             }
             ConfigField::Port => {
-                self.port = value.parse::<u16>().map_err(|_| "Invalid port number")?;
+                let port = value
+                    .parse::<u16>()
+                    .map_err(|_| "Must be a valid port (1-65535)")?;
+                if port == 0 {
+                    return Err("Must be a valid port (1-65535)".to_string());
+                }
+                self.port = port;
             }
             ConfigField::MaxConcurrent => {
-                self.max_concurrent = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n == 0 {
+                    return Err("Must be at least 1 (0 would block all requests)".to_string());
+                }
+                self.max_concurrent = n;
             }
             ConfigField::RateLimit => {
-                self.rate_limit = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n == 0 {
+                    return Err("Must be at least 1 (0 would block all requests)".to_string());
+                }
+                self.rate_limit = n;
             }
             ConfigField::TimeoutSecs => {
                 self.timeout_secs = value
@@ -719,9 +820,13 @@ impl ServerPanelState {
                     .map_err(|_| "Must be a positive number")?;
             }
             ConfigField::MaxBodySize => {
-                self.max_body_size = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n == 0 {
+                    return Err("Must be at least 1 MB".to_string());
+                }
+                self.max_body_size = n;
             }
             ConfigField::Backend => {
                 self.backend = match value.to_lowercase().as_str() {
@@ -762,34 +867,54 @@ impl ServerPanelState {
                 };
             }
             ConfigField::ContextSize => {
-                self.context_size = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n < 256 {
+                    return Err("Must be at least 256 tokens".to_string());
+                }
+                self.context_size = n;
             }
             ConfigField::BatchSize => {
-                self.batch_size = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n == 0 {
+                    return Err("Must be at least 1".to_string());
+                }
+                self.batch_size = n;
             }
             ConfigField::Threads => {
                 self.threads = value
                     .parse::<u32>()
-                    .map_err(|_| "Must be a positive number")?;
+                    .map_err(|_| "Must be a number (0 = auto)")?;
             }
             ConfigField::MaxTokens => {
-                self.max_tokens = value
+                let n = value
                     .parse::<u32>()
                     .map_err(|_| "Must be a positive number")?;
+                if n == 0 {
+                    return Err("Must be at least 1".to_string());
+                }
+                self.max_tokens = n;
             }
             ConfigField::Temperature => {
-                self.temperature = value
+                let v = value
                     .parse::<f32>()
                     .map_err(|_| "Must be a float (0.0-2.0)")?;
+                if !(0.0..=2.0).contains(&v) {
+                    return Err("Must be between 0.0 and 2.0".to_string());
+                }
+                self.temperature = v;
             }
             ConfigField::TopP => {
-                self.top_p = value
+                let v = value
                     .parse::<f32>()
                     .map_err(|_| "Must be a float (0.0-1.0)")?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err("Must be between 0.0 and 1.0".to_string());
+                }
+                self.top_p = v;
             }
             ConfigField::ReasoningBudget => {
                 self.reasoning_budget = value
@@ -805,7 +930,11 @@ impl ServerPanelState {
                     .map_err(|_| "Must be a number (cores)")?;
             }
             ConfigField::ParallelSlots => {
-                self.parallel_slots = value.parse::<u32>().map_err(|_| "Must be 1-16")?;
+                let n = value.parse::<u32>().map_err(|_| "Must be 1-16")?;
+                if !(1..=16).contains(&n) {
+                    return Err("Must be 1-16".to_string());
+                }
+                self.parallel_slots = n;
             }
             ConfigField::LoraPaths => {
                 self.lora_paths = value.to_string();
@@ -827,7 +956,11 @@ impl ServerPanelState {
                 self.otel_service_name = value.to_string();
             }
             ConfigField::OtelSampleRatio => {
-                self.otel_sample_ratio = value.parse::<f64>().map_err(|_| "0.0-1.0")?;
+                let v = value.parse::<f64>().map_err(|_| "0.0-1.0")?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err("Must be between 0.0 and 1.0".to_string());
+                }
+                self.otel_sample_ratio = v;
             }
             ConfigField::IpAllowlist => {
                 self.ip_allowlist = value.to_string();
@@ -884,24 +1017,74 @@ impl ServerPanelState {
             .map(|m| m.file_path.to_string_lossy().to_string())
     }
 
-    /// Generate a random 32-byte hex API key
+    /// Estimate the RAM/VRAM footprint of loading the currently selected
+    /// model with the current panel settings. Returns None when no model
+    /// is selected. This is a heuristic — the same one used by the chat
+    /// loader: file size + context/KV-cache overhead.
+    pub fn estimate_selected_model_load(&self) -> Option<LoadEstimate> {
+        let model = self.models.get(self.model_selected)?;
+        let model_size_mb = model.file_size_bytes / (1024 * 1024);
+        let full_ram = estimate_model_ram_mb(model_size_mb, self.context_size);
+        let ctx_overhead = full_ram - model_size_mb;
+
+        let ram_available_mb = self.hardware.memory_available_mb;
+        let gpu_offload = self.gpu_layers != 0 && !self.hardware.gpus.is_empty();
+        let full_gpu_offload = gpu_offload && self.gpu_layers < 0;
+        let partial_gpu_offload = gpu_offload && self.gpu_layers > 0;
+
+        let target_gpu = if gpu_offload {
+            self.hardware
+                .gpus
+                .iter()
+                .find(|g| Some(g.index) == self.gpu_device)
+                .or_else(|| self.hardware.gpus.first())
+        } else {
+            None
+        };
+        let vram_free_mb = target_gpu.map(|g| g.vram_total_mb.saturating_sub(g.vram_used_mb));
+
+        let (ram_mb, vram_mb) = if full_gpu_offload {
+            // Weights + KV cache go to VRAM; host keeps runtime buffers only
+            (512 + ctx_overhead / 4, Some(model_size_mb + ctx_overhead))
+        } else if partial_gpu_offload {
+            // Unknown layer split — RAM shown is a safe upper bound,
+            // VRAM a rough midpoint.
+            (full_ram, Some(model_size_mb / 2))
+        } else {
+            (full_ram, None)
+        };
+
+        // Unknown available memory (detection failed) → don't claim it won't fit
+        let fits_ram = ram_available_mb == 0 || ram_mb <= ram_available_mb;
+        let fits_vram = match (vram_mb, vram_free_mb) {
+            (Some(need), Some(free)) if free > 0 => need <= free,
+            _ => true,
+        };
+        let fits = fits_ram && fits_vram;
+        let tight = fits && ram_available_mb > 0 && ram_mb * 10 >= ram_available_mb * 9;
+
+        Some(LoadEstimate {
+            model_size_mb,
+            ram_mb,
+            vram_mb,
+            ram_available_mb,
+            vram_free_mb,
+            full_gpu_offload,
+            partial_gpu_offload,
+            gpu_layers: self.gpu_layers,
+            fits,
+            tight,
+        })
+    }
+
+    /// Generate a random 64-char hex API key using OS entropy (UUIDv4 x2).
     pub fn generate_api_key(&mut self) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let mut bytes = [0u8; 32];
-        // Simple PRNG seeded by current time — sufficient for API key generation
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let mut state = seed;
-        for b in bytes.iter_mut() {
-            // xorshift64
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *b = (state & 0xFF) as u8;
-        }
-        self.api_key = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        let key = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        self.api_key = key;
         self.generated_key_display = Some(self.api_key.clone());
     }
 
@@ -1099,5 +1282,193 @@ fn on_off(b: bool) -> String {
         "ON".to_string()
     } else {
         "OFF".to_string()
+    }
+}
+
+/// Mask a secret for display: show only the first and last 4 chars.
+fn mask_secret(key: &str) -> String {
+    let len = key.chars().count();
+    if len <= 8 {
+        "••••••••".to_string()
+    } else {
+        let first: String = key.chars().take(4).collect();
+        let last: String = key.chars().skip(len - 4).collect();
+        format!("{}…{}", first, last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use athenas_core::{ModelFormat, ModelInfo};
+
+    fn test_hardware() -> HardwareInfo {
+        HardwareInfo {
+            cpus: 8,
+            memory_total_mb: 16 * 1024,
+            memory_available_mb: 10 * 1024,
+            gpus: Vec::new(),
+            has_cuda: false,
+            has_rocm: false,
+            has_vulkan: false,
+            has_metal: false,
+        }
+    }
+
+    fn test_model(size_mb: u64) -> ModelInfo {
+        ModelInfo {
+            id: "test/model.gguf".to_string(),
+            repo_id: "test".to_string(),
+            name: "model.gguf".to_string(),
+            format: ModelFormat::Gguf,
+            file_path: std::path::PathBuf::from("/tmp/model.gguf"),
+            file_size_bytes: size_mb * 1024 * 1024,
+            quantization: Some("Q4_K_M".to_string()),
+            context_length: None,
+            architecture: None,
+            huggingface_url: None,
+            license: None,
+            tags: Vec::new(),
+            downloaded_at: chrono::Utc::now(),
+            last_used_at: None,
+        }
+    }
+
+    fn test_state() -> ServerPanelState {
+        let mut config = AppConfig::default();
+        // Point at a nonexistent dir so no real models are scanned
+        config.paths.models_dir = std::path::PathBuf::from("/nonexistent");
+        ServerPanelState::new(&config, test_hardware())
+    }
+
+    #[test]
+    fn edit_value_never_returns_placeholders() {
+        let state = test_state();
+        assert_eq!(state.edit_value(&ConfigField::ApiKey), "");
+        assert_eq!(state.edit_value(&ConfigField::IpAllowlist), "");
+        assert_eq!(state.edit_value(&ConfigField::IpDenylist), "");
+        assert_eq!(state.edit_value(&ConfigField::LoraPaths), "");
+        assert_eq!(state.edit_value(&ConfigField::OtelEndpoint), "");
+        assert_eq!(state.edit_value(&ConfigField::GpuDevice), "");
+        // "unlimited" display value must become the raw number
+        assert_ne!(
+            state.edit_value(&ConfigField::VectorStoreMaxDocs),
+            "unlimited"
+        );
+    }
+
+    #[test]
+    fn save_edit_validates_ranges() {
+        let mut state = test_state();
+
+        // Port 0 is invalid
+        state.selected = state
+            .fields
+            .iter()
+            .position(|f| *f == ConfigField::Port)
+            .unwrap();
+        state.edit_buffer = "0".to_string();
+        assert!(state.save_edit().is_err());
+        state.edit_buffer = "8080".to_string();
+        assert!(state.save_edit().is_ok());
+        assert_eq!(state.port, 8080);
+
+        // Temperature out of range
+        state.selected = state
+            .fields
+            .iter()
+            .position(|f| *f == ConfigField::Temperature)
+            .unwrap();
+        state.edit_buffer = "3.5".to_string();
+        assert!(state.save_edit().is_err());
+        state.edit_buffer = "0.7".to_string();
+        assert!(state.save_edit().is_ok());
+
+        // Parallel slots out of range
+        state.selected = state
+            .fields
+            .iter()
+            .position(|f| *f == ConfigField::ParallelSlots)
+            .unwrap();
+        state.edit_buffer = "99".to_string();
+        assert!(state.save_edit().is_err());
+
+        // Zero rate limit / max concurrent would block all requests
+        state.selected = state
+            .fields
+            .iter()
+            .position(|f| *f == ConfigField::RateLimit)
+            .unwrap();
+        state.edit_buffer = "0".to_string();
+        assert!(state.save_edit().is_err());
+    }
+
+    #[test]
+    fn estimate_cpu_only_matches_shared_heuristic() {
+        let mut state = test_state();
+        state.models = vec![test_model(4096)];
+        state.model_selected = 0;
+        state.gpu_layers = 0;
+        state.context_size = 4096;
+
+        let est = state.estimate_selected_model_load().unwrap();
+        assert_eq!(est.model_size_mb, 4096);
+        // 4096 ctx → (4096/1024)*64 = 256 MB overhead
+        assert_eq!(est.ram_mb, 4096 + 256);
+        assert_eq!(est.vram_mb, None);
+        assert!(est.fits);
+        assert!(!est.tight);
+    }
+
+    #[test]
+    fn estimate_detects_when_model_does_not_fit() {
+        let mut state = test_state();
+        state.models = vec![test_model(12 * 1024)]; // 12 GB model, 10 GB free
+        state.model_selected = 0;
+        state.gpu_layers = 0;
+        state.context_size = 4096;
+
+        let est = state.estimate_selected_model_load().unwrap();
+        assert!(!est.fits);
+    }
+
+    #[test]
+    fn estimate_full_gpu_offload_moves_weight_to_vram() {
+        let mut state = test_state();
+        state.hardware.gpus.push(athenas_core::GpuInfo {
+            index: 0,
+            name: "Test GPU".to_string(),
+            vendor: athenas_core::hardware::GpuVendor::Nvidia,
+            vram_total_mb: 12 * 1024,
+            vram_used_mb: 0,
+            driver_version: "test".to_string(),
+            compute_capability: None,
+        });
+        state.models = vec![test_model(4096)];
+        state.model_selected = 0;
+        state.gpu_layers = -1;
+        state.context_size = 4096;
+
+        let est = state.estimate_selected_model_load().unwrap();
+        assert!(est.full_gpu_offload);
+        assert_eq!(est.vram_mb, Some(4096 + 256));
+        assert!(est.ram_mb < est.model_size_mb); // host keeps only overhead
+        assert!(est.fits);
+    }
+
+    #[test]
+    fn mask_secret_hides_middle() {
+        assert_eq!(mask_secret("abcd1234efgh5678"), "abcd…5678");
+        assert_eq!(mask_secret("short"), "••••••••");
+    }
+
+    #[test]
+    fn refresh_models_clamps_selection() {
+        let mut state = test_state();
+        state.models = vec![test_model(10)];
+        state.model_selected = 5; // out of bounds
+        let config = AppConfig::default();
+        state.refresh_models(&config); // real dir scan → 0 or N models, index must be valid
+        assert!(state.model_selected < state.models.len().max(1));
     }
 }
