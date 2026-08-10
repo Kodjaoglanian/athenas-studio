@@ -66,15 +66,15 @@ pub fn is_process_alive(pid: u32) -> bool {
 
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle == 0 {
+            if handle.is_null() {
                 // Can't open — process doesn't exist or no access
                 return false;
             }
             let mut exit_code: u32 = 0;
             let ok = GetExitCodeProcess(handle, &mut exit_code);
             CloseHandle(handle);
-            // ok is non-zero on success; STILL_ACTIVE means the process is running
-            ok != 0 && exit_code == STILL_ACTIVE
+            // ok is non-zero on success; STILL_ACTIVE (259) means the process is running
+            ok != 0 && exit_code == STILL_ACTIVE as u32
         }
     }
     #[cfg(not(any(unix, windows)))]

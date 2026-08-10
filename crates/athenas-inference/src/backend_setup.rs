@@ -554,7 +554,6 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
     // On Windows, prevent a console window from popping up during verification
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         verify_cmd.creation_flags(CREATE_NO_WINDOW);
     }

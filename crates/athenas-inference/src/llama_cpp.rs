@@ -409,7 +409,6 @@ impl LlamaCppBackend {
         // On Windows, prevent a console window from popping up
         #[cfg(windows)]
         {
-            use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
@@ -670,14 +669,21 @@ impl LlamaCppBackend {
     }
 }
 
-/// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems
+/// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems.
+/// This is a Linux-only dependency; on other platforms it returns false immediately.
 async fn try_install_libgomp() -> bool {
-    // libgomp is a Linux-only dependency; on Windows/macOS it's not needed
     #[cfg(not(target_os = "linux"))]
     {
-        return false;
+        false
     }
+    #[cfg(target_os = "linux")]
+    {
+        try_install_libgomp_linux().await
+    }
+}
 
+#[cfg(target_os = "linux")]
+async fn try_install_libgomp_linux() -> bool {
     // Detect package manager and install
     let managers = [
         ("apt-get", vec!["apt-get", "install", "-y", "libgomp1"]),
