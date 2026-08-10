@@ -361,8 +361,32 @@ impl LlamaCppBackend {
             }
         }
 
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+        // Redirect llama-server stdout/stderr to a log file instead of
+        // piping. When using Stdio::piped(), the pipe buffer (64KB) can
+        // fill up if we don't drain it, causing the llama-server to
+        // BLOCK on write() and become unresponsive. By writing to a
+        // file, the llama-server can always write without blocking.
+        let llama_log_path = {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            let dir = format!("{}/.athenas", home);
+            let _ = std::fs::create_dir_all(&dir);
+            format!("{}/llama-server.log", dir)
+        };
+        let llama_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&llama_log_path)
+            .map_err(|e| {
+                AthenasError::Backend(format!("Failed to open llama-server log: {}", e))
+            })?;
+        let llama_log_clone = llama_log
+            .try_clone()
+            .map_err(|e| AthenasError::Backend(format!("Failed to dup log fd: {}", e)))?;
+
+        info!("llama-server logs: {}", llama_log_path);
+
+        cmd.stdout(std::process::Stdio::from(llama_log))
+            .stderr(std::process::Stdio::from(llama_log_clone))
             .kill_on_drop(true);
 
         info!(
@@ -386,24 +410,23 @@ impl LlamaCppBackend {
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        // Try to read stderr for diagnostic info
-                        let stderr_msg = if let Some(stderr) = child.stderr.take() {
-                            use tokio::io::AsyncReadExt;
-                            let mut buf = Vec::new();
-                            let mut stderr = stderr;
-                            let _ = stderr.read_to_end(&mut buf).await;
-                            String::from_utf8_lossy(&buf).to_string()
-                        } else {
-                            String::new()
-                        };
+                        // Read llama-server log file for diagnostic info
+                        // (stderr is now redirected to a file, not piped)
+                        let stderr_msg = std::fs::read_to_string(&llama_log_path)
+                            .unwrap_or_default()
+                            .lines()
+                            .last()
+                            .unwrap_or("")
+                            .to_string();
 
                         let mut msg = format!("llama-server exited early with status: {}", status);
                         if !stderr_msg.is_empty() {
-                            msg.push_str(&format!("\nstderr: {}", stderr_msg));
+                            msg.push_str(&format!("\nlast log line: {}", stderr_msg));
                         }
 
                         // Check if --reasoning flags are unsupported by this version
-                        if (stderr_msg.contains("reasoning") || stderr_msg.contains("unrecognized"))
+                        let full_log = std::fs::read_to_string(&llama_log_path).unwrap_or_default();
+                        if (full_log.contains("reasoning") || full_log.contains("unrecognized"))
                             && !self.skip_reasoning_flag
                         {
                             info!("--reasoning flag not supported, retrying without it...");
@@ -417,7 +440,7 @@ impl LlamaCppBackend {
 
                         if status.code() == Some(127) {
                             // Check if it's libgomp missing — try to auto-install
-                            if stderr_msg.contains("libgomp.so.1") {
+                            if full_log.contains("libgomp.so.1") {
                                 info!("libgomp.so.1 missing, attempting auto-install...");
                                 let installed = try_install_libgomp().await;
                                 if installed {
@@ -435,9 +458,7 @@ impl LlamaCppBackend {
                                 }
                             }
                             // Check if libvulkan is missing (Vulkan binary needs it)
-                            if stderr_msg.contains("libvulkan.so")
-                                || stderr_msg.contains("libvulkan")
-                            {
+                            if full_log.contains("libvulkan.so") || full_log.contains("libvulkan") {
                                 msg.push_str(
                                     "\n\nHint: Vulkan library missing. The GPU-accelerated \
                                      binary needs Vulkan libraries.\n\

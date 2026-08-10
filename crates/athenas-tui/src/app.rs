@@ -207,56 +207,101 @@ impl TuiApp {
             Some(h) => h.join(".athenas").join("server.log"),
             None => return,
         };
+        // Also tail the llama-server log (subprocess output)
+        let llama_log_path = match dirs::home_dir() {
+            Some(h) => h.join(".athenas").join("llama-server.log"),
+            None => return,
+        };
 
         use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
         // Track the file size we've already read. 0 means we haven't read
         // anything yet (or the file was truncated/recreated).
         let mut last_size: u64 = 0;
+        let mut llama_last_size: u64 = 0;
         // Track whether we've done the initial read of the file
         let mut initialized = false;
+        let mut llama_initialized = false;
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            // Try to get file metadata. If the file doesn't exist, just
-            // continue polling — don't block.
+            // --- Tail server.log (athenas serve output) ---
             let current_size = match std::fs::metadata(&log_path) {
                 Ok(m) => m.len(),
                 Err(_) => {
-                    // File doesn't exist (no server running). Reset state
-                    // so that when the file appears, we read from the start.
                     initialized = false;
                     last_size = 0;
+                    0
+                }
+            };
+
+            if current_size > 0 {
+                if !initialized {
+                    initialized = true;
+                    if current_size > 50_000 {
+                        last_size = current_size - 50_000;
+                    } else {
+                        last_size = 0;
+                    }
+                }
+
+                if current_size < last_size {
+                    last_size = 0;
+                }
+
+                if current_size != last_size {
+                    if let Ok(mut f) = std::fs::File::open(&log_path) {
+                        let _ = f.seek(SeekFrom::Start(last_size));
+                        let mut reader = BufReader::new(f);
+                        let mut buf = String::new();
+                        loop {
+                            buf.clear();
+                            match reader.read_line(&mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    let line = buf.trim_end();
+                                    if !line.is_empty() {
+                                        buffer.push_raw_line(line);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        last_size = current_size;
+                    }
+                }
+            }
+
+            // --- Tail llama-server.log (subprocess output) ---
+            let llama_size = match std::fs::metadata(&llama_log_path) {
+                Ok(m) => m.len(),
+                Err(_) => {
+                    llama_initialized = false;
+                    llama_last_size = 0;
                     continue;
                 }
             };
 
-            if !initialized {
-                // First time the file exists — read from the end (last ~50KB)
-                // to avoid loading a huge log file on startup. If the file
-                // is small, read from the beginning.
-                initialized = true;
-                if current_size > 50_000 {
-                    last_size = current_size - 50_000;
+            if !llama_initialized {
+                llama_initialized = true;
+                if llama_size > 50_000 {
+                    llama_last_size = llama_size - 50_000;
                 } else {
-                    last_size = 0;
+                    llama_last_size = 0;
                 }
             }
 
-            // Check if the file was truncated/recreated (server restarted
-            // with log rotation, or file was deleted and recreated)
-            if current_size < last_size {
-                last_size = 0;
+            if llama_size < llama_last_size {
+                llama_last_size = 0;
             }
 
-            if current_size == last_size {
+            if llama_size == llama_last_size {
                 continue;
             }
 
-            // Read new content from last_size onwards
-            if let Ok(mut f) = std::fs::File::open(&log_path) {
-                let _ = f.seek(SeekFrom::Start(last_size));
+            if let Ok(mut f) = std::fs::File::open(&llama_log_path) {
+                let _ = f.seek(SeekFrom::Start(llama_last_size));
                 let mut reader = BufReader::new(f);
                 let mut buf = String::new();
                 loop {
@@ -272,7 +317,7 @@ impl TuiApp {
                         Err(_) => break,
                     }
                 }
-                last_size = current_size;
+                llama_last_size = llama_size;
             }
         }
     }
