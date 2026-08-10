@@ -59,6 +59,35 @@ impl std::fmt::Display for GpuInfo {
     }
 }
 
+impl HardwareInfo {
+    /// Re-read system memory (total / available) from the OS, in place.
+    /// Values are only overwritten when the OS reports non-zero values,
+    /// so a failed read never wipes out a previous detection.
+    pub fn refresh_memory(&mut self) {
+        let (total, available) = detect_memory();
+        if total > 0 {
+            self.memory_total_mb = total;
+        }
+        if available > 0 {
+            self.memory_available_mb = available;
+        }
+    }
+}
+
+/// Read (total_mb, available_mb) of system memory from the OS.
+/// Returns (0, 0) when detection fails. This does blocking file I/O
+/// (e.g. `/proc/meminfo` on Linux) — call from a blocking context.
+pub fn detect_memory_mb() -> (u64, u64) {
+    detect_memory()
+}
+
+/// Rough estimate of the RAM (in MB) needed to load a model:
+/// the file size (weights, mmap'd) plus a context/KV-cache overhead
+/// that scales with the configured context size.
+pub fn estimate_model_ram_mb(model_size_mb: u64, context_size: u32) -> u64 {
+    model_size_mb + (context_size as u64 / 1024) * 64
+}
+
 impl std::fmt::Display for HardwareInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "=== Hardware Info ===")?;

@@ -9,6 +9,8 @@ pub use config::{
     VectorStoreServerConfig,
 };
 pub use errors::{AthenasError, Result};
-pub use hardware::{GpuInfo, HardwareDetector, HardwareInfo};
+pub use hardware::{
+    detect_memory_mb, estimate_model_ram_mb, GpuInfo, HardwareDetector, HardwareInfo,
+};
 pub use model_registry::{ModelFormat, ModelInfo, ModelRegistry};
 pub use storage::Database;
