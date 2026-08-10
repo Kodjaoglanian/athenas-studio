@@ -24,4 +24,5 @@ chrono = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 dirs = { workspace = true }
+uuid = { workspace = true }
 libc = "0.2"
