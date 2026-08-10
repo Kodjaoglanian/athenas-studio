@@ -1080,9 +1080,13 @@ fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             Style::default().fg(Color::White),
         ),
         Span::raw("  "),
-        Span::styled("Mem: ", Style::default().fg(Color::Yellow)),
+        Span::styled("RAM: ", Style::default().fg(Color::Yellow)),
         Span::styled(
-            format!("{} MB", state.hardware.memory_total_mb),
+            format!(
+                "{} free / {}",
+                fmt_mb(state.hardware.memory_available_mb),
+                fmt_mb(state.hardware.memory_total_mb),
+            ),
             Style::default().fg(Color::White),
         ),
     ]));
@@ -1094,7 +1098,14 @@ fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             .hardware
             .gpus
             .iter()
-            .map(|g| format!("{} ({} MB)", g.name, g.vram_total_mb))
+            .map(|g| {
+                format!(
+                    "{} (VRAM {} free / {})",
+                    g.name,
+                    fmt_mb(g.vram_total_mb.saturating_sub(g.vram_used_mb)),
+                    fmt_mb(g.vram_total_mb),
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -1102,6 +1113,10 @@ fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         Span::styled(" GPU: ", Style::default().fg(Color::Yellow)),
         Span::styled(gpu_str, Style::default().fg(Color::White)),
     ]));
+
+    // Estimated memory footprint of the selected model — shown BEFORE
+    // the user starts the server so they know whether it will fit.
+    lines.push(render_load_estimate_line(state));
 
     let status_line = match &state.phase {
         ServerPhase::Configuring => Line::from(vec![
@@ -1149,6 +1164,98 @@ fn render_hardware_banner(f: &mut Frame, area: Rect, state: &ServerPanelState) {
     f.render_widget(p, area);
 }
 
+/// Build the "Est. load" banner line for the currently selected model.
+fn render_load_estimate_line(state: &ServerPanelState) -> Line<'static> {
+    let label = Span::styled(" Est. load: ", Style::default().fg(Color::Yellow));
+
+    let Some(est) = state.estimate_selected_model_load() else {
+        return Line::from(vec![
+            label,
+            Span::styled(
+                "no model selected".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    };
+
+    let (verdict, verdict_color) = if !est.fits {
+        ("✗ does NOT fit!", Color::Red)
+    } else if est.tight {
+        ("⚠ tight fit", Color::Yellow)
+    } else {
+        ("✓ fits", Color::Green)
+    };
+
+    let mut spans = vec![label];
+
+    // What will be consumed
+    if est.full_gpu_offload {
+        spans.push(Span::styled(
+            format!(
+                "~{} VRAM + ~{} RAM",
+                fmt_mb(est.vram_mb.unwrap_or(0)),
+                fmt_mb(est.ram_mb),
+            ),
+            Style::default().fg(Color::White),
+        ));
+    } else if est.partial_gpu_offload {
+        spans.push(Span::styled(
+            format!(
+                "≤{} RAM + ~{} VRAM ({} layers on GPU)",
+                fmt_mb(est.ram_mb),
+                fmt_mb(est.vram_mb.unwrap_or(0)),
+                est.gpu_layers,
+            ),
+            Style::default().fg(Color::White),
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!(
+                "~{} RAM (model {} + ctx {})",
+                fmt_mb(est.ram_mb),
+                fmt_mb(est.model_size_mb),
+                fmt_mb(est.ram_mb - est.model_size_mb),
+            ),
+            Style::default().fg(Color::White),
+        ));
+    }
+
+    // What is available
+    if est.ram_available_mb > 0 {
+        spans.push(Span::styled(
+            format!("  |  free: {}", fmt_mb(est.ram_available_mb)),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    if let Some(free) = est.vram_free_mb {
+        if free > 0 {
+            spans.push(Span::styled(
+                format!(" + {} VRAM", fmt_mb(free)),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+    }
+
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        verdict.to_string(),
+        Style::default()
+            .fg(verdict_color)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    Line::from(spans)
+}
+
+/// Format a megabyte count as a human-readable string (GB when >= 1 GB).
+fn fmt_mb(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{} MB", mb)
+    }
+}
+
 fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1162,6 +1269,8 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
 
     let mut lines: Vec<Line> = Vec::new();
     let mut current_section = "";
+    // Exact line index of the selected field — used for scroll math below
+    let mut selected_line: u16 = 0;
 
     for (i, field) in state.fields.iter().enumerate() {
         let section = field.section();
@@ -1181,6 +1290,9 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         }
 
         let is_selected = i == state.selected;
+        if is_selected {
+            selected_line = lines.len() as u16;
+        }
         let prefix = if is_selected { " > " } else { "   " };
 
         // Special rendering for model selection
@@ -1211,7 +1323,7 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
             };
 
             lines.push(Line::styled(
-                format!("{}{: <16}: {}", prefix, field.label(), value),
+                format!("{}{: <22}: {}", prefix, field.label(), value),
                 style,
             ));
 
@@ -1350,7 +1462,7 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled(format!("{}{: <16}: ", prefix, field.label()), style),
+            Span::styled(format!("{}{: <22}: ", prefix, field.label()), style),
             Span::styled(value, value_style),
         ]));
 
@@ -1362,30 +1474,13 @@ fn render_config_fields(f: &mut Frame, area: Rect, state: &ServerPanelState) {
         }
     }
 
-    // Calculate scroll offset to keep selected field visible
-    // Each field takes ~1-2 lines (field + optional hint). We estimate
-    // the position by counting lines up to the selected field.
-    let mut line_count = 0u16;
-    let mut current_section = "";
-    for (i, field) in state.fields.iter().enumerate() {
-        let section = field.section();
-        if section != current_section {
-            current_section = section;
-            line_count += 3; // blank + header + separator
-        }
-        if i == state.selected {
-            break;
-        }
-        line_count += 1;
-        // Selected field shows a hint line
-        if i == state.selected.saturating_sub(1) {
-            line_count += 1;
-        }
-    }
-    // Scroll if the selected field is below the visible area
+    // Keep the selected field (and its hint line) inside the visible area.
+    // `selected_line` was recorded exactly while building the lines above,
+    // so the scroll offset is precise — no estimation drift.
     let visible_height = area.height.saturating_sub(2); // minus borders
-    let scroll = if line_count > visible_height {
-        line_count - visible_height + 2
+    let selected_end = selected_line + 1; // field line + hint line below it
+    let scroll = if selected_end >= visible_height {
+        selected_end - visible_height + 1
     } else {
         0
     };
@@ -1459,22 +1554,20 @@ fn render_server_status_bar(f: &mut Frame, area: Rect, state: &ServerPanelState)
     let status = if state.editing {
         " Enter: Save | Esc: Cancel | Type to edit ".to_string()
     } else if let Some(ref msg) = state.status_message {
-        msg.clone()
+        // Multi-line messages (e.g. mmproj rejection) don't fit the bar —
+        // show only the first line.
+        msg.lines().next().unwrap_or(msg).to_string()
     } else if state.phase == ServerPhase::Running {
         format!(
-            " Server running on {} | Enter on Stop to halt ",
+            " Server running on {} | Edits apply on next start | Enter on Stop to halt ",
             state.server_url.as_deref().unwrap_or("?")
         )
     } else {
-        " Up/Down: Navigate | Enter: Edit/Toggle/Action | Left/Right: Cycle Model | F4: Server | F6: Logs "
+        " Up/Down: Navigate | PgUp/PgDn: Jump | Enter: Edit/Toggle/Action | Left/Right: Cycle Model | F6: Logs "
             .to_string()
     };
 
-    let color = if state
-        .status_message
-        .as_ref()
-        .is_some_and(|m| m.starts_with("Error") || m.starts_with("["))
-    {
+    let color = if state.status_message.is_some() && state.status_is_error {
         Color::Red
     } else if state.phase == ServerPhase::Running {
         Color::Green
