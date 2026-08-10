@@ -31,6 +31,8 @@
 - **Reasoning/Thinking Mode** — Support for reasoning models (Qwen3.5, DeepSeek R1, etc.) with configurable thinking budget
 - **Hardware Auto-Detection** — Automatically detects CUDA, ROCm, Vulkan, and Metal
 - **Auto Resource Limits** — Automatically caps threads, context size, and batch size based on available hardware
+- **RAM Pre-Flight Check** — Server panel shows live RAM/VRAM usage and blocks startup if the selected model doesn't fit (with Auto Resource Limits enabled)
+- **API Key Generation** — Generate random admin keys with OS entropy directly from the TUI server panel
 - **Streaming** — Real-time token streaming in both TUI and API server
 - **File Upload** — Upload images and files via `/v1/files` endpoint for multimodal inference
 - **Self-Update** — Built-in `athenas update` command to upgrade to the latest release
@@ -164,7 +166,16 @@ The server panel (F4) also provides full configuration for enterprise features:
 - **TRACING:** OpenTelemetry enable, OTLP Endpoint, Service Name, Sample Ratio
 - **SECURITY:** IP Allowlist, IP Denylist (comma-separated IPs/CIDRs)
 
+The hardware banner shows live **free/total RAM** and **free VRAM**, plus an **Est. load** line with a colored verdict (✓ fits / ⚠ tight / ✗ does NOT fit) that updates as you cycle models — so you know whether a model will fit *before* starting the server.
+
+When Auto Resource Limits is enabled, a **RAM pre-flight check** blocks startup with a clear message if the selected model doesn't fit in available memory.
+
 All fields are editable (Enter to edit, Esc to cancel) or toggleable (Enter to toggle ON/OFF), and persist to `~/.athenas/config.toml`.
+
+**Navigation shortcuts:**
+- **PageUp / PageDown** — Jump 10 fields at a time
+- **G** (on API Key field) — Generate a random admin key (OS-entropy UUIDv4)
+- **X** (on API Key field) — Clear the API key (disables auth)
 
 ### Chat in terminal
 ```bash
@@ -200,7 +211,7 @@ athenas serve model.gguf \
 |------|---------|-------------|
 | `--max-concurrent` | 10 | Max simultaneous inference requests (semaphore) |
 | `--rate-limit` | 20 | Requests per second per IP (token bucket) |
-| `--timeout` | 120 | Request timeout in seconds |
+| `--timeout` | 300 | Request timeout in seconds |
 | `--max-body-size` | 10 | Max request body size in MB |
 
 ### Search HuggingFace
@@ -388,7 +399,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.7.32"
+version = "0.7.33"
 
 [paths]
 models_dir = "~/.athenas/models"
@@ -417,7 +428,7 @@ cpu_reserve_cores = 1           # cores to leave free
 auto_resource_limits = true     # auto-cap threads/ctx/batch based on hardware
 # Advanced inference
 lora_paths = []                 # LoRA adapter paths (e.g. ["/path/to/adapter.gguf"])
-parallel_slots = 1              # parallel decoding slots (1=safe, 4=fast but more RAM)
+parallel_slots = 4              # parallel decoding slots (1=safe, 4=resilient but more RAM)
 
 [server]
 default_host = "127.0.0.1"
@@ -426,7 +437,7 @@ cors_enabled = true
 # api_key = "your-secret-key"   # optional auth
 max_concurrent_requests = 10    # max simultaneous inferences
 rate_limit_per_second = 20      # token bucket per IP
-request_timeout_secs = 120      # kill stuck requests
+request_timeout_secs = 300      # kill stuck requests (must be >= prompt processing time)
 max_body_size_mb = 10           # DoS protection
 enable_metrics = true           # Prometheus /metrics endpoint
 enable_compression = true       # gzip response compression

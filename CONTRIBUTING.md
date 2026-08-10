@@ -35,6 +35,8 @@ The project is organized as a Cargo workspace with 6 crates:
 - **GPU Auto-Download** — Automatically downloads the correct GPU-accelerated llama-server binary based on detected hardware (Vulkan on Linux, CUDA on Windows, Metal on macOS)
 - **Reasoning Mode** — Configurable thinking budget for reasoning models (Qwen3.5, DeepSeek R1)
 - **Auto Resource Limits** — Hardware-aware capping of threads, context, and batch size
+- **RAM Pre-Flight Check** — Server panel shows live RAM/VRAM and blocks startup if the model doesn't fit
+- **API Key Generation** — Generate random admin keys with OS entropy from the TUI
 - **RemoteBackend** — TUI chat connects to detached server via HTTP API
 - **Detached Server** — Server runs as a separate process, surviving TUI restarts
 
