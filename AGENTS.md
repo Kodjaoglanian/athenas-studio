@@ -87,6 +87,33 @@ Files with `mmproj` in the name are multimodal projectors (CLIP vision models), 
 - Rejected with a clear error if loaded directly
 - Auto-detected and loaded via `--mmproj` flag when loading the main model
 
+### Server Panel Status & Errors
+
+`ServerPanelState` has an explicit `status_is_error` flag — set messages via
+`set_status()` (info) / `set_error()` (red) / `clear_status()`. Never write
+`status_message` directly and never infer errors from string prefixes.
+
+### RAM Estimate (shared heuristic)
+
+`athenas_core::estimate_model_ram_mb(model_size_mb, context_size)` =
+`file_size + (ctx / 1024) * 64` MB. Used by BOTH the chat loader and the
+server panel's `estimate_selected_model_load()`. If you change the heuristic,
+keep it shared — don't duplicate the formula.
+
+### Editing Fields (no placeholder leakage)
+
+`ServerPanelState::edit_value()` (not `field_value()`) pre-fills the edit
+buffer. `field_value()` returns *display* strings ("(none)", "unlimited",
+masked secrets) that would corrupt the config if edited literally. Any new
+field with a display placeholder MUST add a matching `edit_value()` arm.
+
+### Memory Refresh
+
+Available RAM is stale at startup. The server panel re-reads it every 5s
+while the tab is open via `poll_mem_refresh()` (spawn_blocking → `detect_memory_mb`).
+Use `HardwareInfo::refresh_memory()` or `detect_memory_mb()` for fresh data;
+pre-flight checks in `start_server()` read memory before the estimate verdict.
+
 ## Release Process
 
 1. Bump version in `Cargo.toml` and `README.md`
@@ -103,3 +130,5 @@ Files with `mmproj` in the name are multimodal projectors (CLIP vision models), 
 - **Check `server_health_task` before starting** — not just `server_start_task`
 - **Always kill stale processes** before starting a new server
 - **The latest llama.cpp release may be incomplete** — search recent releases for the required asset
+- **Don't pre-fill edit buffers from `field_value()`** — use `edit_value()` or placeholders leak into config
+- **Don't write `server_panel_state.status_message` directly** — use `set_status()`/`set_error()` so the status bar colors correctly
