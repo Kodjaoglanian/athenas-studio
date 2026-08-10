@@ -106,7 +106,7 @@ fn default_rate_limit() -> u32 {
     20
 }
 fn default_timeout_secs() -> u64 {
-    120
+    300
 }
 fn default_max_body_size() -> u32 {
     10
@@ -292,7 +292,7 @@ impl Default for AppConfig {
                 api_key: None,
                 max_concurrent_requests: 10,
                 rate_limit_per_second: 20,
-                request_timeout_secs: 120,
+                request_timeout_secs: 300,
                 max_body_size_mb: 10,
                 enable_metrics: true,
                 enable_compression: true,
