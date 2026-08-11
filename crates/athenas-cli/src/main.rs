@@ -69,6 +69,12 @@ enum Commands {
         /// Context size
         #[arg(long, default_value = "4096")]
         context_size: u32,
+        /// Number of CPU threads (0 = auto-detect with auto_resource_limits)
+        #[arg(long)]
+        threads: Option<u32>,
+        /// Batch size for prompt processing
+        #[arg(long)]
+        batch_size: Option<u32>,
         /// Max concurrent requests (semaphore)
         #[arg(long)]
         max_concurrent: Option<u32>,
@@ -251,6 +257,8 @@ async fn main() -> anyhow::Result<()> {
                 gpu_runtime,
                 gpu_device,
                 context_size,
+                threads,
+                batch_size,
                 max_concurrent,
                 rate_limit,
                 timeout,
@@ -265,6 +273,8 @@ async fn main() -> anyhow::Result<()> {
                     gpu_runtime,
                     gpu_device,
                     context_size,
+                    threads,
+                    batch_size,
                     max_concurrent,
                     rate_limit,
                     timeout,

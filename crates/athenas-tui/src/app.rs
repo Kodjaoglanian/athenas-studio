@@ -1845,6 +1845,8 @@ impl TuiApp {
         let gpu_runtime = self.server_panel_state.gpu_runtime.to_string();
         let gpu_device = self.server_panel_state.gpu_device;
         let context_size = self.server_panel_state.context_size;
+        let threads = self.server_panel_state.threads;
+        let batch_size = self.server_panel_state.batch_size;
         let max_concurrent = Some(self.server_panel_state.max_concurrent);
         let rate_limit = Some(self.server_panel_state.rate_limit);
         let timeout_secs = Some(self.server_panel_state.timeout_secs);
@@ -1860,6 +1862,8 @@ impl TuiApp {
             &gpu_runtime,
             gpu_device,
             context_size,
+            Some(threads),
+            Some(batch_size),
             max_concurrent,
             rate_limit,
             timeout_secs,

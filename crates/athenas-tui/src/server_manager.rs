@@ -115,6 +115,8 @@ pub fn start_detached(
     gpu_runtime: &str,
     gpu_device: Option<u32>,
     context_size: u32,
+    threads: Option<u32>,
+    batch_size: Option<u32>,
     max_concurrent: Option<u32>,
     rate_limit: Option<u32>,
     timeout_secs: Option<u64>,
@@ -141,6 +143,13 @@ pub fn start_detached(
 
     if let Some(device) = gpu_device {
         cmd.arg("--gpu-device").arg(device.to_string());
+    }
+
+    if let Some(t) = threads {
+        cmd.arg("--threads").arg(t.to_string());
+    }
+    if let Some(bs) = batch_size {
+        cmd.arg("--batch-size").arg(bs.to_string());
     }
 
     if let Some(mc) = max_concurrent {

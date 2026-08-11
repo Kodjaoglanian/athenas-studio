@@ -12,6 +12,8 @@ pub async fn run(
     gpu_runtime: athenas_core::GpuRuntime,
     gpu_device: Option<u32>,
     context_size: u32,
+    threads: Option<u32>,
+    batch_size: Option<u32>,
     max_concurrent: Option<u32>,
     rate_limit: Option<u32>,
     timeout_secs: Option<u64>,
@@ -51,14 +53,64 @@ pub async fn run(
         gpu_runtime
     };
     let effective_gpu_device = gpu_device.or(config.inference.gpu_device);
+
+    // Apply auto resource limits if enabled
+    let mut effective_threads = threads.unwrap_or(config.inference.default_threads);
+    let mut effective_batch_size = batch_size.unwrap_or(config.inference.default_batch_size);
+    let mut effective_context_size = context_size;
+
+    if config.inference.auto_resource_limits {
+        // Cap threads: leave cpu_reserve_cores free for the OS
+        if effective_threads == 0 {
+            // 0 = auto: use all cores minus reserve
+            effective_threads = hardware
+                .cpus
+                .saturating_sub(config.inference.cpu_reserve_cores)
+                .max(1);
+        } else {
+            // User specified a value — cap it at (cpus - reserve)
+            let max_threads = hardware
+                .cpus
+                .saturating_sub(config.inference.cpu_reserve_cores)
+                .max(1);
+            if effective_threads > max_threads {
+                effective_threads = max_threads;
+            }
+        }
+
+        // Cap context size based on available memory
+        if hardware.memory_total_mb > 0 {
+            let model_size_mb = std::fs::metadata(&model_path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
+            let reserved = model_size_mb + config.inference.ram_reserve_mb;
+            let usable = hardware.memory_total_mb.saturating_sub(reserved);
+            // Rough: allow up to 50% of remaining RAM for context
+            let max_ctx = ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024;
+            if max_ctx > 0 && effective_context_size > max_ctx {
+                effective_context_size = max_ctx.max(512);
+            }
+        }
+
+        // Cap batch size — can't exceed context size
+        if effective_batch_size > effective_context_size {
+            effective_batch_size = effective_context_size;
+        }
+
+        println!(
+            "Auto resource limits: threads={}, context={}, batch={}",
+            effective_threads, effective_context_size, effective_batch_size
+        );
+    }
+
     let load_config = ModelLoadConfig {
         model_path,
         gpu_layers,
         gpu_runtime: effective_gpu_runtime,
         gpu_device: effective_gpu_device,
-        context_size,
-        batch_size: config.inference.default_batch_size,
-        threads: config.inference.default_threads,
+        context_size: effective_context_size,
+        batch_size: effective_batch_size,
+        threads: effective_threads,
         flash_attention: config.inference.flash_attention,
         use_mmap: true,
         use_mlock: false,
