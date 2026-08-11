@@ -585,18 +585,76 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            return Err(AthenasError::Backend(format!(
-                "Downloaded llama-server failed to run (exit code: {:?}).\n\
-                 stdout: {}\n\
-                 stderr: {}\n\
-                 This usually means missing shared libraries.\n\
-                 Try: ldd {}\n\
-                 On Ubuntu/Debian: apt install -y libgomp1",
-                output.status.code(),
-                stdout,
-                stderr,
-                extracted_path.display()
-            )));
+
+            // On Linux, if libgomp.so.1 is missing, try to auto-install it
+            #[cfg(target_os = "linux")]
+            {
+                if stderr.contains("libgomp.so.1") {
+                    info!("libgomp.so.1 missing during verification, attempting auto-install...");
+                    if crate::llama_cpp::try_install_libgomp().await {
+                        info!("libgomp1 installed, re-verifying llama-server...");
+                        let reverify = verify_cmd.output().await;
+                        if let Ok(rv) = reverify {
+                            if rv.status.success() {
+                                info!("llama-server verified successfully after libgomp install");
+                                // Success — continue to variant marker
+                            } else {
+                                let rv_stderr = String::from_utf8_lossy(&rv.stderr);
+                                return Err(AthenasError::Backend(format!(
+                                    "llama-server still fails after libgomp install (exit code: {:?}).\n\
+                                     stderr: {}\n\
+                                     Try: ldd {}",
+                                    rv.status.code(),
+                                    rv_stderr,
+                                    extracted_path.display()
+                                )));
+                            }
+                        } else {
+                            return Err(AthenasError::Backend(
+                                "Cannot re-execute llama-server after libgomp install".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(AthenasError::Backend(format!(
+                            "Downloaded llama-server failed to run (exit code: {:?}).\n\
+                             stdout: {}\n\
+                             stderr: {}\n\
+                             This usually means missing shared libraries.\n\
+                             Try: ldd {}\n\
+                             On Ubuntu/Debian: apt install -y libgomp1",
+                            output.status.code(),
+                            stdout,
+                            stderr,
+                            extracted_path.display()
+                        )));
+                    }
+                } else {
+                    return Err(AthenasError::Backend(format!(
+                        "Downloaded llama-server failed to run (exit code: {:?}).\n\
+                         stdout: {}\n\
+                         stderr: {}\n\
+                         This usually means missing shared libraries.\n\
+                         Try: ldd {}\n\
+                         On Ubuntu/Debian: apt install -y libgomp1",
+                        output.status.code(),
+                        stdout,
+                        stderr,
+                        extracted_path.display()
+                    )));
+                }
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(AthenasError::Backend(format!(
+                    "Downloaded llama-server failed to run (exit code: {:?}).\n\
+                     stdout: {}\n\
+                     stderr: {}",
+                    output.status.code(),
+                    stdout,
+                    stderr,
+                )));
+            }
         }
         Err(e) => {
             return Err(AthenasError::Backend(format!(

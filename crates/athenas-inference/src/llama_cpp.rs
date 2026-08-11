@@ -671,7 +671,7 @@ impl LlamaCppBackend {
 
 /// Try to install libgomp1 (GNU OpenMP) — needed by llama-server on some systems.
 /// This is a Linux-only dependency; on other platforms it returns false immediately.
-async fn try_install_libgomp() -> bool {
+pub async fn try_install_libgomp() -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         false
