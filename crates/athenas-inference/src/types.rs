@@ -249,6 +249,25 @@ pub struct ModelLoadConfig {
     /// Number of parallel slots for batched inference (decoding multiple sequences simultaneously)
     #[serde(default = "default_parallel_slots")]
     pub parallel_slots: u32,
+    /// Path to a draft model for speculative decoding (smaller model that
+    /// proposes tokens for the main model to verify). None = disabled.
+    #[serde(default)]
+    pub draft_model_path: Option<String>,
+    /// Maximum number of tokens the draft model can propose per step.
+    /// Higher = more speculative tokens but more compute if rejected.
+    #[serde(default = "default_draft_max_tokens")]
+    pub draft_max_tokens: u32,
+    /// Minimum context size for the draft model.
+    #[serde(default = "default_draft_min_ctx")]
+    pub draft_min_ctx: u32,
+}
+
+fn default_draft_max_tokens() -> u32 {
+    16
+}
+
+fn default_draft_min_ctx() -> u32 {
+    512
 }
 
 fn default_parallel_slots() -> u32 {
@@ -277,6 +296,9 @@ impl Default for ModelLoadConfig {
             mmproj_path: None,
             lora_paths: Vec::new(),
             parallel_slots: 4,
+            draft_model_path: None,
+            draft_max_tokens: 16,
+            draft_min_ctx: 512,
         }
     }
 }
@@ -392,4 +414,26 @@ pub struct ToolCall {
 pub struct ToolCallFunction {
     pub name: String,
     pub arguments: String,
+}
+
+// ─── Tokenization ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeRequest {
+    /// Text to tokenize (or detokenize if `detokenize` is true)
+    pub text: String,
+    /// If true, treat `text` as a comma-separated list of token IDs to detokenize
+    #[serde(default)]
+    pub detokenize: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenizeResponse {
+    /// Token IDs (for tokenize)
+    pub tokens: Vec<u32>,
+    /// Number of tokens
+    pub count: usize,
+    /// Decoded text (only present for detokenize)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }

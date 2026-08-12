@@ -38,6 +38,9 @@ pub async fn run(
         mmproj_path: None,
         lora_paths: Vec::new(),
         parallel_slots: 1,
+        draft_model_path: None,
+        draft_max_tokens: 16,
+        draft_min_ctx: 512,
     };
 
     backend.load_model(load_config).await?;

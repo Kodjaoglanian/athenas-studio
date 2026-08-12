@@ -61,6 +61,24 @@ pub struct InferenceConfig {
     /// Number of parallel decoding slots for batched inference
     #[serde(default = "default_parallel_slots_cfg")]
     pub parallel_slots: u32,
+    /// Path to a draft model for speculative decoding (relative to models_dir
+    /// or absolute). None = disabled.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// Maximum number of tokens the draft model can propose per step.
+    #[serde(default = "default_draft_max_tokens_cfg")]
+    pub draft_max_tokens: u32,
+    /// Minimum context size for the draft model.
+    #[serde(default = "default_draft_min_ctx_cfg")]
+    pub draft_min_ctx: u32,
+}
+
+fn default_draft_max_tokens_cfg() -> u32 {
+    16
+}
+
+fn default_draft_min_ctx_cfg() -> u32 {
+    512
 }
 
 fn default_parallel_slots_cfg() -> u32 {
@@ -97,6 +115,11 @@ pub struct ServerConfig {
     /// OpenTelemetry tracing configuration
     #[serde(default)]
     pub otel: OtelConfig,
+    /// When true, responses include `X-Queue-Position` and `X-Active-Requests`
+    /// headers indicating the request's position in the queue when waiting
+    /// for a semaphore permit. Does not change behavior — purely informational.
+    #[serde(default)]
+    pub queue_visibility: bool,
 }
 
 fn default_max_concurrent() -> u32 {
@@ -284,6 +307,9 @@ impl Default for AppConfig {
                 auto_resource_limits: true,
                 lora_paths: Vec::new(),
                 parallel_slots: 4,
+                draft_model: None,
+                draft_max_tokens: 16,
+                draft_min_ctx: 512,
             },
             server: ServerConfig {
                 default_host: "127.0.0.1".to_string(),
@@ -300,6 +326,7 @@ impl Default for AppConfig {
                 ip_allowlist: Vec::new(),
                 ip_denylist: Vec::new(),
                 otel: OtelConfig::default(),
+                queue_visibility: false,
             },
             huggingface: HuggingFaceConfig {
                 token: None,

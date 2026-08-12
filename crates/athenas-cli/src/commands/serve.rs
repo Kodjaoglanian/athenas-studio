@@ -59,6 +59,21 @@ pub async fn run(
     let mut effective_batch_size = batch_size.unwrap_or(config.inference.default_batch_size);
     let mut effective_context_size = context_size;
 
+    // Resolve draft model path (relative to models_dir or absolute)
+    let draft_model_path = config.inference.draft_model.as_ref().map(|p| {
+        let path = std::path::Path::new(p);
+        if path.is_absolute() {
+            p.clone()
+        } else {
+            config
+                .paths
+                .models_dir
+                .join(p)
+                .to_string_lossy()
+                .to_string()
+        }
+    });
+
     if config.inference.auto_resource_limits {
         // Cap threads: leave cpu_reserve_cores free for the OS
         if effective_threads == 0 {
@@ -119,6 +134,9 @@ pub async fn run(
         mmproj_path: None,
         lora_paths: config.inference.lora_paths.clone(),
         parallel_slots: config.inference.parallel_slots,
+        draft_model_path,
+        draft_max_tokens: config.inference.draft_max_tokens,
+        draft_min_ctx: config.inference.draft_min_ctx,
     };
 
     backend.load_model(load_config).await?;

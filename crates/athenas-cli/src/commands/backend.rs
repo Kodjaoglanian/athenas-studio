@@ -137,6 +137,9 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             mmproj_path: None,
             lora_paths: Vec::new(),
             parallel_slots: 1,
+            draft_model_path: None,
+            draft_max_tokens: 16,
+            draft_min_ctx: 512,
         })
         .await?;
     let load_time = load_start.elapsed();

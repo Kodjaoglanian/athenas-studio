@@ -20,7 +20,7 @@ use tower_http::{
 use athenas_core::ServerConfig;
 use athenas_inference::{
     Backend, BackendFactory, ChatMessage, ChatRequest, CompletionRequest, ContentPart,
-    EmbeddingRequest, MessageContent, ModelLoadConfig, Role, StreamChunk,
+    EmbeddingRequest, MessageContent, ModelLoadConfig, Role, StreamChunk, TokenizeRequest,
 };
 
 use crate::api_keys::{AuthResult, SharedApiKeyManager};
@@ -49,6 +49,106 @@ struct AppState {
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     start_time: std::time::Instant,
+    /// Number of requests currently waiting for a semaphore permit.
+    waiting_requests: Arc<std::sync::atomic::AtomicU32>,
+    /// Number of requests currently holding a permit (active inference).
+    active_requests: Arc<std::sync::atomic::AtomicU32>,
+    /// Whether to include queue position headers in responses.
+    queue_visibility: bool,
+}
+
+/// RAII guard that decrements the active request counter when dropped.
+/// Wraps an `OwnedSemaphorePermit` so the semaphore is also released.
+struct PermitGuard {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    active_requests: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for PermitGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl std::ops::Deref for PermitGuard {
+    type Target = tokio::sync::OwnedSemaphorePermit;
+    fn deref(&self) -> &Self::Target {
+        &self.permit
+    }
+}
+
+/// Acquire a semaphore permit with queue tracking.
+/// Returns `Some((guard, queue_position))` on success, or `None` if the
+/// semaphore is closed. When `queue_visibility` is enabled, the caller
+/// should include `X-Queue-Position` and `X-Active-Requests` headers in
+/// the response.
+async fn acquire_with_tracking(state: &AppState) -> Option<(PermitGuard, u32)> {
+    use std::sync::atomic::Ordering;
+
+    // Try a non-blocking acquire first (fast path — no queue)
+    if let Ok(permit) = state.semaphore.clone().try_acquire_owned() {
+        state.active_requests.fetch_add(1, Ordering::Relaxed);
+        let guard = PermitGuard {
+            permit,
+            active_requests: state.active_requests.clone(),
+        };
+        return Some((guard, 0));
+    }
+
+    // Slow path — we're going to wait. Track our position.
+    let queue_position = state.waiting_requests.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let permit_result = state.semaphore.clone().acquire_owned().await;
+
+    state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
+    state.active_requests.fetch_add(1, Ordering::Relaxed);
+
+    match permit_result {
+        Ok(permit) => {
+            let guard = PermitGuard {
+                permit,
+                active_requests: state.active_requests.clone(),
+            };
+            Some((guard, queue_position))
+        }
+        Err(_) => None,
+    }
+}
+
+/// Build response headers with queue information if visibility is enabled.
+fn queue_headers(state: &AppState, queue_position: u32) -> Vec<(String, String)> {
+    use std::sync::atomic::Ordering;
+
+    if !state.queue_visibility {
+        return Vec::new();
+    }
+
+    let active = state.active_requests.load(Ordering::Relaxed);
+    let waiting = state.waiting_requests.load(Ordering::Relaxed);
+
+    vec![
+        ("X-Queue-Position".to_string(), queue_position.to_string()),
+        ("X-Active-Requests".to_string(), active.to_string()),
+        ("X-Waiting-Requests".to_string(), waiting.to_string()),
+    ]
+}
+
+/// Attach queue visibility headers to a response.
+fn with_queue_headers(state: &AppState, queue_position: u32, mut resp: Response) -> Response {
+    let headers = queue_headers(state, queue_position);
+    if headers.is_empty() {
+        return resp;
+    }
+    let h = resp.headers_mut();
+    for (k, v) in headers {
+        if let Ok(name) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
+            if let Ok(val) = axum::http::HeaderValue::from_str(&v) {
+                h.insert(name, val);
+            }
+        }
+    }
+    resp
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,12 +177,18 @@ pub fn create_router(
         metrics: metrics.clone(),
         semaphore,
         start_time: std::time::Instant::now(),
+        waiting_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        active_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        queue_visibility: config.queue_visibility,
     };
 
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/tokenize", post(tokenize))
+        .route("/v1/responses", post(responses))
+        .route("/v1/queue", get(queue_status))
         .route("/v1/models", get(list_models))
         .route("/v1/models/load", post(load_model_endpoint))
         .route("/v1/models/unload", post(unload_model_endpoint))
@@ -364,6 +470,23 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json)
 }
 
+/// Queue status endpoint — returns current queue depth and active requests.
+/// Useful for monitoring and autoscaling decisions.
+async fn queue_status(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    let active = state.active_requests.load(Ordering::Relaxed);
+    let waiting = state.waiting_requests.load(Ordering::Relaxed);
+    let max_concurrent = state.semaphore.available_permits();
+
+    Json(serde_json::json!({
+        "active_requests": active,
+        "waiting_requests": waiting,
+        "available_permits": max_concurrent,
+        "queue_visibility_enabled": state.queue_visibility,
+    }))
+}
+
 async fn ready(State(state): State<AppState>) -> Response {
     let mgr = state.model_manager.lock().await;
     if mgr.has_models() {
@@ -515,11 +638,9 @@ async fn chat_completions(
         }
     };
 
-    let _permit = match state.semaphore.acquire().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
+        Some((permit, pos)) => (permit, pos),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let new_messages: Vec<ChatMessage> = req
@@ -856,7 +977,7 @@ async fn chat_completions(
                         "total_tokens": resp.stats.tokens_prompt + resp.stats.tokens_generated,
                     },
                 });
-                Json(json).into_response()
+                with_queue_headers(&state, queue_pos, Json(json).into_response())
             }
             Err(e) => {
                 tracing::error!(
@@ -1047,11 +1168,9 @@ async fn completions(
         }
     };
 
-    let _permit = match state.semaphore.acquire().await {
-        Ok(permit) => permit,
-        Err(_) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
+    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
+        Some((permit, pos)) => (permit, pos),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let stop = match req.stop {
@@ -1229,7 +1348,7 @@ async fn completions(
                         "total_tokens": resp.stats.tokens_prompt + resp.stats.tokens_generated,
                     },
                 });
-                Json(json).into_response()
+                with_queue_headers(&state, queue_pos, Json(json).into_response())
             }
             Err(e) => {
                 tracing::error!("Completion error: {}", e);
@@ -1408,6 +1527,9 @@ async fn load_model_endpoint(
         mmproj_path: req.mmproj_path,
         lora_paths: req.lora_paths.clone(),
         parallel_slots: req.parallel_slots.unwrap_or(4),
+        draft_model_path: None,
+        draft_max_tokens: 16,
+        draft_min_ctx: 512,
     };
 
     if let Err(e) = backend.load_model(load_config).await {
@@ -1856,6 +1978,437 @@ fn default_encoding_format_api() -> Option<String> {
     Some("float".to_string())
 }
 
+// ─── Tokenize endpoint ───
+
+#[derive(Debug, Deserialize)]
+struct TokenizeApiRequest {
+    /// Text to tokenize
+    text: String,
+    /// If true, treat `text` as comma-separated token IDs to detokenize
+    #[serde(default)]
+    detokenize: bool,
+}
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/tokenize"))]
+async fn tokenize(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<TokenizeApiRequest>,
+) -> Response {
+    // Auth check (same as embeddings)
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, None).await {
+        AuthResult::NoAuthRequired => None,
+        AuthResult::Allowed { key_id, .. } => Some(key_id),
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Resolve backend
+    let backend = {
+        let mgr = state.model_manager.lock().await;
+        mgr.get(None)
+    };
+
+    let Some(backend) = backend else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "No model loaded"})),
+        )
+            .into_response();
+    };
+
+    let result = backend
+        .tokenize(TokenizeRequest {
+            text: req.text,
+            detokenize: req.detokenize,
+        })
+        .await;
+
+    match result {
+        Ok(resp) => {
+            // Record usage for API key (tokenize uses prompt tokens)
+            if let Some(ref key_id) = auth_key_id {
+                if let Some(ref mgr_arc) = state.api_key_manager {
+                    let mut mgr = mgr_arc.lock().await;
+                    if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                        mgr.record_usage(&key, resp.count as u64, 0);
+                    }
+                }
+            }
+            Json(resp).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ─── /v1/responses endpoint (OpenAI Responses API) ───
+
+#[derive(Debug, Deserialize)]
+struct ResponsesApiRequest {
+    model: Option<String>,
+    /// `input` can be a simple string or an array of messages (same format
+    /// as chat completions `messages`).
+    input: serde_json::Value,
+    instructions: Option<String>,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    max_output_tokens: Option<u32>,
+    stream: Option<bool>,
+    stop: Option<serde_json::Value>,
+    seed: Option<u64>,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
+    response_format: Option<serde_json::Value>,
+    grammar: Option<String>,
+}
+
+/// Convert the `input` field (string or array of messages) into ChatMessage list.
+fn parse_responses_input(
+    input: &serde_json::Value,
+    instructions: &Option<String>,
+) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+
+    // Prepend system instructions if provided
+    if let Some(ref instr) = instructions {
+        if !instr.is_empty() {
+            messages.push(ChatMessage::system(instr.clone()));
+        }
+    }
+
+    match input {
+        serde_json::Value::String(s) => {
+            messages.push(ChatMessage::user(s.clone()));
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(role) = item.get("role").and_then(|r| r.as_str()) {
+                    let content = match item.get("content") {
+                        Some(serde_json::Value::String(s)) => MessageContent::Text(s.clone()),
+                        Some(serde_json::Value::Array(_)) => {
+                            // Parse as content parts (multimodal)
+                            serde_json::from_value(item["content"].clone())
+                                .map(MessageContent::Parts)
+                                .unwrap_or(MessageContent::Text(String::new()))
+                        }
+                        _ => MessageContent::Text(String::new()),
+                    };
+                    let role_enum = match role {
+                        "system" => Role::System,
+                        "assistant" => Role::Assistant,
+                        "tool" => Role::Tool,
+                        _ => Role::User,
+                    };
+                    messages.push(ChatMessage {
+                        role: role_enum,
+                        content,
+                    });
+                }
+            }
+        }
+        _ => {
+            // Fallback: treat as single user message
+            messages.push(ChatMessage::user(input.to_string()));
+        }
+    }
+
+    messages
+}
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/responses"))]
+async fn responses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ResponsesApiRequest>,
+) -> Response {
+    let model_for_auth = req.model.as_deref();
+    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
+    {
+        AuthResult::NoAuthRequired => None,
+        AuthResult::Allowed { key_id, .. } => Some(key_id),
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded for this API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "This API key is not allowed to use the requested model"}))).into_response();
+        }
+    };
+
+    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
+        Some((permit, pos)) => (permit, pos),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let messages = parse_responses_input(&req.input, &req.instructions);
+
+    let stop = match &req.stop {
+        Some(serde_json::Value::String(s)) => Some(vec![s.clone()]),
+        Some(serde_json::Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    };
+
+    let chat_req = ChatRequest {
+        model: req.model.clone().unwrap_or_default(),
+        messages,
+        temperature: req.temperature,
+        top_p: req.top_p,
+        max_tokens: req.max_output_tokens,
+        stream: req.stream.unwrap_or(false),
+        stop,
+        seed: req.seed,
+        tools: req.tools.clone(),
+        tool_choice: req.tool_choice.clone(),
+        response_format: req.response_format.clone(),
+        grammar: req.grammar.clone(),
+    };
+
+    let model_id = chat_req.model.clone();
+
+    // Resolve backend (same logic as chat_completions)
+    let (backend, resolved_model_id, _tried_models): (Arc<dyn Backend>, String, Vec<String>) = {
+        let mgr = state.model_manager.lock().await;
+
+        let mut backend: Option<Arc<dyn Backend>> = None;
+        let mut resolved = String::new();
+
+        if let Some(b) = mgr.get(Some(model_id.as_str())) {
+            backend = Some(b);
+            resolved = model_id.clone();
+        }
+        if backend.is_none() {
+            if let Some(b) = mgr.get(None) {
+                if let Some(def_id) = mgr.default_id() {
+                    resolved = def_id.to_string();
+                }
+                backend = Some(b);
+            }
+        }
+
+        match backend {
+            Some(b) => (b, resolved, vec![]),
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("No model loaded for model '{}'", model_id)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if chat_req.stream {
+        // Streaming responses API format
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+        let model_name = backend
+            .model_info()
+            .map(|i| i.name.clone())
+            .unwrap_or_default();
+        let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+
+        let metrics = state.metrics.clone();
+        let api_key_mgr_clone = state.api_key_manager.clone();
+        let auth_key_id_clone = auth_key_id.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = backend.chat_stream(chat_req, tx).await {
+                tracing::error!("Stream error: {}", e);
+            }
+        });
+
+        let stream = async_stream::stream! {
+            let mut rx = rx;
+            let mut full_text = String::new();
+            while let Some(chunk) = rx.recv().await {
+                if chunk.done {
+                    if let Some(stats) = &chunk.stats {
+                        metrics.record_tokens(&model_name, stats.tokens_prompt, stats.tokens_generated);
+                        if let Some(ref key_id) = auth_key_id_clone {
+                            if let Some(ref mgr_arc) = api_key_mgr_clone {
+                                let mut mgr = mgr_arc.lock().await;
+                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                    mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
+                                }
+                            }
+                        }
+                    }
+
+                    // Final response.completed event
+                    let json = serde_json::json!({
+                        "id": response_id,
+                        "object": "response.completed",
+                        "created_at": chrono::Utc::now().timestamp(),
+                        "model": model_name,
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": full_text}],
+                        }],
+                        "usage": {
+                            "input_tokens": chunk.stats.as_ref().map(|s| s.tokens_prompt).unwrap_or(0),
+                            "output_tokens": chunk.stats.as_ref().map(|s| s.tokens_generated).unwrap_or(0),
+                            "total_tokens": chunk.stats.as_ref().map(|s| s.tokens_prompt + s.tokens_generated).unwrap_or(0),
+                        },
+                    });
+                    yield Ok::<Event, std::convert::Infallible>(
+                        Event::default().data(json.to_string())
+                    );
+                    yield Ok(Event::default().data("[DONE]"));
+                    break;
+                }
+                full_text.push_str(&chunk.text);
+                let json = serde_json::json!({
+                    "id": response_id,
+                    "object": "response.output_text.delta",
+                    "delta": chunk.text,
+                });
+                yield Ok::<Event, std::convert::Infallible>(
+                    Event::default().data(json.to_string())
+                );
+            }
+        };
+
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    } else {
+        // Non-streaming responses API
+        match backend.chat(chat_req).await {
+            Ok(resp) => {
+                state.metrics.record_tokens(
+                    &resp.model,
+                    resp.stats.tokens_prompt,
+                    resp.stats.tokens_generated,
+                );
+
+                if let Some(ref key_id) = auth_key_id {
+                    if let Some(ref mgr_arc) = state.api_key_manager {
+                        let mut mgr = mgr_arc.lock().await;
+                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
+                        {
+                            mgr.record_usage(
+                                &key,
+                                resp.stats.tokens_prompt as u64,
+                                resp.stats.tokens_generated as u64,
+                            );
+                        }
+                    }
+                }
+
+                record_audit(
+                    &state,
+                    AuditParams {
+                        endpoint: "/v1/responses",
+                        method: "POST",
+                        status: 200,
+                        model: &resp.model,
+                        tokens_prompt: resp.stats.tokens_prompt as u64,
+                        tokens_generated: resp.stats.tokens_generated as u64,
+                        error: None,
+                    },
+                )
+                .await;
+
+                let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
+                let output_text = resp.message.content.as_text();
+
+                let json = serde_json::json!({
+                    "id": response_id,
+                    "object": "response",
+                    "created_at": chrono::Utc::now().timestamp(),
+                    "model": resp.model,
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": output_text}],
+                    }],
+                    "output_text": output_text,
+                    "usage": {
+                        "input_tokens": resp.stats.tokens_prompt,
+                        "output_tokens": resp.stats.tokens_generated,
+                        "total_tokens": resp.stats.tokens_prompt + resp.stats.tokens_generated,
+                    },
+                });
+                with_queue_headers(&state, queue_pos, Json(json).into_response())
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Responses API error with model '{}': {}",
+                    resolved_model_id,
+                    e
+                );
+
+                state
+                    .metrics
+                    .errors_total
+                    .with_label_values(&["/v1/responses", "inference"])
+                    .inc();
+
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": {"message": e.to_string(), "type": "server_error"}
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, fields(endpoint = "/v1/embeddings"))]
 async fn embeddings(
     State(state): State<AppState>,
@@ -1897,9 +2450,9 @@ async fn embeddings(
         }
     };
 
-    let _permit = match state.semaphore.acquire().await {
-        Ok(permit) => permit,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
+        Some((permit, pos)) => (permit, pos),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let model_id = req.model.clone().unwrap_or_default();
@@ -1994,7 +2547,7 @@ async fn embeddings(
                 }
             }
 
-            Json(resp).into_response()
+            with_queue_headers(&state, queue_pos, Json(resp).into_response())
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -811,7 +811,9 @@ impl TuiApp {
                 KeyCode::Backspace => {
                     self.browser_state.search_input.pop();
                 }
-                KeyCode::Char('g') | KeyCode::Char('G') => {
+                KeyCode::Char('g') | KeyCode::Char('G')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     self.browser_state.gguf_only = !self.browser_state.gguf_only;
                 }
                 KeyCode::Esc => {
@@ -1502,6 +1504,9 @@ impl TuiApp {
             mmproj_path: None,
             lora_paths: Vec::new(),
             parallel_slots: 1,
+            draft_model_path: None,
+            draft_max_tokens: 16,
+            draft_min_ctx: 512,
         };
 
         let task = tokio::spawn(async move {

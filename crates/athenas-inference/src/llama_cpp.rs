@@ -9,7 +9,7 @@ use crate::backend::{Backend, ModelInfo};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, EmbeddingData,
     EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, InferenceStats, MessageContent,
-    ModelLoadConfig, Role, StreamChunk,
+    ModelLoadConfig, Role, StreamChunk, TokenizeRequest, TokenizeResponse,
 };
 
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
@@ -373,6 +373,26 @@ impl LlamaCppBackend {
             if !lora_path.is_empty() {
                 info!("Loading LoRA adapter: {}", lora_path);
                 cmd.arg("--lora").arg(lora_path);
+            }
+        }
+
+        // Speculative decoding with a draft model
+        if let Some(ref draft_path) = config.draft_model_path {
+            if !draft_path.is_empty() && std::path::Path::new(draft_path).exists() {
+                info!(
+                    "Speculative decoding enabled: draft model={}, max_tokens={}, min_ctx={}",
+                    draft_path, config.draft_max_tokens, config.draft_min_ctx
+                );
+                cmd.arg("--model-draft").arg(draft_path);
+                cmd.arg("--draft-max")
+                    .arg(config.draft_max_tokens.to_string());
+                cmd.arg("--draft-min-ctx")
+                    .arg(config.draft_min_ctx.to_string());
+            } else if !draft_path.is_empty() {
+                warn!(
+                    "Draft model path '{}' not found — speculative decoding disabled",
+                    draft_path
+                );
             }
         }
 
@@ -1469,6 +1489,104 @@ impl Backend for LlamaCppBackend {
                 total_tokens,
             },
         })
+    }
+
+    /// Tokenize text via llama-server's /tokenize endpoint,
+    /// or detokenize via /detokenize.
+    async fn tokenize(&self, request: TokenizeRequest) -> Result<TokenizeResponse> {
+        if !self.loaded {
+            return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+
+        if request.detokenize {
+            // Parse comma-separated token IDs
+            let tokens: Vec<u32> = request
+                .text
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u32>().ok())
+                .collect();
+
+            let body = serde_json::json!({ "tokens": tokens });
+            let url = format!("http://127.0.0.1:{}/detokenize", self.server_port);
+            let resp = self
+                .client
+                .post(&url)
+                .json(&body)
+                .timeout(tokio::time::Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| AthenasError::Backend(format!("Detokenize request failed: {}", e)))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(AthenasError::Backend(format!(
+                    "llama-server detokenize returned {}: {}",
+                    status, text
+                )));
+            }
+
+            let result: serde_json::Value = resp.json().await.map_err(|e| {
+                AthenasError::Backend(format!("Invalid detokenize response: {}", e))
+            })?;
+
+            // llama-server returns {"text": "decoded text"}
+            let decoded = result
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let count = tokens.len();
+            Ok(TokenizeResponse {
+                tokens,
+                count,
+                text: Some(decoded),
+            })
+        } else {
+            let body = serde_json::json!({ "content": request.text });
+            let url = format!("http://127.0.0.1:{}/tokenize", self.server_port);
+            let resp = self
+                .client
+                .post(&url)
+                .json(&body)
+                .timeout(tokio::time::Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| AthenasError::Backend(format!("Tokenize request failed: {}", e)))?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(AthenasError::Backend(format!(
+                    "llama-server tokenize returned {}: {}",
+                    status, text
+                )));
+            }
+
+            let result: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| AthenasError::Backend(format!("Invalid tokenize response: {}", e)))?;
+
+            // llama-server returns {"tokens": [123, 456, ...]}
+            let tokens: Vec<u32> = result
+                .get("tokens")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as u32))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let count = tokens.len();
+            Ok(TokenizeResponse {
+                tokens,
+                count,
+                text: None,
+            })
+        }
     }
 
     fn model_info(&self) -> Option<ModelInfo> {

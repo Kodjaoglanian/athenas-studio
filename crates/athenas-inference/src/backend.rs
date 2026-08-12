@@ -5,7 +5,7 @@ use athenas_core::Result;
 
 use crate::types::{
     ChatRequest, ChatResponse, CompletionRequest, CompletionResponse, EmbeddingRequest,
-    EmbeddingResponse, ModelLoadConfig, StreamChunk,
+    EmbeddingResponse, ModelLoadConfig, StreamChunk, TokenizeRequest, TokenizeResponse,
 };
 
 #[async_trait]
@@ -31,6 +31,14 @@ pub trait Backend: Send + Sync {
     async fn embeddings(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {
         Err(athenas_core::AthenasError::Backend(
             "Embeddings not supported by this backend".to_string(),
+        ))
+    }
+
+    /// Tokenize text into token IDs using the loaded model's tokenizer.
+    /// Default implementation returns an error — backends override if supported.
+    async fn tokenize(&self, _request: TokenizeRequest) -> Result<TokenizeResponse> {
+        Err(athenas_core::AthenasError::Backend(
+            "Tokenization not supported by this backend".to_string(),
         ))
     }
 

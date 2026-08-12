@@ -48,6 +48,7 @@ pub enum ConfigField {
     CorsEnabled,
     MetricsEnabled,
     CompressionEnabled,
+    QueueVisibility,
     // Inference / optimization
     Backend,
     GpuRuntime,
@@ -70,6 +71,9 @@ pub enum ConfigField {
     // Advanced inference
     ParallelSlots,
     LoraPaths,
+    DraftModel,
+    DraftMaxTokens,
+    DraftMinCtx,
     // Vector store
     VectorStoreEnabled,
     VectorStoreMaxDocs,
@@ -106,6 +110,7 @@ impl ConfigField {
             ConfigField::CorsEnabled,
             ConfigField::MetricsEnabled,
             ConfigField::CompressionEnabled,
+            ConfigField::QueueVisibility,
             ConfigField::Backend,
             ConfigField::GpuRuntime,
             ConfigField::GpuDevice,
@@ -124,6 +129,9 @@ impl ConfigField {
             ConfigField::AutoResourceLimits,
             ConfigField::ParallelSlots,
             ConfigField::LoraPaths,
+            ConfigField::DraftModel,
+            ConfigField::DraftMaxTokens,
+            ConfigField::DraftMinCtx,
             ConfigField::VectorStoreEnabled,
             ConfigField::VectorStoreMaxDocs,
             ConfigField::VectorStoreTopK,
@@ -155,6 +163,7 @@ impl ConfigField {
             ConfigField::CorsEnabled => "CORS",
             ConfigField::MetricsEnabled => "Metrics",
             ConfigField::CompressionEnabled => "Compression",
+            ConfigField::QueueVisibility => "Queue Info",
             ConfigField::Backend => "Backend",
             ConfigField::GpuRuntime => "GPU Runtime",
             ConfigField::GpuDevice => "GPU Device",
@@ -173,6 +182,9 @@ impl ConfigField {
             ConfigField::AutoResourceLimits => "Auto Resource Limits",
             ConfigField::ParallelSlots => "Parallel Slots",
             ConfigField::LoraPaths => "LoRA Adapters",
+            ConfigField::DraftModel => "Draft Model",
+            ConfigField::DraftMaxTokens => "Draft Max Tokens",
+            ConfigField::DraftMinCtx => "Draft Min Ctx",
             ConfigField::VectorStoreEnabled => "Vector Store",
             ConfigField::VectorStoreMaxDocs => "VS Max Documents",
             ConfigField::VectorStoreTopK => "VS Default Top-K",
@@ -203,7 +215,8 @@ impl ConfigField {
             | ConfigField::MaxBodySize
             | ConfigField::CorsEnabled
             | ConfigField::MetricsEnabled
-            | ConfigField::CompressionEnabled => "SERVER",
+            | ConfigField::CompressionEnabled
+            | ConfigField::QueueVisibility => "SERVER",
             ConfigField::Backend
             | ConfigField::GpuRuntime
             | ConfigField::GpuDevice
@@ -221,7 +234,10 @@ impl ConfigField {
             | ConfigField::CpuReserve
             | ConfigField::AutoResourceLimits
             | ConfigField::ParallelSlots
-            | ConfigField::LoraPaths => "ADVANCED",
+            | ConfigField::LoraPaths
+            | ConfigField::DraftModel
+            | ConfigField::DraftMaxTokens
+            | ConfigField::DraftMinCtx => "ADVANCED",
             ConfigField::VectorStoreEnabled
             | ConfigField::VectorStoreMaxDocs
             | ConfigField::VectorStoreTopK => "VECTOR STORE",
@@ -258,6 +274,7 @@ impl ConfigField {
             ConfigField::CorsEnabled
                 | ConfigField::MetricsEnabled
                 | ConfigField::CompressionEnabled
+                | ConfigField::QueueVisibility
                 | ConfigField::FlashAttention
                 | ConfigField::Reasoning
                 | ConfigField::AutoResourceLimits
@@ -336,6 +353,7 @@ pub struct ServerPanelState {
     pub cors_enabled: bool,
     pub metrics_enabled: bool,
     pub compression_enabled: bool,
+    pub queue_visibility: bool,
 
     // Optimization
     pub backend: BackendType,
@@ -362,6 +380,9 @@ pub struct ServerPanelState {
     // Advanced inference
     pub parallel_slots: u32,
     pub lora_paths: String,
+    pub draft_model: String,
+    pub draft_max_tokens: u32,
+    pub draft_min_ctx: u32,
 
     // Vector store
     pub vs_enabled: bool,
@@ -426,6 +447,7 @@ impl ServerPanelState {
             cors_enabled: config.server.cors_enabled,
             metrics_enabled: config.server.enable_metrics,
             compression_enabled: config.server.enable_compression,
+            queue_visibility: config.server.queue_visibility,
             backend: config.inference.default_backend,
             gpu_layers: config.inference.default_gpu_layers,
             gpu_runtime: config.inference.gpu_runtime,
@@ -444,6 +466,9 @@ impl ServerPanelState {
             auto_resource_limits: config.inference.auto_resource_limits,
             parallel_slots: config.inference.parallel_slots,
             lora_paths: config.inference.lora_paths.join(", "),
+            draft_model: config.inference.draft_model.clone().unwrap_or_default(),
+            draft_max_tokens: config.inference.draft_max_tokens,
+            draft_min_ctx: config.inference.draft_min_ctx,
             vs_enabled: config.server.vector_store.enabled,
             vs_max_documents: config.server.vector_store.max_documents,
             vs_top_k: config.server.vector_store.default_top_k,
@@ -573,6 +598,7 @@ impl ServerPanelState {
             ConfigField::CorsEnabled => on_off(self.cors_enabled),
             ConfigField::MetricsEnabled => on_off(self.metrics_enabled),
             ConfigField::CompressionEnabled => on_off(self.compression_enabled),
+            ConfigField::QueueVisibility => on_off(self.queue_visibility),
             ConfigField::Backend => self.backend.to_string(),
             ConfigField::GpuRuntime => self.gpu_runtime.to_string(),
             ConfigField::GpuDevice => match self.gpu_device {
@@ -606,6 +632,15 @@ impl ServerPanelState {
                     self.lora_paths.clone()
                 }
             }
+            ConfigField::DraftModel => {
+                if self.draft_model.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.draft_model.clone()
+                }
+            }
+            ConfigField::DraftMaxTokens => self.draft_max_tokens.to_string(),
+            ConfigField::DraftMinCtx => self.draft_min_ctx.to_string(),
             ConfigField::VectorStoreEnabled => on_off(self.vs_enabled),
             ConfigField::VectorStoreMaxDocs => {
                 if self.vs_max_documents == 0 {
@@ -702,6 +737,7 @@ impl ServerPanelState {
             ConfigField::CorsEnabled => "Allow cross-origin requests",
             ConfigField::MetricsEnabled => "Expose /metrics endpoint (Prometheus)",
             ConfigField::CompressionEnabled => "gzip response compression",
+            ConfigField::QueueVisibility => "X-Queue-Position headers in responses",
             ConfigField::Backend => "auto, llama.cpp, or vllm",
             ConfigField::GpuRuntime => "auto, cuda, rocm, vulkan, metal, or cpu",
             ConfigField::GpuDevice => "GPU index (0, 1, 2, ...) or 'auto' for default",
@@ -722,6 +758,11 @@ impl ServerPanelState {
             ConfigField::AutoResourceLimits => "Auto-cap threads/ctx/batch based on hardware",
             ConfigField::ParallelSlots => "Parallel decoding slots (1=safe, 4=fast but more RAM)",
             ConfigField::LoraPaths => "Comma-separated paths to .gguf LoRA adapter files",
+            ConfigField::DraftModel => {
+                "Draft model for speculative decoding (path relative to models dir)"
+            }
+            ConfigField::DraftMaxTokens => "Max tokens draft model proposes per step (8-64)",
+            ConfigField::DraftMinCtx => "Minimum context size for draft model",
             ConfigField::VectorStoreEnabled => "Enable integrated vector store for RAG",
             ConfigField::VectorStoreMaxDocs => "Max documents (0 = unlimited)",
             ConfigField::VectorStoreTopK => "Default search results count",
@@ -754,6 +795,9 @@ impl ServerPanelState {
             ConfigField::GpuLayers => self.gpu_layers.to_string(),
             ConfigField::VectorStoreMaxDocs => self.vs_max_documents.to_string(),
             ConfigField::LoraPaths => self.lora_paths.clone(),
+            ConfigField::DraftModel => self.draft_model.clone(),
+            ConfigField::DraftMaxTokens => self.draft_max_tokens.to_string(),
+            ConfigField::DraftMinCtx => self.draft_min_ctx.to_string(),
             ConfigField::OtelEndpoint => self.otel_endpoint.clone(),
             ConfigField::IpAllowlist => self.ip_allowlist.clone(),
             ConfigField::IpDenylist => self.ip_denylist.clone(),
@@ -939,6 +983,23 @@ impl ServerPanelState {
             ConfigField::LoraPaths => {
                 self.lora_paths = value.to_string();
             }
+            ConfigField::DraftModel => {
+                self.draft_model = value.to_string();
+            }
+            ConfigField::DraftMaxTokens => {
+                let n = value.parse::<u32>().map_err(|_| "Must be 1-256")?;
+                if !(1..=256).contains(&n) {
+                    return Err("Must be 1-256".to_string());
+                }
+                self.draft_max_tokens = n;
+            }
+            ConfigField::DraftMinCtx => {
+                let n = value.parse::<u32>().map_err(|_| "Must be 64-65536")?;
+                if !(64..=65536).contains(&n) {
+                    return Err("Must be 64-65536".to_string());
+                }
+                self.draft_min_ctx = n;
+            }
             ConfigField::VectorStoreMaxDocs => {
                 self.vs_max_documents = value
                     .parse::<usize>()
@@ -983,6 +1044,9 @@ impl ServerPanelState {
             ConfigField::MetricsEnabled => self.metrics_enabled = !self.metrics_enabled,
             ConfigField::CompressionEnabled => {
                 self.compression_enabled = !self.compression_enabled;
+            }
+            ConfigField::QueueVisibility => {
+                self.queue_visibility = !self.queue_visibility;
             }
             ConfigField::FlashAttention => self.flash_attention = !self.flash_attention,
             ConfigField::Reasoning => self.reasoning_enabled = !self.reasoning_enabled,
@@ -1142,6 +1206,13 @@ impl ServerPanelState {
                     .collect()
             },
             parallel_slots: self.parallel_slots,
+            draft_model_path: if self.draft_model.is_empty() {
+                None
+            } else {
+                Some(self.draft_model.clone())
+            },
+            draft_max_tokens: self.draft_max_tokens,
+            draft_min_ctx: self.draft_min_ctx,
         }
     }
 
@@ -1161,6 +1232,7 @@ impl ServerPanelState {
         config.server.cors_enabled = self.cors_enabled;
         config.server.enable_metrics = self.metrics_enabled;
         config.server.enable_compression = self.compression_enabled;
+        config.server.queue_visibility = self.queue_visibility;
         config.inference.default_backend = self.backend;
         config.inference.default_gpu_layers = self.gpu_layers;
         config.inference.gpu_runtime = self.gpu_runtime;
@@ -1187,6 +1259,13 @@ impl ServerPanelState {
                 .collect()
         };
         config.inference.parallel_slots = self.parallel_slots;
+        config.inference.draft_model = if self.draft_model.is_empty() {
+            None
+        } else {
+            Some(self.draft_model.clone())
+        };
+        config.inference.draft_max_tokens = self.draft_max_tokens;
+        config.inference.draft_min_ctx = self.draft_min_ctx;
         config.server.vector_store.enabled = self.vs_enabled;
         config.server.vector_store.max_documents = self.vs_max_documents;
         config.server.vector_store.default_top_k = self.vs_top_k;

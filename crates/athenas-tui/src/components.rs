@@ -830,7 +830,7 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
             ));
             lines.push(Line::from(""));
             lines.push(Line::styled(
-                " Enter to search | G: toggle GGUF filter | Ctrl+U: clear",
+                " Enter to search | Ctrl+G: toggle GGUF filter | Ctrl+U: clear",
                 Style::default().fg(Color::DarkGray),
             ));
         }
