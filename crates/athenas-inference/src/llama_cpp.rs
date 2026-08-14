@@ -503,6 +503,19 @@ impl LlamaCppBackend {
                             }
                             // Check if libvulkan is missing (Vulkan binary needs it)
                             if full_log.contains("libvulkan.so") || full_log.contains("libvulkan") {
+                                info!("libvulkan missing, attempting auto-install...");
+                                let installed =
+                                    crate::backend_setup::try_install_vulkan_libs_pub().await;
+                                if installed {
+                                    info!(
+                                        "Vulkan libraries installed successfully, retrying server start..."
+                                    );
+                                    if let Some(ref mut child) = self.server_handle {
+                                        let _ = child.kill().await;
+                                    }
+                                    self.server_handle = None;
+                                    return self.retry_start_server(config).await;
+                                }
                                 msg.push_str(
                                     "\n\nHint: Vulkan library missing. The GPU-accelerated \
                                      binary needs Vulkan libraries.\n\

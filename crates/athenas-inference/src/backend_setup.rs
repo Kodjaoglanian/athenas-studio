@@ -10,13 +10,18 @@ const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 /// This function checks for GPU availability and selects the correct
 /// GPU-accelerated binary. If no GPU is detected, it falls back to CPU.
 ///
-/// Priority order:
-/// - NVIDIA GPU: CUDA (Windows) / Vulkan (Linux — no CUDA prebuilt for Linux)
-/// - AMD GPU: ROCm (if available) / Vulkan
-/// - Intel GPU: SYCL (Linux) / OpenVINO (Windows)
-/// - Apple Silicon: Metal (built into macOS binaries)
-/// - No GPU: CPU-only binary
-fn platform_asset_name() -> Option<String> {
+/// Priority order on Linux:
+/// - Vulkan (works with NVIDIA, AMD, and Intel GPUs/APUs)
+/// - ROCm (only for dedicated AMD Radeon RX/Pro/Instinct GPUs — APUs
+///   like Radeon 780M/890M have rocm-smi but don't support ROCm compute)
+/// - CPU-only fallback
+///
+/// Priority order on Windows:
+/// - NVIDIA: CUDA
+/// - AMD: HIP
+/// - Vulkan fallback
+/// - CPU-only
+async fn platform_asset_name() -> Option<String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
@@ -30,7 +35,7 @@ fn platform_asset_name() -> Option<String> {
         ("linux", "x86_64") => {
             // On Linux, always prefer Vulkan because:
             // 1. There is no CUDA prebuilt for Linux from llama.cpp
-            // 2. Many AMD APUs (Barcelo, Renoir, etc.) have rocm-smi
+            // 2. Many AMD APUs (Renoir, Strix, etc.) have rocm-smi
             //    installed but don't actually support ROCm compute
             // 3. Vulkan works with NVIDIA, AMD, and Intel GPUs
             if has_vulkan {
@@ -43,10 +48,35 @@ fn platform_asset_name() -> Option<String> {
                 }
                 return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
             }
-            // No Vulkan — try ROCm as fallback (AMD only)
-            if has_amd && detect_rocm() {
-                info!("AMD GPU detected with ROCm (no Vulkan), using ROCm binary");
+            // No Vulkan libs installed. Check if we have an AMD GPU that
+            // could benefit from Vulkan — if so, try to auto-install the
+            // Vulkan libraries before falling back.
+            if has_amd || has_nvidia {
+                warn!(
+                    "GPU detected but Vulkan libraries not found. \
+                     Attempting to install Vulkan libraries..."
+                );
+                if try_install_vulkan_libs_pub().await {
+                    info!("Vulkan libraries installed successfully, using Vulkan binary");
+                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+                }
+                warn!(
+                    "Failed to auto-install Vulkan libraries. \
+                     Please install manually: apt install -y libvulkan1 mesa-vulkan-drivers"
+                );
+            }
+            // No Vulkan — try ROCm only for dedicated AMD GPUs (not APUs)
+            if has_amd && detect_rocm() && !is_amd_apu() {
+                info!("Dedicated AMD GPU detected with ROCm (no Vulkan), using ROCm binary");
                 return Some("bin-ubuntu-rocm-7.2-x64.tar.gz".to_string());
+            }
+            if has_amd && detect_rocm() && is_amd_apu() {
+                warn!(
+                    "AMD APU detected with rocm-smi, but ROCm compute is not supported \
+                     on integrated GPUs. Falling back to CPU. \
+                     Install Vulkan libraries for GPU acceleration: \
+                     apt install -y libvulkan1 mesa-vulkan-drivers"
+                );
             }
             // No Vulkan, no ROCm — try CUDA (custom build)
             if has_nvidia {
@@ -111,6 +141,90 @@ fn detect_amd() -> bool {
         .unwrap_or(false)
 }
 
+/// Check if the AMD GPU is an APU (integrated) rather than a dedicated GPU.
+///
+/// APUs have rocm-smi installed but don't support ROCm compute. They use
+/// shared system memory instead of dedicated VRAM. We detect this by:
+/// 1. Checking the GPU name for APU indicators (Radeon Vega, 780M, 890M, etc.)
+/// 2. Checking if VRAM is 0 or very low (APUs report 0 VRAM via rocm-smi)
+fn is_amd_apu() -> bool {
+    // Method 1: check GPU name from rocm-smi
+    if let Ok(output) = std::process::Command::new("rocm-smi")
+        .args(["--showproductname", "--json"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                if let Some(obj) = json.as_object() {
+                    for (_key, value) in obj {
+                        let name = value
+                            .get("Card series")
+                            .or_else(|| value.get("Card model"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let name_lower = name.to_lowercase();
+
+                        // APU indicators — integrated Radeon graphics
+                        let apu_indicators = [
+                            "radeon graphics", // Generic AMD APU
+                            "radeon 680m",     // Phoenix/Raphael
+                            "radeon 780m",     // Phoenix
+                            "radeon 880m",     // Strix
+                            "radeon 890m",     // Strix Halo
+                            "radeon vega",     // Renoir/Cezanne/Barcelo
+                            "vega graphics",
+                            "radeon(tm) graphics",
+                            "strix",     // Strix APU codename
+                            "phoenix",   // Phoenix APU codename
+                            "renoir",    // Renoir APU codename
+                            "cezanne",   // Cezanne APU codename
+                            "barcelo",   // Barcelo APU codename
+                            "raphael",   // Raphael APU codename
+                            "rembrandt", // Rembrandt APU codename
+                            "mendocino", // Mendocino APU codename
+                            "dragon",    // Dragon Range APU codename
+                            "phoenix range",
+                        ];
+
+                        if apu_indicators.iter().any(|ind| name_lower.contains(ind)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Method 2: check VRAM — APUs report 0 or shared VRAM via rocm-smi
+    if let Ok(output) = std::process::Command::new("rocm-smi")
+        .args(["--showmeminfo", "vram", "--json"])
+        .output()
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                if let Some(obj) = json.as_object() {
+                    for (_key, value) in obj {
+                        let vram_total = value
+                            .get("VRAM Total Memory (B)")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        // Dedicated GPUs have at least 1 GB VRAM
+                        // APUs report 0 or very small amounts
+                        if vram_total < 1024 * 1024 * 1024 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Check if ROCm is installed (rocm-smi works).
 fn detect_rocm() -> bool {
     std::process::Command::new("rocm-smi")
@@ -118,6 +232,116 @@ fn detect_rocm() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Try to install Vulkan libraries on Linux (libvulkan1, mesa-vulkan-drivers).
+/// This enables GPU acceleration on systems with AMD/NVIDIA GPUs but missing
+/// Vulkan loader libraries.
+pub async fn try_install_vulkan_libs_pub() -> bool {
+    try_install_vulkan_libs_inner().await
+}
+
+async fn try_install_vulkan_libs_inner() -> bool {
+    // Detect package manager and install Vulkan libraries
+    let managers: [(&str, &[&str]); 5] = [
+        (
+            "apt-get",
+            &[
+                "apt-get",
+                "install",
+                "-y",
+                "libvulkan1",
+                "mesa-vulkan-drivers",
+            ],
+        ),
+        (
+            "dnf",
+            &[
+                "dnf",
+                "install",
+                "-y",
+                "vulkan-loader",
+                "mesa-vulkan-drivers",
+            ],
+        ),
+        (
+            "yum",
+            &[
+                "yum",
+                "install",
+                "-y",
+                "vulkan-loader",
+                "mesa-vulkan-drivers",
+            ],
+        ),
+        (
+            "pacman",
+            &[
+                "pacman",
+                "-S",
+                "--noconfirm",
+                "vulkan-icd-loader",
+                "vulkan-mesa-layers",
+            ],
+        ),
+        (
+            "apk",
+            &["apk", "add", "vulkan-loader", "mesa-vulkan-drivers"],
+        ),
+    ];
+
+    for (name, args) in &managers {
+        // Check if the package manager exists
+        let check = tokio::process::Command::new("which")
+            .arg(name)
+            .output()
+            .await;
+
+        if let Ok(check_output) = check {
+            if !check_output.status.success() {
+                continue;
+            }
+
+            info!("Installing Vulkan libraries via {}...", name);
+            // For apt-get, run update first
+            if *name == "apt-get" {
+                let _ = tokio::process::Command::new("apt-get")
+                    .arg("update")
+                    .arg("-qq")
+                    .output()
+                    .await;
+            }
+
+            let result = tokio::process::Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .await;
+
+            return match result {
+                Ok(output) => {
+                    if output.status.success() {
+                        info!("Vulkan libraries installed successfully via {}", name);
+                        // Verify libvulkan.so is now available
+                        detect_vulkan_support()
+                    } else {
+                        warn!(
+                            "Failed to install Vulkan libraries via {}: {}",
+                            name,
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        false
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to run {}: {}", name, e);
+                    false
+                }
+            };
+        }
+    }
+
+    warn!("No supported package manager found to install Vulkan libraries");
+    false
 }
 
 /// Check if Vulkan is available by running vulkaninfo or checking for
@@ -438,7 +662,7 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
     let variant_marker = bin_dir.join(".llama-server-variant");
 
     // Determine the desired asset (GPU-aware)
-    let desired_asset_suffix = platform_asset_name().ok_or_else(|| {
+    let desired_asset_suffix = platform_asset_name().await.ok_or_else(|| {
         AthenasError::Backend(format!(
             "No prebuilt llama-server available for {} {}. Please install llama.cpp manually.",
             std::env::consts::OS,
@@ -622,6 +846,45 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
                              This usually means missing shared libraries.\n\
                              Try: ldd {}\n\
                              On Ubuntu/Debian: apt install -y libgomp1",
+                            output.status.code(),
+                            stdout,
+                            stderr,
+                            extracted_path.display()
+                        )));
+                    }
+                } else if stderr.contains("libvulkan") {
+                    info!("libvulkan missing during verification, attempting auto-install...");
+                    if try_install_vulkan_libs_pub().await {
+                        info!("Vulkan libraries installed, re-verifying llama-server...");
+                        let reverify = verify_cmd.output().await;
+                        if let Ok(rv) = reverify {
+                            if rv.status.success() {
+                                info!("llama-server verified successfully after Vulkan install");
+                                // Success — continue to variant marker
+                            } else {
+                                let rv_stderr = String::from_utf8_lossy(&rv.stderr);
+                                return Err(AthenasError::Backend(format!(
+                                    "llama-server still fails after Vulkan install (exit code: {:?}).\n\
+                                     stderr: {}\n\
+                                     Try: ldd {}",
+                                    rv.status.code(),
+                                    rv_stderr,
+                                    extracted_path.display()
+                                )));
+                            }
+                        } else {
+                            return Err(AthenasError::Backend(
+                                "Cannot re-execute llama-server after Vulkan install".into(),
+                            ));
+                        }
+                    } else {
+                        return Err(AthenasError::Backend(format!(
+                            "Downloaded llama-server failed to run (exit code: {:?}).\n\
+                             stdout: {}\n\
+                             stderr: {}\n\
+                             Vulkan libraries are missing and could not be auto-installed.\n\
+                             Try: ldd {}\n\
+                             On Ubuntu/Debian: apt install -y libvulkan1 mesa-vulkan-drivers",
                             output.status.code(),
                             stdout,
                             stderr,
