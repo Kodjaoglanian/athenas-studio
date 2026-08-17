@@ -1804,7 +1804,24 @@ impl TuiApp {
         if self.server_panel_state.auto_resource_limits {
             if let Some(est) = self.server_panel_state.estimate_selected_model_load() {
                 if !est.fits {
-                    let (need, avail) = if est.full_gpu_offload {
+                    // For APUs with full GPU offload, the bottleneck is system
+                    // RAM (unified memory), not dedicated VRAM
+                    let (need, avail) = if est.full_gpu_offload
+                        && est.vram_free_mb.unwrap_or(0) < est.vram_mb.unwrap_or(0)
+                    {
+                        // Show the larger of the two needs (vram vs ram)
+                        // and the relevant available memory
+                        let vram_need = est.vram_mb.unwrap_or(0);
+                        let ram_need = est.ram_mb;
+                        if vram_need > ram_need {
+                            (
+                                vram_need,
+                                est.ram_available_mb.max(est.vram_free_mb.unwrap_or(0)),
+                            )
+                        } else {
+                            (ram_need, est.ram_available_mb)
+                        }
+                    } else if est.full_gpu_offload {
                         (est.vram_mb.unwrap_or(0), est.vram_free_mb.unwrap_or(0))
                     } else {
                         (est.ram_mb, est.ram_available_mb)

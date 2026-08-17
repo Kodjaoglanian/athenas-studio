@@ -212,39 +212,15 @@ fn detect_amd() -> bool {
 ///
 /// APUs don't support ROCm/HIP compute. They use shared system memory
 /// instead of dedicated VRAM. We detect this by:
-/// 1. Checking the GPU name for APU indicators (Radeon Vega, 780M, 890M, etc.)
+/// 1. Checking the GPU name for APU indicators (via athenas_core::is_apu_name)
 /// 2. Checking if VRAM is 0 or very low (APUs report 0 or shared VRAM)
 fn is_amd_apu() -> bool {
-    // APU name indicators — integrated Radeon graphics
-    const APU_INDICATORS: &[&str] = &[
-        "radeon graphics", // Generic AMD APU
-        "radeon 680m",     // Phoenix/Raphael
-        "radeon 780m",     // Phoenix
-        "radeon 880m",     // Strix
-        "radeon 890m",     // Strix Halo
-        "radeon vega",     // Renoir/Cezanne/Barcelo
-        "vega graphics",
-        "radeon(tm) graphics",
-        "strix",     // Strix APU codename
-        "phoenix",   // Phoenix APU codename
-        "renoir",    // Renoir APU codename
-        "cezanne",   // Cezanne APU codename
-        "barcelo",   // Barcelo APU codename
-        "raphael",   // Raphael APU codename
-        "rembrandt", // Rembrandt APU codename
-        "mendocino", // Mendocino APU codename
-        "dragon",    // Dragon Range APU codename
-        "phoenix range",
-    ];
-
     // Get GPU names and VRAM info using platform-appropriate method
     let gpu_infos = get_amd_gpu_infos();
 
     for (name, vram_total_mb) in gpu_infos {
-        let name_lower = name.to_lowercase();
-
         // Method 1: check GPU name for APU indicators
-        if APU_INDICATORS.iter().any(|ind| name_lower.contains(ind)) {
+        if athenas_core::is_apu_name(&name) {
             return true;
         }
 

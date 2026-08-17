@@ -25,6 +25,12 @@ pub struct GpuInfo {
     pub vram_used_mb: u64,
     pub driver_version: String,
     pub compute_capability: Option<String>,
+    /// True if this is an APU (integrated GPU with unified memory).
+    /// APUs share system RAM instead of having dedicated VRAM, so the
+    /// VRAM reported by the driver is typically very small (0-512 MB)
+    /// while the actual available memory is the system RAM.
+    #[serde(default)]
+    pub is_apu: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +92,39 @@ pub fn detect_memory_mb() -> (u64, u64) {
 /// that scales with the configured context size.
 pub fn estimate_model_ram_mb(model_size_mb: u64, context_size: u32) -> u64 {
     model_size_mb + (context_size as u64 / 1024) * 64
+}
+
+/// Check if a GPU name indicates an APU (integrated GPU with unified memory).
+/// APUs share system RAM instead of having dedicated VRAM.
+pub fn is_apu_name(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    const APU_INDICATORS: &[&str] = &[
+        "radeon graphics", // Generic AMD APU
+        "radeon 680m",     // Phoenix/Raphael
+        "radeon 780m",     // Phoenix
+        "radeon 880m",     // Strix
+        "radeon 890m",     // Strix Halo
+        "radeon vega",     // Renoir/Cezanne/Barcelo
+        "vega graphics",
+        "radeon(tm) graphics",
+        "strix",     // Strix APU codename
+        "phoenix",   // Phoenix APU codename
+        "renoir",    // Renoir APU codename
+        "cezanne",   // Cezanne APU codename
+        "barcelo",   // Barcelo APU codename
+        "raphael",   // Raphael APU codename
+        "rembrandt", // Rembrandt APU codename
+        "mendocino", // Mendocino APU codename
+        "dragon",    // Dragon Range APU codename
+        "phoenix range",
+        "intel(r) iris(r) xe",   // Intel Iris Xe integrated
+        "intel(r) uhd graphics", // Intel UHD integrated
+        "intel(r) hd graphics",  // Intel HD integrated
+        "mali",                  // ARM Mali integrated
+        "adreno",                // Qualcomm Adreno integrated
+        "apple m",               // Apple Silicon (unified memory)
+    ];
+    APU_INDICATORS.iter().any(|ind| name_lower.contains(ind))
 }
 
 impl std::fmt::Display for HardwareInfo {
@@ -180,7 +219,15 @@ impl HardwareDetector {
             return 0;
         }
 
-        let total_vram_mb: u64 = hw.gpus.iter().map(|g| g.vram_total_mb).sum();
+        // For APUs (integrated GPUs with unified memory), use system RAM
+        // instead of the tiny dedicated VRAM reported by the driver.
+        let has_apu = hw.gpus.iter().any(|g| g.is_apu);
+        let total_vram_mb: u64 = if has_apu {
+            // APU uses unified memory — use available system RAM
+            hw.memory_available_mb
+        } else {
+            hw.gpus.iter().map(|g| g.vram_total_mb).sum()
+        };
         let total_vram_gb = total_vram_mb as f64 / 1024.0;
         let available_vram_gb = total_vram_gb * 0.85; // Leave 15% headroom
 
@@ -282,6 +329,7 @@ fn detect_nvidia_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
                 vram_used_mb: parts[3].parse().unwrap_or(0),
                 driver_version: parts[4].to_string(),
                 compute_capability: Some(parts[5].to_string()),
+                is_apu: is_apu_name(parts[1]),
             });
         }
     }
@@ -349,12 +397,13 @@ fn detect_amd_gpus_linux() -> std::result::Result<Vec<GpuInfo>, ()> {
 
                 gpus.push(GpuInfo {
                     index,
-                    name,
+                    name: name.clone(),
                     vendor: GpuVendor::Amd,
                     vram_total_mb,
                     vram_used_mb,
                     driver_version: "ROCm".to_string(),
                     compute_capability: None,
+                    is_apu: is_apu_name(&name) || vram_total_mb < 1024,
                 });
             }
         }
@@ -420,12 +469,13 @@ fn detect_amd_gpus_windows() -> std::result::Result<Vec<GpuInfo>, ()> {
 
             gpus.push(GpuInfo {
                 index,
-                name,
+                name: name.clone(),
                 vendor: GpuVendor::Amd,
                 vram_total_mb,
                 vram_used_mb: 0,
                 driver_version,
                 compute_capability: None,
+                is_apu: is_apu_name(&name) || vram_total_mb < 1024,
             });
             index += 1;
         }

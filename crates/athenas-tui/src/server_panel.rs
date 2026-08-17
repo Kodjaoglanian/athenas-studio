@@ -1105,6 +1105,12 @@ impl ServerPanelState {
         } else {
             None
         };
+
+        // For APUs (integrated GPUs with unified memory), the "VRAM" reported
+        // by the driver is just a small dedicated portion (e.g. 512 MB).
+        // The GPU actually uses system RAM, so we should check against
+        // system RAM available, not the tiny dedicated VRAM.
+        let is_apu = target_gpu.map(|g| g.is_apu).unwrap_or(false);
         let vram_free_mb = target_gpu.map(|g| g.vram_total_mb.saturating_sub(g.vram_used_mb));
 
         let (ram_mb, vram_mb) = if full_gpu_offload {
@@ -1120,9 +1126,17 @@ impl ServerPanelState {
 
         // Unknown available memory (detection failed) → don't claim it won't fit
         let fits_ram = ram_available_mb == 0 || ram_mb <= ram_available_mb;
-        let fits_vram = match (vram_mb, vram_free_mb) {
-            (Some(need), Some(free)) if free > 0 => need <= free,
-            _ => true,
+        // For APUs, check against system RAM instead of dedicated VRAM,
+        // since the GPU uses unified memory (shared system RAM).
+        let fits_vram = if is_apu {
+            // APU uses system RAM — check if the total (RAM + VRAM portion)
+            // fits in available system memory
+            ram_available_mb == 0 || vram_mb.unwrap_or(0) <= ram_available_mb
+        } else {
+            match (vram_mb, vram_free_mb) {
+                (Some(need), Some(free)) if free > 0 => need <= free,
+                _ => true,
+            }
         };
         let fits = fits_ram && fits_vram;
         let tight = fits && ram_available_mb > 0 && ram_mb * 10 >= ram_available_mb * 9;
@@ -1522,6 +1536,7 @@ mod tests {
             vram_used_mb: 0,
             driver_version: "test".to_string(),
             compute_capability: None,
+            is_apu: false,
         });
         state.models = vec![test_model(4096)];
         state.model_selected = 0;
