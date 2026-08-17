@@ -103,9 +103,24 @@ async fn platform_asset_name() -> Option<String> {
                 info!("NVIDIA GPU detected, using CUDA 12.4 binary for GPU acceleration");
                 return Some("bin-win-cuda-12.4-x64.zip".to_string());
             }
-            if has_amd {
-                info!("AMD GPU detected, using HIP binary for GPU acceleration");
+            if has_amd && !is_amd_apu() {
+                // Dedicated AMD GPU — use HIP binary
+                info!("Dedicated AMD GPU detected, using HIP binary for GPU acceleration");
                 return Some("bin-win-hip-radeon-x64.zip".to_string());
+            }
+            if has_amd && is_amd_apu() && has_vulkan {
+                // AMD APU (integrated) — HIP doesn't work, use Vulkan
+                info!("AMD APU detected, using Vulkan binary for GPU acceleration");
+                return Some("bin-win-vulkan-x64.zip".to_string());
+            }
+            if has_amd && is_amd_apu() && !has_vulkan {
+                // AMD APU without Vulkan — fall back to CPU
+                warn!(
+                    "AMD APU detected but no Vulkan support. \
+                     HIP/ROCm is not supported on integrated GPUs. \
+                     Falling back to CPU. Install Vulkan drivers for GPU acceleration."
+                );
+                return Some("bin-win-cpu-x64.zip".to_string());
             }
             if has_vulkan {
                 info!("Vulkan support detected, using Vulkan binary for GPU acceleration");
@@ -122,35 +137,147 @@ async fn platform_asset_name() -> Option<String> {
     }
 }
 
-/// Check if an NVIDIA GPU is present by running nvidia-smi.
+/// Check if an NVIDIA GPU is present.
+/// Uses nvidia-smi (works on both Linux and Windows when driver is installed).
+/// Falls back to WMIC on Windows if nvidia-smi is not in PATH.
 fn detect_nvidia() -> bool {
-    std::process::Command::new("nvidia-smi")
+    if std::process::Command::new("nvidia-smi")
         .arg("--query-gpu=name")
         .arg("--format=csv,noheader")
         .output()
         .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
+    {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Fallback: check via WMIC for NVIDIA display adapters
+        std::process::Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name"])
+            .output()
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let stdout = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                stdout.contains("nvidia") || stdout.contains("geforce") || stdout.contains("quadro")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
 }
 
-/// Check if an AMD GPU is present by running rocm-smi.
+/// Check if an AMD GPU is present.
+/// On Linux: uses rocm-smi.
+/// On Windows: uses WMIC to query display adapters.
 fn detect_amd() -> bool {
-    std::process::Command::new("rocm-smi")
-        .arg("--showproductname")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("rocm-smi")
+            .arg("--showproductname")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Use WMIC to check for AMD display adapters
+        std::process::Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name"])
+            .output()
+            .map(|o| {
+                if !o.status.success() {
+                    return false;
+                }
+                let stdout = String::from_utf8_lossy(&o.stdout).to_lowercase();
+                stdout.contains("amd") || stdout.contains("radeon")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        false
+    }
 }
 
 /// Check if the AMD GPU is an APU (integrated) rather than a dedicated GPU.
 ///
-/// APUs have rocm-smi installed but don't support ROCm compute. They use
-/// shared system memory instead of dedicated VRAM. We detect this by:
+/// APUs don't support ROCm/HIP compute. They use shared system memory
+/// instead of dedicated VRAM. We detect this by:
 /// 1. Checking the GPU name for APU indicators (Radeon Vega, 780M, 890M, etc.)
-/// 2. Checking if VRAM is 0 or very low (APUs report 0 VRAM via rocm-smi)
+/// 2. Checking if VRAM is 0 or very low (APUs report 0 or shared VRAM)
 fn is_amd_apu() -> bool {
-    // Method 1: check GPU name from rocm-smi
+    // APU name indicators — integrated Radeon graphics
+    const APU_INDICATORS: &[&str] = &[
+        "radeon graphics", // Generic AMD APU
+        "radeon 680m",     // Phoenix/Raphael
+        "radeon 780m",     // Phoenix
+        "radeon 880m",     // Strix
+        "radeon 890m",     // Strix Halo
+        "radeon vega",     // Renoir/Cezanne/Barcelo
+        "vega graphics",
+        "radeon(tm) graphics",
+        "strix",     // Strix APU codename
+        "phoenix",   // Phoenix APU codename
+        "renoir",    // Renoir APU codename
+        "cezanne",   // Cezanne APU codename
+        "barcelo",   // Barcelo APU codename
+        "raphael",   // Raphael APU codename
+        "rembrandt", // Rembrandt APU codename
+        "mendocino", // Mendocino APU codename
+        "dragon",    // Dragon Range APU codename
+        "phoenix range",
+    ];
+
+    // Get GPU names and VRAM info using platform-appropriate method
+    let gpu_infos = get_amd_gpu_infos();
+
+    for (name, vram_total_mb) in gpu_infos {
+        let name_lower = name.to_lowercase();
+
+        // Method 1: check GPU name for APU indicators
+        if APU_INDICATORS.iter().any(|ind| name_lower.contains(ind)) {
+            return true;
+        }
+
+        // Method 2: check VRAM — dedicated GPUs have at least 1 GB VRAM
+        // APUs report 0 or very small amounts
+        if vram_total_mb < 1024 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Get AMD GPU information (name, VRAM in MB) using platform-appropriate tools.
+/// Returns a list of (gpu_name, vram_total_mb) tuples.
+fn get_amd_gpu_infos() -> Vec<(String, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        get_amd_gpu_infos_linux()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        get_amd_gpu_infos_windows()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_amd_gpu_infos_linux() -> Vec<(String, u64)> {
+    let mut result = Vec::new();
+
+    // Get GPU names from rocm-smi
     if let Ok(output) = std::process::Command::new("rocm-smi")
-        .args(["--showproductname", "--json"])
+        .args(["--showproductname", "--showmeminfo", "vram", "--json"])
         .output()
     {
         if output.status.success() {
@@ -162,67 +289,74 @@ fn is_amd_apu() -> bool {
                             .get("Card series")
                             .or_else(|| value.get("Card model"))
                             .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let name_lower = name.to_lowercase();
-
-                        // APU indicators — integrated Radeon graphics
-                        let apu_indicators = [
-                            "radeon graphics", // Generic AMD APU
-                            "radeon 680m",     // Phoenix/Raphael
-                            "radeon 780m",     // Phoenix
-                            "radeon 880m",     // Strix
-                            "radeon 890m",     // Strix Halo
-                            "radeon vega",     // Renoir/Cezanne/Barcelo
-                            "vega graphics",
-                            "radeon(tm) graphics",
-                            "strix",     // Strix APU codename
-                            "phoenix",   // Phoenix APU codename
-                            "renoir",    // Renoir APU codename
-                            "cezanne",   // Cezanne APU codename
-                            "barcelo",   // Barcelo APU codename
-                            "raphael",   // Raphael APU codename
-                            "rembrandt", // Rembrandt APU codename
-                            "mendocino", // Mendocino APU codename
-                            "dragon",    // Dragon Range APU codename
-                            "phoenix range",
-                        ];
-
-                        if apu_indicators.iter().any(|ind| name_lower.contains(ind)) {
-                            return true;
-                        }
+                            .unwrap_or("")
+                            .to_string();
+                        let vram_total_mb = value
+                            .get("VRAM Total Memory (B)")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(|b| b / (1024 * 1024))
+                            .unwrap_or(0);
+                        result.push((name, vram_total_mb));
                     }
                 }
             }
         }
     }
 
-    // Method 2: check VRAM — APUs report 0 or shared VRAM via rocm-smi
-    if let Ok(output) = std::process::Command::new("rocm-smi")
-        .args(["--showmeminfo", "vram", "--json"])
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn get_amd_gpu_infos_windows() -> Vec<(String, u64)> {
+    let mut result = Vec::new();
+
+    // Use PowerShell to get GPU name and VRAM via CIM/WMI
+    // This works on all modern Windows versions
+    let ps_script =
+        "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM | ConvertTo-Json";
+
+    if let Ok(output) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps_script])
         .output()
     {
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                if let Some(obj) = json.as_object() {
-                    for (_key, value) in obj {
-                        let vram_total = value
-                            .get("VRAM Total Memory (B)")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        // Dedicated GPUs have at least 1 GB VRAM
-                        // APUs report 0 or very small amounts
-                        if vram_total < 1024 * 1024 * 1024 {
-                            return true;
-                        }
-                    }
+                // Can be a single object or an array
+                let gpus = if let Some(arr) = json.as_array() {
+                    arr.clone()
+                } else {
+                    vec![json]
+                };
+
+                for gpu in gpus {
+                    let name = gpu
+                        .get("Name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // AdapterRAM is u32 and wraps for >4GB, but for APU
+                    // detection it's usually 0 or small anyway
+                    let vram_total_mb = gpu
+                        .get("AdapterRAM")
+                        .and_then(|v| v.as_u64())
+                        .map(|b| b / (1024 * 1024))
+                        .unwrap_or(0);
+                    result.push((name, vram_total_mb));
                 }
             }
         }
     }
 
-    false
+    // Filter to only AMD/Radeon GPUs
+    result
+        .into_iter()
+        .filter(|(name, _)| {
+            let lower = name.to_lowercase();
+            lower.contains("amd") || lower.contains("radeon")
+        })
+        .collect()
 }
 
 /// Check if ROCm is installed (rocm-smi works).
@@ -344,8 +478,9 @@ async fn try_install_vulkan_libs_inner() -> bool {
     false
 }
 
-/// Check if Vulkan is available by running vulkaninfo or checking for
-/// libvulkan.so on Linux.
+/// Check if Vulkan is available.
+/// On Linux: checks for vulkaninfo, libvulkan.so, or NVIDIA driver.
+/// On Windows: checks for vulkaninfo or vulkan-1.dll in System32.
 fn detect_vulkan_support() -> bool {
     if cfg!(target_os = "linux") {
         // Method 1: try vulkaninfo
@@ -383,11 +518,40 @@ fn detect_vulkan_support() -> bool {
         }
         false
     } else if cfg!(target_os = "windows") {
-        std::process::Command::new("vulkaninfo")
+        // Method 1: try vulkaninfo (comes with Vulkan SDK)
+        if std::process::Command::new("vulkaninfo")
             .arg("--summary")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+        {
+            return true;
+        }
+        // Method 2: check for vulkan-1.dll in System32/SysWOW64
+        // The Vulkan loader DLL is installed by GPU drivers (AMD, NVIDIA, Intel)
+        let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let dll_paths = [
+            format!("{}\\System32\\vulkan-1.dll", win_dir),
+            format!("{}\\SysWOW64\\vulkan-1.dll", win_dir),
+        ];
+        for path in &dll_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        // Method 3: check for GPU-specific Vulkan ICD drivers
+        let icd_paths = [
+            format!("{}\\System32\\vulkan_radeon.dll", win_dir), // AMD
+            format!("{}\\System32\\vulkan_intel.dll", win_dir),  // Intel
+            format!("{}\\System32\\nvoglv64.dll", win_dir),      // NVIDIA
+            format!("{}\\System32\\nvcuda.dll", win_dir),        // NVIDIA CUDA
+        ];
+        for path in &icd_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        false
     } else {
         false
     }

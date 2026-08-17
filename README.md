@@ -399,7 +399,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.7.38"
+version = "0.7.39"
 
 [paths]
 models_dir = "~/.athenas/models"

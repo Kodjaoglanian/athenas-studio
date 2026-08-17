@@ -1886,7 +1886,14 @@ impl TuiApp {
                 self.server_state = Some(state);
 
                 // Spawn a background task to poll the health endpoint
-                let health_host = host.clone();
+                // Use 127.0.0.1 for the health check even if the server
+                // binds to 0.0.0.0 — on Windows, connecting to 0.0.0.0
+                // doesn't work like it does on Linux.
+                let health_host = if host == "0.0.0.0" || host == "::" {
+                    "127.0.0.1".to_string()
+                } else {
+                    host.clone()
+                };
                 let health_port = port;
                 let health_state = self.server_state.clone();
                 let health_task = tokio::spawn(async move {
@@ -1924,6 +1931,21 @@ impl TuiApp {
                 self.server_panel_state
                     .set_error(format!("Failed to start server: {}", e));
             }
+        }
+    }
+
+    /// Get the connectable host for the server.
+    /// If the server binds to 0.0.0.0 or ::, use 127.0.0.1 for local
+    /// connections — on Windows, connecting to 0.0.0.0 doesn't work.
+    fn connect_host(&self) -> String {
+        if let Some(ref state) = self.server_state {
+            if state.host == "0.0.0.0" || state.host == "::" {
+                "127.0.0.1".to_string()
+            } else {
+                state.host.clone()
+            }
+        } else {
+            "127.0.0.1".to_string()
         }
     }
 
@@ -2151,7 +2173,7 @@ impl TuiApp {
 
         // If detached server, use HTTP API to load model
         if let Some(ref state) = self.server_state {
-            let host = state.host.clone();
+            let host = self.connect_host();
             let port = state.port;
             let api_key = if self.server_panel_state.api_key.is_empty() {
                 None
@@ -2342,7 +2364,7 @@ impl TuiApp {
 
         // Detached server: use HTTP API
         if let Some(ref state) = self.server_state {
-            let host = state.host.clone();
+            let host = self.connect_host();
             let port = state.port;
             let api_key = if self.server_panel_state.api_key.is_empty() {
                 None
@@ -2445,7 +2467,7 @@ impl TuiApp {
 
         // Detached server: use HTTP API
         if let Some(ref state) = self.server_state {
-            let host = state.host.clone();
+            let host = self.connect_host();
             let port = state.port;
             let api_key = if self.server_panel_state.api_key.is_empty() {
                 None
@@ -2523,7 +2545,7 @@ impl TuiApp {
         let Some(ref state) = self.server_state else {
             return;
         };
-        let host = state.host.clone();
+        let host = self.connect_host();
         let port = state.port;
         let api_key = if self.server_panel_state.api_key.is_empty() {
             None
@@ -2768,7 +2790,7 @@ impl TuiApp {
                 .set_error("Server not running".to_string());
             return;
         };
-        let host = state.host.clone();
+        let host = self.connect_host();
         let port = state.port;
         let admin_key = if self.server_panel_state.api_key.is_empty() {
             None
@@ -2840,7 +2862,7 @@ impl TuiApp {
                 .set_error("Server not running".to_string());
             return;
         };
-        let host = state.host.clone();
+        let host = self.connect_host();
         let port = state.port;
         let admin_key = if self.server_panel_state.api_key.is_empty() {
             None
@@ -2895,7 +2917,7 @@ impl TuiApp {
                 .set_error("Server not running".to_string());
             return;
         };
-        let host = state.host.clone();
+        let host = self.connect_host();
         let port = state.port;
         let admin_key = if self.server_panel_state.api_key.is_empty() {
             None
@@ -2949,7 +2971,7 @@ impl TuiApp {
                 .set_error("Server not running — start it first");
             return;
         };
-        let host = state.host.clone();
+        let host = self.connect_host();
         let port = state.port;
         let api_key = if self.server_panel_state.api_key.is_empty() {
             None
