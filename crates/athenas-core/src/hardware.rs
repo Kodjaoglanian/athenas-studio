@@ -290,6 +290,22 @@ fn detect_nvidia_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
 }
 
 fn detect_amd_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
+    #[cfg(target_os = "linux")]
+    {
+        detect_amd_gpus_linux()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        detect_amd_gpus_windows()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_amd_gpus_linux() -> std::result::Result<Vec<GpuInfo>, ()> {
     let output = Command::new("rocm-smi")
         .args(["--showproductname", "--showmeminfo", "vram", "--json"])
         .output()
@@ -347,6 +363,77 @@ fn detect_amd_gpus() -> std::result::Result<Vec<GpuInfo>, ()> {
     Ok(gpus)
 }
 
+#[cfg(target_os = "windows")]
+fn detect_amd_gpus_windows() -> std::result::Result<Vec<GpuInfo>, ()> {
+    // Use PowerShell Get-CimInstance (WMIC is deprecated on Windows 11)
+    let ps_script = "Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | ConvertTo-Json";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", ps_script])
+        .output()
+        .map_err(|_| ())?;
+
+    if !output.status.success() {
+        return Err(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut gpus = Vec::new();
+    let mut index = 0u32;
+
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+        let controllers = if let Some(arr) = json.as_array() {
+            arr.clone()
+        } else {
+            vec![json]
+        };
+
+        for controller in controllers {
+            let name = controller
+                .get("Name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let name_lower = name.to_lowercase();
+            if !name_lower.contains("amd") && !name_lower.contains("radeon") {
+                continue;
+            }
+
+            // AdapterRAM is u32 and wraps for >4GB GPUs, but it's
+            // sufficient for detection purposes
+            let vram_total_mb = controller
+                .get("AdapterRAM")
+                .and_then(|v| v.as_u64())
+                .map(|b| b / (1024 * 1024))
+                .unwrap_or(0);
+
+            let driver_version = controller
+                .get("DriverVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown")
+                .to_string();
+
+            gpus.push(GpuInfo {
+                index,
+                name,
+                vendor: GpuVendor::Amd,
+                vram_total_mb,
+                vram_used_mb: 0,
+                driver_version,
+                compute_capability: None,
+            });
+            index += 1;
+        }
+    }
+
+    Ok(gpus)
+}
+
 fn detect_vulkan() -> bool {
     if cfg!(target_os = "linux") {
         // Method 1: try vulkaninfo
@@ -379,11 +466,39 @@ fn detect_vulkan() -> bool {
         }
         false
     } else if cfg!(target_os = "windows") {
-        Command::new("vulkaninfo")
+        // Method 1: try vulkaninfo (comes with Vulkan SDK)
+        if Command::new("vulkaninfo")
             .arg("--summary")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+        {
+            return true;
+        }
+        // Method 2: check for vulkan-1.dll in System32/SysWOW64
+        // The Vulkan loader DLL is installed by GPU drivers (AMD, NVIDIA, Intel)
+        let win_dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let dll_paths = [
+            format!("{}\\System32\\vulkan-1.dll", win_dir),
+            format!("{}\\SysWOW64\\vulkan-1.dll", win_dir),
+        ];
+        for path in &dll_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        // Method 3: check for GPU-specific Vulkan ICD drivers
+        let icd_paths = [
+            format!("{}\\System32\\vulkan_radeon.dll", win_dir), // AMD
+            format!("{}\\System32\\vulkan_intel.dll", win_dir),  // Intel
+            format!("{}\\System32\\nvoglv64.dll", win_dir),      // NVIDIA
+        ];
+        for path in &icd_paths {
+            if std::path::Path::new(path).exists() {
+                return true;
+            }
+        }
+        false
     } else {
         false
     }

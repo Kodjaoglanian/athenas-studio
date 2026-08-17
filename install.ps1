@@ -36,6 +36,21 @@ if ($arch -eq "AMD64") {
 
 Write-Info "Detected target: $target"
 
+# Check if athenas or llama-server processes are running
+$runningProcesses = Get-Process -Name "athenas","llama-server" -ErrorAction SilentlyContinue
+if ($runningProcesses) {
+    Write-Host ""
+    Write-Warn "Athenas Studio or llama-server is currently running."
+    Write-Warn "The installation cannot proceed while these processes are active."
+    Write-Warn "Please stop the server and close Athenas Studio before updating."
+    Write-Host ""
+    Write-Host "  To stop the server from the TUI: press 's' in the Server tab" -ForegroundColor DarkCyan
+    Write-Host "  Or run: Stop-Process -Name athenas,llama-server -Force" -ForegroundColor DarkCyan
+    Write-Host ""
+    $runningProcesses | Format-Table Name, Id, CPU -AutoSize
+    Write-Err "Cannot update while processes are running. Stop them and try again."
+}
+
 # Fetch latest release
 try {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers @{ "User-Agent" = "athenas-installer" }

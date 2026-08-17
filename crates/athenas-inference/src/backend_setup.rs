@@ -139,7 +139,7 @@ async fn platform_asset_name() -> Option<String> {
 
 /// Check if an NVIDIA GPU is present.
 /// Uses nvidia-smi (works on both Linux and Windows when driver is installed).
-/// Falls back to WMIC on Windows if nvidia-smi is not in PATH.
+/// Falls back to PowerShell Get-CimInstance on Windows if nvidia-smi is not in PATH.
 fn detect_nvidia() -> bool {
     if std::process::Command::new("nvidia-smi")
         .arg("--query-gpu=name")
@@ -152,9 +152,11 @@ fn detect_nvidia() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Fallback: check via WMIC for NVIDIA display adapters
-        std::process::Command::new("wmic")
-            .args(["path", "win32_VideoController", "get", "name"])
+        // Fallback: check via PowerShell for NVIDIA display adapters
+        let ps_script =
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name";
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps_script])
             .output()
             .map(|o| {
                 if !o.status.success() {
@@ -173,7 +175,7 @@ fn detect_nvidia() -> bool {
 
 /// Check if an AMD GPU is present.
 /// On Linux: uses rocm-smi.
-/// On Windows: uses WMIC to query display adapters.
+/// On Windows: uses PowerShell Get-CimInstance (WMIC is deprecated on Win11).
 fn detect_amd() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -185,9 +187,11 @@ fn detect_amd() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Use WMIC to check for AMD display adapters
-        std::process::Command::new("wmic")
-            .args(["path", "win32_VideoController", "get", "name"])
+        // Use PowerShell to check for AMD/Radeon display adapters
+        let ps_script =
+            "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name";
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps_script])
             .output()
             .map(|o| {
                 if !o.status.success() {
