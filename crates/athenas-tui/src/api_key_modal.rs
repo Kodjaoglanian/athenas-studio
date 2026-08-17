@@ -362,11 +362,11 @@ fn render_list_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Header hint
-            Constraint::Min(5),    // Key list
-            Constraint::Length(8), // Selected key details
-            Constraint::Length(4), // Action hints
-            Constraint::Length(2), // Status
+            Constraint::Length(2),  // Header hint
+            Constraint::Min(5),     // Key list
+            Constraint::Length(16), // Selected key details (with usage metrics)
+            Constraint::Length(4),  // Action hints
+            Constraint::Length(2),  // Status
         ])
         .split(inner);
 
@@ -498,6 +498,49 @@ fn render_list_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
             Line::from(vec![
                 Span::styled("  Created:        ", Style::default().fg(Color::DarkGray)),
                 Span::styled(&k.created_at, Style::default().fg(Color::Gray)),
+            ]),
+            // Usage metrics section
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                "  ── Usage (today) ──",
+                Style::default().fg(Color::Yellow),
+            )]),
+            Line::from(vec![
+                Span::styled("  Requests:       ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", k.usage_requests),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Tokens in:      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", k.usage_tokens_prompt),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled("   out: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", k.usage_tokens_generated),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Tokens total:   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{}", k.usage_tokens_total),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Rate remaining: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    if k.rate_limit_per_minute == 0 {
+                        "unlimited".to_string()
+                    } else {
+                        format!("{}/min", k.rate_limit_remaining)
+                    },
+                    Style::default().fg(Color::Green),
+                ),
             ]),
         ])
         .block(detail_block);

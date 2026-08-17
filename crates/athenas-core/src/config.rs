@@ -90,7 +90,6 @@ pub struct ServerConfig {
     pub default_host: String,
     pub default_port: u16,
     pub cors_enabled: bool,
-    pub api_key: Option<String>,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_requests: u32,
     #[serde(default = "default_rate_limit")]
@@ -315,7 +314,6 @@ impl Default for AppConfig {
                 default_host: "127.0.0.1".to_string(),
                 default_port: 8080,
                 cors_enabled: true,
-                api_key: None,
                 max_concurrent_requests: 10,
                 rate_limit_per_second: 20,
                 request_timeout_secs: 300,

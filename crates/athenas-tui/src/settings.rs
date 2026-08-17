@@ -23,7 +23,6 @@ pub enum SettingsField {
     AutoResourceLimits,
     ServerHost,
     ServerPort,
-    ServerApiKey,
 }
 
 impl SettingsField {
@@ -50,7 +49,6 @@ impl SettingsField {
             SettingsField::AutoResourceLimits,
             SettingsField::ServerHost,
             SettingsField::ServerPort,
-            SettingsField::ServerApiKey,
         ]
     }
 
@@ -77,7 +75,6 @@ impl SettingsField {
             SettingsField::AutoResourceLimits => "Auto Resource Limits",
             SettingsField::ServerHost => "Server Host",
             SettingsField::ServerPort => "Server Port",
-            SettingsField::ServerApiKey => "Server API Key",
         }
     }
 
@@ -102,9 +99,7 @@ impl SettingsField {
             | SettingsField::RamReserve
             | SettingsField::CpuReserve
             | SettingsField::AutoResourceLimits => "Inference",
-            SettingsField::ServerHost | SettingsField::ServerPort | SettingsField::ServerApiKey => {
-                "Server"
-            }
+            SettingsField::ServerHost | SettingsField::ServerPort => "Server",
         }
     }
 }
@@ -297,9 +292,6 @@ impl SettingsState {
                     .parse()
                     .map_err(|_| "Must be a valid port (1-65535)".to_string())?;
             }
-            SettingsField::ServerApiKey => {
-                self.config.server.api_key = if value.is_empty() { None } else { Some(value) };
-            }
         }
 
         self.config.save().map_err(|e| e.to_string())?;
@@ -374,13 +366,6 @@ impl SettingsState {
             }
             SettingsField::ServerHost => self.config.server.default_host.clone(),
             SettingsField::ServerPort => self.config.server.default_port.to_string(),
-            SettingsField::ServerApiKey => {
-                if self.config.server.api_key.is_some() {
-                    "[set]".to_string()
-                } else {
-                    String::new()
-                }
-            }
         }
     }
 
@@ -409,7 +394,6 @@ impl SettingsState {
             }
             SettingsField::ServerHost => "e.g. 127.0.0.1",
             SettingsField::ServerPort => "e.g. 8080",
-            SettingsField::ServerApiKey => "Leave empty to disable auth",
         }
     }
 }

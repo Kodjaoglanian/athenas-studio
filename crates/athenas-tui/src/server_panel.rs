@@ -31,6 +31,13 @@ pub struct ApiKeyInfo {
     pub daily_token_limit: u64,
     pub allowed_models: Vec<String>,
     pub created_at: String,
+    // Usage metrics (today's stats)
+    pub usage_requests: u64,
+    pub usage_tokens_prompt: u64,
+    pub usage_tokens_generated: u64,
+    pub usage_tokens_total: u64,
+    pub usage_date: String,
+    pub rate_limit_remaining: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,7 +47,6 @@ pub enum ConfigField {
     // Server config
     Host,
     Port,
-    ApiKey,
     MaxConcurrent,
     RateLimit,
     TimeoutSecs,
@@ -102,7 +108,6 @@ impl ConfigField {
             ConfigField::ModelSelection,
             ConfigField::Host,
             ConfigField::Port,
-            ConfigField::ApiKey,
             ConfigField::MaxConcurrent,
             ConfigField::RateLimit,
             ConfigField::TimeoutSecs,
@@ -155,7 +160,6 @@ impl ConfigField {
             ConfigField::ModelSelection => "Model",
             ConfigField::Host => "Host",
             ConfigField::Port => "Port",
-            ConfigField::ApiKey => "API Key",
             ConfigField::MaxConcurrent => "Max Concurrent",
             ConfigField::RateLimit => "Rate Limit (req/s)",
             ConfigField::TimeoutSecs => "Timeout (secs)",
@@ -208,7 +212,6 @@ impl ConfigField {
             ConfigField::ModelSelection => "MODEL",
             ConfigField::Host
             | ConfigField::Port
-            | ConfigField::ApiKey
             | ConfigField::MaxConcurrent
             | ConfigField::RateLimit
             | ConfigField::TimeoutSecs
@@ -345,7 +348,6 @@ pub struct ServerPanelState {
     // Config values (edited copies)
     pub host: String,
     pub port: u16,
-    pub api_key: String,
     pub max_concurrent: u32,
     pub rate_limit: u32,
     pub timeout_secs: u64,
@@ -417,7 +419,6 @@ pub struct ServerPanelState {
     // Multi-tenant API key management
     pub api_keys: Vec<ApiKeyInfo>,
     pub api_key_selected: usize,
-    pub generated_key_display: Option<String>,
     pub new_key_name: String,
     pub new_key_rate_limit: String,
     pub new_key_token_limit: String,
@@ -439,7 +440,6 @@ impl ServerPanelState {
             model_selected: 0,
             host: config.server.default_host.clone(),
             port: config.server.default_port,
-            api_key: config.server.api_key.clone().unwrap_or_default(),
             max_concurrent: config.server.max_concurrent_requests,
             rate_limit: config.server.rate_limit_per_second,
             timeout_secs: config.server.request_timeout_secs,
@@ -490,7 +490,6 @@ impl ServerPanelState {
             hardware,
             api_keys: Vec::new(),
             api_key_selected: 0,
-            generated_key_display: None,
             new_key_name: String::new(),
             new_key_rate_limit: "60".to_string(),
             new_key_token_limit: "0".to_string(),
@@ -584,13 +583,6 @@ impl ServerPanelState {
             }
             ConfigField::Host => self.host.clone(),
             ConfigField::Port => self.port.to_string(),
-            ConfigField::ApiKey => {
-                if self.api_key.is_empty() {
-                    "(not set — no auth)".to_string()
-                } else {
-                    mask_secret(&self.api_key)
-                }
-            }
             ConfigField::MaxConcurrent => self.max_concurrent.to_string(),
             ConfigField::RateLimit => self.rate_limit.to_string(),
             ConfigField::TimeoutSecs => self.timeout_secs.to_string(),
@@ -727,9 +719,6 @@ impl ServerPanelState {
             ConfigField::ModelSelection => "Up/Down to select from local models",
             ConfigField::Host => "0.0.0.0 for all interfaces, 127.0.0.1 for local",
             ConfigField::Port => "Port number (e.g. 8080)",
-            ConfigField::ApiKey => {
-                "Static admin key. Enter: edit | G: generate random | X: clear (no auth)"
-            }
             ConfigField::MaxConcurrent => "Max simultaneous inference requests",
             ConfigField::RateLimit => "Token bucket: requests per second per IP",
             ConfigField::TimeoutSecs => "Kill stuck requests after N seconds",
@@ -787,7 +776,6 @@ impl ServerPanelState {
     /// into the config when the user presses Enter.
     pub fn edit_value(&self, field: &ConfigField) -> String {
         match field {
-            ConfigField::ApiKey => self.api_key.clone(),
             ConfigField::GpuDevice => match self.gpu_device {
                 Some(d) => d.to_string(),
                 None => String::new(),
@@ -1155,21 +1143,13 @@ impl ServerPanelState {
         })
     }
 
-    /// Generate a random 64-char hex API key using OS entropy (UUIDv4 x2).
-    pub fn generate_api_key(&mut self) {
-        let key = format!(
-            "{}{}",
-            uuid::Uuid::new_v4().simple(),
-            uuid::Uuid::new_v4().simple()
-        );
-        self.api_key = key;
-        self.generated_key_display = Some(self.api_key.clone());
-    }
-
-    /// Clear the API key (disable auth)
-    pub fn clear_api_key(&mut self) {
-        self.api_key.clear();
-        self.generated_key_display = None;
+    /// Returns the first active multi-tenant API key to use for TUI→server auth.
+    /// Returns None when no keys exist (bootstrap mode — server allows no-auth).
+    pub fn auth_bearer(&self) -> Option<&str> {
+        self.api_keys
+            .iter()
+            .find(|k| k.active)
+            .map(|k| k.api_key.as_str())
     }
 
     pub fn api_key_select_next(&mut self) {
@@ -1234,11 +1214,6 @@ impl ServerPanelState {
         let mut config = base.clone();
         config.server.default_host = self.host.clone();
         config.server.default_port = self.port;
-        config.server.api_key = if self.api_key.is_empty() {
-            None
-        } else {
-            Some(self.api_key.clone())
-        };
         config.server.max_concurrent_requests = self.max_concurrent;
         config.server.rate_limit_per_second = self.rate_limit;
         config.server.request_timeout_secs = self.timeout_secs;
@@ -1378,18 +1353,6 @@ fn on_off(b: bool) -> String {
     }
 }
 
-/// Mask a secret for display: show only the first and last 4 chars.
-fn mask_secret(key: &str) -> String {
-    let len = key.chars().count();
-    if len <= 8 {
-        "••••••••".to_string()
-    } else {
-        let first: String = key.chars().take(4).collect();
-        let last: String = key.chars().skip(len - 4).collect();
-        format!("{}…{}", first, last)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1437,7 +1400,6 @@ mod tests {
     #[test]
     fn edit_value_never_returns_placeholders() {
         let state = test_state();
-        assert_eq!(state.edit_value(&ConfigField::ApiKey), "");
         assert_eq!(state.edit_value(&ConfigField::IpAllowlist), "");
         assert_eq!(state.edit_value(&ConfigField::IpDenylist), "");
         assert_eq!(state.edit_value(&ConfigField::LoraPaths), "");
@@ -1548,12 +1510,6 @@ mod tests {
         assert_eq!(est.vram_mb, Some(4096 + 256));
         assert!(est.ram_mb < est.model_size_mb); // host keeps only overhead
         assert!(est.fits);
-    }
-
-    #[test]
-    fn mask_secret_hides_middle() {
-        assert_eq!(mask_secret("abcd1234efgh5678"), "abcd…5678");
-        assert_eq!(mask_secret("short"), "••••••••");
     }
 
     #[test]

@@ -41,7 +41,6 @@ struct AppState {
     model_manager: SharedModelManager,
     session_manager: SharedSessionManager,
     slot_manager: Option<Arc<SlotManager>>,
-    api_key: Option<String>,
     api_key_manager: Option<SharedApiKeyManager>,
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
@@ -169,7 +168,6 @@ pub fn create_router(
         model_manager,
         session_manager,
         slot_manager,
-        api_key: config.api_key.clone(),
         api_key_manager,
         model_router,
         audit_logger,
@@ -267,62 +265,28 @@ pub fn create_router(
     router.with_state(state)
 }
 
-fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
-    if api_key.is_none() {
-        return true;
-    }
-    let expected = api_key.as_ref().unwrap();
-    if let Some(auth) = headers.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                return &auth_str[7..] == expected;
-            }
-        }
-    }
-    false
+/// Check auth for API key management endpoints.
+/// Allows access without auth when no keys exist yet (bootstrap mode),
+/// otherwise requires a valid multi-tenant key.
+async fn check_auth_for_key_mgmt(headers: &HeaderMap, state: &AppState) -> bool {
+    check_auth_any(headers, state).await
 }
 
-/// Check auth for API key management endpoints.
-/// Allows access without auth when:
-/// - No static key is configured, OR
-/// - Static key is configured but no multi-tenant keys exist yet (bootstrap mode)
-async fn check_auth_for_key_mgmt(headers: &HeaderMap, state: &AppState) -> bool {
-    if check_auth(headers, &state.api_key) {
+/// Check auth for model management endpoints (load/unload/set default).
+/// Allows access without auth when no keys are configured at all.
+/// Otherwise requires a valid multi-tenant key.
+async fn check_auth_any(headers: &HeaderMap, state: &AppState) -> bool {
+    // If no key manager, allow all
+    if state.api_key_manager.is_none() {
         return true;
     }
-    // Bootstrap: if static key is set but no multi-tenant keys exist, allow access
-    // so the admin can create the first key from the TUI
+
+    // If key manager has no keys, allow all (bootstrap mode)
     if let Some(ref mgr_arc) = state.api_key_manager {
         let mgr = mgr_arc.lock().await;
         if mgr.list_keys().is_empty() {
             return true;
         }
-    }
-    false
-}
-
-/// Check auth for model management endpoints (load/unload/set default).
-/// Accepts the static key OR any valid multi-tenant key.
-/// Allows access without auth when no keys are configured at all.
-async fn check_auth_any(headers: &HeaderMap, state: &AppState) -> bool {
-    // If no static key and no key manager, allow all
-    if state.api_key.is_none() && state.api_key_manager.is_none() {
-        return true;
-    }
-
-    // If no static key and key manager has no keys, allow all
-    if state.api_key.is_none() {
-        if let Some(ref mgr_arc) = state.api_key_manager {
-            let mgr = mgr_arc.lock().await;
-            if mgr.list_keys().is_empty() {
-                return true;
-            }
-        }
-    }
-
-    // Check static key
-    if check_auth(headers, &state.api_key) {
-        return true;
     }
 
     // Check multi-tenant keys
@@ -350,21 +314,19 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Full authentication check: validates against static api_key OR the multi-tenant ApiKeyManager.
+/// Full authentication check: validates against the multi-tenant ApiKeyManager.
 /// Returns an AuthResult indicating the outcome.
 async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&str>) -> AuthResult {
-    // If no static key and no key manager, allow all
-    if state.api_key.is_none() && state.api_key_manager.is_none() {
+    // If no key manager, allow all
+    if state.api_key_manager.is_none() {
         return AuthResult::NoAuthRequired;
     }
 
-    // If no static key and key manager has no keys, allow all
-    if state.api_key.is_none() {
-        if let Some(ref mgr_arc) = state.api_key_manager {
-            let mgr = mgr_arc.lock().await;
-            if mgr.list_keys().is_empty() {
-                return AuthResult::NoAuthRequired;
-            }
+    // If key manager has no keys, allow all (bootstrap mode)
+    if let Some(ref mgr_arc) = state.api_key_manager {
+        let mgr = mgr_arc.lock().await;
+        if mgr.list_keys().is_empty() {
+            return AuthResult::NoAuthRequired;
         }
     }
 
@@ -372,16 +334,6 @@ async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&s
         Some(t) => t,
         None => return AuthResult::Unauthorized,
     };
-
-    // Check static key first
-    if let Some(ref expected) = state.api_key {
-        if token == *expected {
-            return AuthResult::Allowed {
-                key_id: "static".to_string(),
-                key_name: "server-key".to_string(),
-            };
-        }
-    }
 
     // Check API key manager
     if let Some(ref mgr_arc) = state.api_key_manager {
@@ -1370,7 +1322,7 @@ async fn upload_file(
     headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1644,7 +1596,7 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1681,7 +1633,7 @@ async fn create_session(
 }
 
 async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1700,7 +1652,7 @@ async fn get_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1732,7 +1684,7 @@ async fn delete_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1753,7 +1705,7 @@ async fn get_session_messages(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1803,7 +1755,7 @@ async fn set_session_system_prompt(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<SetSystemPromptRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1822,7 +1774,7 @@ async fn set_session_system_prompt(
 }
 
 async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1840,7 +1792,7 @@ async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMa
 // ── Slot management endpoints ────────────────────────────────────────
 
 async fn list_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1873,7 +1825,7 @@ async fn save_slot(
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1906,7 +1858,7 @@ async fn restore_slot(
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1938,7 +1890,7 @@ async fn erase_slot(
     headers: HeaderMap,
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2631,6 +2583,20 @@ async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
         .list_keys()
         .iter()
         .map(|k| {
+            let usage = mgr.get_usage(&k.key_id);
+            let (requests, tokens_prompt, tokens_generated, tokens_total, usage_date) =
+                if let Some((_, u)) = usage {
+                    (
+                        u.requests,
+                        u.tokens_prompt,
+                        u.tokens_generated,
+                        u.tokens_total(),
+                        u.date.clone(),
+                    )
+                } else {
+                    (0u64, 0u64, 0u64, 0u64, String::new())
+                };
+            let rate_limit_remaining = mgr.rate_limit_remaining(k);
             serde_json::json!({
                 "key_id": k.key_id,
                 "api_key": k.api_key,
@@ -2642,6 +2608,14 @@ async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
                 "daily_token_limit": k.daily_token_limit,
                 "allowed_models": k.allowed_models,
                 "metadata": k.metadata,
+                "usage": {
+                    "date": usage_date,
+                    "requests": requests,
+                    "tokens_prompt": tokens_prompt,
+                    "tokens_generated": tokens_generated,
+                    "tokens_total": tokens_total,
+                    "rate_limit_remaining": rate_limit_remaining,
+                },
             })
         })
         .collect();
@@ -2790,7 +2764,7 @@ async fn create_alias(
     headers: HeaderMap,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2806,7 +2780,7 @@ async fn create_alias(
 }
 
 async fn list_aliases(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2837,7 +2811,7 @@ async fn create_chain(
     headers: HeaderMap,
     Json(req): Json<CreateChainRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2863,7 +2837,7 @@ async fn create_chain(
 }
 
 async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2878,7 +2852,7 @@ async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 async fn routing_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2947,7 +2921,7 @@ async fn query_audit_logs(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2967,7 +2941,7 @@ async fn query_audit_logs(
 }
 
 async fn audit_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2996,7 +2970,7 @@ async fn vs_add_document(
     headers: HeaderMap,
     Json(req): Json<VsAddRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3034,7 +3008,7 @@ async fn vs_add_batch(
     headers: HeaderMap,
     Json(req): Json<VsAddBatchRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3078,7 +3052,7 @@ async fn vs_search(
     headers: HeaderMap,
     Json(req): Json<VsSearchRequest>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3099,7 +3073,7 @@ async fn vs_search(
 }
 
 async fn vs_list_documents(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3123,7 +3097,7 @@ async fn vs_get_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3147,7 +3121,7 @@ async fn vs_delete_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3168,7 +3142,7 @@ async fn vs_delete_document(
 }
 
 async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3182,7 +3156,7 @@ async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response
 }
 
 async fn vs_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth(&headers, &state.api_key) {
+    if !check_auth_any(&headers, &state).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

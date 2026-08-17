@@ -48,13 +48,6 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
                 athenas_core::AthenasError::InvalidInput("Invalid port".to_string())
             })?;
         }
-        "server.api_key" => {
-            config.server.api_key = if value.is_empty() {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
         "huggingface.token" => {
             config.huggingface.token = if value.is_empty() {
                 None

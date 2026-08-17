@@ -1195,11 +1195,7 @@ impl TuiApp {
             let m = mgr.lock().await;
             m.get(None).map(|b| b.boxed_clone())
         } else if let Some(ref state) = self.server_state {
-            let api_key = if self.server_panel_state.api_key.is_empty() {
-                None
-            } else {
-                Some(self.server_panel_state.api_key.as_str())
-            };
+            let api_key = self.server_panel_state.auth_bearer();
             Some(Box::new(RemoteBackend::new(
                 &state.host,
                 state.port,
@@ -1648,23 +1644,6 @@ impl TuiApp {
                     }
                     _ => {}
                 },
-                // Generate a random admin API key (OS entropy)
-                KeyCode::Char('g') | KeyCode::Char('G') if field == ConfigField::ApiKey => {
-                    self.server_panel_state.generate_api_key();
-                    let key = self
-                        .server_panel_state
-                        .generated_key_display
-                        .clone()
-                        .unwrap_or_default();
-                    self.server_panel_state
-                        .set_status(format!("Generated key: {} — saved on server start", key));
-                }
-                // Clear the admin API key (disables auth)
-                KeyCode::Char('x') | KeyCode::Char('X') if field == ConfigField::ApiKey => {
-                    self.server_panel_state.clear_api_key();
-                    self.server_panel_state
-                        .set_status("API key cleared — auth disabled on next start");
-                }
                 KeyCode::Enter => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
@@ -2192,11 +2171,7 @@ impl TuiApp {
         if let Some(ref state) = self.server_state {
             let host = self.connect_host();
             let port = state.port;
-            let api_key = if self.server_panel_state.api_key.is_empty() {
-                None
-            } else {
-                Some(self.server_panel_state.api_key.clone())
-            };
+            let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
             let gpu_layers = self.server_panel_state.gpu_layers;
             let context_size = self.server_panel_state.context_size;
 
@@ -2383,11 +2358,7 @@ impl TuiApp {
         if let Some(ref state) = self.server_state {
             let host = self.connect_host();
             let port = state.port;
-            let api_key = if self.server_panel_state.api_key.is_empty() {
-                None
-            } else {
-                Some(self.server_panel_state.api_key.clone())
-            };
+            let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
             let mid = model_id.clone();
 
             let result = tokio::spawn(async move {
@@ -2486,11 +2457,7 @@ impl TuiApp {
         if let Some(ref state) = self.server_state {
             let host = self.connect_host();
             let port = state.port;
-            let api_key = if self.server_panel_state.api_key.is_empty() {
-                None
-            } else {
-                Some(self.server_panel_state.api_key.clone())
-            };
+            let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
             let mid = model_id.clone();
 
             let result = tokio::spawn(async move {
@@ -2564,11 +2531,7 @@ impl TuiApp {
         };
         let host = self.connect_host();
         let port = state.port;
-        let api_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
+        let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
 
         let result = tokio::spawn(async move {
             let client = reqwest::Client::new();
@@ -2809,11 +2772,7 @@ impl TuiApp {
         };
         let host = self.connect_host();
         let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
+        let admin_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
         let (name, rate_limit, token_limit, allowed_models) = self.api_key_modal.form_values();
 
         let result = tokio::spawn(async move {
@@ -2881,11 +2840,7 @@ impl TuiApp {
         };
         let host = self.connect_host();
         let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
+        let admin_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
         let kid = key_id.clone();
 
         let result = tokio::spawn(async move {
@@ -2936,11 +2891,7 @@ impl TuiApp {
         };
         let host = self.connect_host();
         let port = state.port;
-        let admin_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
+        let admin_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
         let kid = key_id.clone();
 
         let result = tokio::spawn(async move {
@@ -2990,11 +2941,7 @@ impl TuiApp {
         };
         let host = self.connect_host();
         let port = state.port;
-        let api_key = if self.server_panel_state.api_key.is_empty() {
-            None
-        } else {
-            Some(self.server_panel_state.api_key.clone())
-        };
+        let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
 
         let result = tokio::spawn(async move {
             let client = reqwest::Client::builder()
@@ -3066,6 +3013,38 @@ impl TuiApp {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?")
                                 .to_string(),
+                            usage_requests: k
+                                .get("usage")
+                                .and_then(|u| u.get("requests"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            usage_tokens_prompt: k
+                                .get("usage")
+                                .and_then(|u| u.get("tokens_prompt"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            usage_tokens_generated: k
+                                .get("usage")
+                                .and_then(|u| u.get("tokens_generated"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            usage_tokens_total: k
+                                .get("usage")
+                                .and_then(|u| u.get("tokens_total"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            usage_date: k
+                                .get("usage")
+                                .and_then(|u| u.get("date"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            rate_limit_remaining: k
+                                .get("usage")
+                                .and_then(|u| u.get("rate_limit_remaining"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32,
                         });
                     }
                 }
