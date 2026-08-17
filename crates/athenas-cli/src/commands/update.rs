@@ -113,6 +113,7 @@ fn find_running_processes() -> Vec<(String, u32)> {
 
     #[cfg(target_os = "windows")]
     {
+        let my_pid = std::process::id();
         // Use tasklist to find processes
         for name in &["athenas.exe", "llama-server.exe"] {
             if let Ok(output) = Command::new("tasklist")
@@ -131,7 +132,8 @@ fn find_running_processes() -> Vec<(String, u32)> {
                     let parts: Vec<&str> = line.split(',').collect();
                     if parts.len() >= 2 {
                         let pid: u32 = parts[1].trim_matches('"').parse().unwrap_or(0);
-                        if pid > 0 {
+                        // Skip our own process
+                        if pid > 0 && pid != my_pid {
                             found.push((name.to_string(), pid));
                         }
                     }
@@ -142,12 +144,18 @@ fn find_running_processes() -> Vec<(String, u32)> {
 
     #[cfg(unix)]
     {
-        // Use pgrep to find processes
+        let my_pid = std::process::id();
+        // Use pgrep to find processes, excluding our own PID
         for name in &["athenas", "llama-server"] {
             if let Ok(output) = Command::new("pgrep").arg("-x").arg(name).output() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 for line in stdout.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
+                        // Skip our own process — `athenas update` is also
+                        // named `athenas` and would false-positive
+                        if pid == my_pid {
+                            continue;
+                        }
                         found.push((name.to_string(), pid));
                     }
                 }
