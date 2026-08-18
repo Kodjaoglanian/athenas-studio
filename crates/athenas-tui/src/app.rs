@@ -65,6 +65,8 @@ pub struct TuiApp {
     config: AppConfig,
     hardware: HardwareInfo,
     chat_state: ChatState,
+    /// Multi-line text input for chat (tui-textarea)
+    chat_input: tui_textarea::TextArea<'static>,
     model_list_state: ModelListState,
     browser_state: ModelBrowserState,
     server_panel_state: ServerPanelState,
@@ -141,6 +143,18 @@ impl TuiApp {
             config,
             hardware,
             chat_state: ChatState::default(),
+            chat_input: {
+                let mut ta = tui_textarea::TextArea::default();
+                ta.set_block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .title(" Input (Enter to send, Shift+Enter for newline) ")
+                        .border_style(
+                            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                        ),
+                );
+                ta
+            },
             model_list_state,
             browser_state: ModelBrowserState::default(),
             server_panel_state,
@@ -525,6 +539,7 @@ impl TuiApp {
                     f,
                     content,
                     &mut self.chat_state,
+                    &mut self.chat_input,
                     self.is_loading_model,
                     self.loading_spinner,
                 );
@@ -561,7 +576,12 @@ impl TuiApp {
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                self.send_message().await;
+                // Shift+Enter = newline, Enter = send
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.chat_input.input(tui_textarea::Input::from(key));
+                } else {
+                    self.send_message().await;
+                }
             }
             // Tab toggles reasoning/thinking expansion on last assistant message
             KeyCode::Tab => {
@@ -575,34 +595,61 @@ impl TuiApp {
                     msg.reasoning_expanded = !msg.reasoning_expanded;
                 }
             }
-            // Up: scroll up one line (toward older messages)
-            KeyCode::Up => {
+            // Up/Down: scroll chat area (only when not focused on multi-line input)
+            // Use Ctrl+Up/Ctrl+Down for scrolling when input has multiple lines
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.chat_state.auto_scroll = false;
                 self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
             }
-            // Down: scroll down one line (toward newer messages)
-            // If we reach the bottom, re-enable auto-scroll
-            KeyCode::Down => {
-                if self.chat_state.auto_scroll {
-                    // Already following, nothing to do
-                } else {
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.chat_state.auto_scroll {
                     self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
-                    // Render will clamp; if we hit bottom, auto-scroll re-enables
-                    // We use a flag to detect this in render via a large scroll value
                 }
             }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL) && !c.is_control() =>
-            {
-                self.chat_state.input_text.push(c);
+            // When input is single-line, Up/Down scroll the chat
+            // When multi-line, they navigate within the textarea
+            KeyCode::Up => {
+                if self.chat_input.lines().len() <= 1 {
+                    self.chat_state.auto_scroll = false;
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                } else {
+                    self.chat_input.input(tui_textarea::Input::from(key));
+                }
+            }
+            KeyCode::Down => {
+                if self.chat_input.lines().len() <= 1 {
+                    if !self.chat_state.auto_scroll {
+                        self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
+                    }
+                } else {
+                    self.chat_input.input(tui_textarea::Input::from(key));
+                }
+            }
+            // PageUp/PageDown for fast scrolling
+            KeyCode::PageUp => {
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(20);
+            }
+            KeyCode::PageDown => {
+                if !self.chat_state.auto_scroll {
+                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(20);
+                }
+            }
+            // Home/End
+            KeyCode::Home => {
+                self.chat_state.auto_scroll = false;
+                self.chat_state.scroll = 0;
+            }
+            KeyCode::End => {
+                self.chat_state.auto_scroll = true;
+                self.chat_state.scroll = 0;
+            }
+            // All other keys go to the textarea
+            _ => {
+                self.chat_input.input(tui_textarea::Input::from(key));
                 // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
             }
-            KeyCode::Backspace => {
-                self.chat_state.input_text.pop();
-            }
-            KeyCode::Esc if self.chat_state.is_generating => {}
-            _ => {}
         }
     }
 
@@ -1077,7 +1124,8 @@ impl TuiApp {
     }
 
     async fn send_message(&mut self) {
-        let text = self.chat_state.input_text.trim().to_string();
+        // Get text from textarea (join multi-line with newlines)
+        let text = self.chat_input.lines().join("\n").trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -1146,7 +1194,13 @@ impl TuiApp {
         }
 
         self.chat_state.add_message("user", &text);
-        self.chat_state.input_text.clear();
+        self.chat_input = tui_textarea::TextArea::default();
+        self.chat_input.set_block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Input (Enter to send, Shift+Enter for newline) ")
+                .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+        );
         self.chat_state.is_generating = true;
         self.chat_state.generation_start = Some(std::time::Instant::now());
 
@@ -1155,23 +1209,34 @@ impl TuiApp {
         // (welcome, model loaded, errors) not meant for the model's context.
         // Many model chat templates (e.g. Qwen) require system messages only
         // at the beginning and reject them if placed after user/assistant turns.
-        let messages: Vec<ChatMessage> = self
-            .chat_state
-            .messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .map(|m| {
-                let role = match m.role.as_str() {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    _ => Role::User,
-                };
-                ChatMessage {
-                    role,
-                    content: MessageContent::Text(m.content.clone()),
-                }
-            })
-            .collect();
+        let mut messages: Vec<ChatMessage> = Vec::new();
+
+        // Prepend custom system prompt if set (via /system command)
+        if !self.chat_state.system_prompt.is_empty() {
+            messages.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::Text(self.chat_state.system_prompt.clone()),
+            });
+        }
+
+        // Add conversation messages (excluding TUI system messages)
+        messages.extend(
+            self.chat_state
+                .messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .map(|m| {
+                    let role = match m.role.as_str() {
+                        "user" => Role::User,
+                        "assistant" => Role::Assistant,
+                        _ => Role::User,
+                    };
+                    ChatMessage {
+                        role,
+                        content: MessageContent::Text(m.content.clone()),
+                    }
+                }),
+        );
 
         let req = ChatRequest {
             model: String::new(),
@@ -1364,8 +1429,37 @@ impl TuiApp {
                 self.chat_state.add_message(
                     "system",
                     "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /logs, /help, /quit\n\
+                     /system <prompt> — set system prompt for the model\n\
+                     /system — show current system prompt\n\
+                     /system clear — remove system prompt\n\
                      F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | F6: Logs | Ctrl+C: Quit",
                 );
+            }
+            "/system" => {
+                if parts.len() < 2 || parts[1].trim().is_empty() {
+                    // Show current system prompt
+                    if self.chat_state.system_prompt.is_empty() {
+                        self.chat_state.add_message(
+                            "system",
+                            "No system prompt set. Use /system <prompt> to set one.",
+                        );
+                    } else {
+                        self.chat_state.add_message(
+                            "system",
+                            &format!("Current system prompt:\n{}", self.chat_state.system_prompt),
+                        );
+                    }
+                } else if parts[1].trim() == "clear" {
+                    self.chat_state.system_prompt.clear();
+                    self.chat_state
+                        .add_message("system", "System prompt cleared.");
+                } else {
+                    self.chat_state.system_prompt = parts[1].trim().to_string();
+                    self.chat_state.add_message(
+                        "system",
+                        &format!("System prompt set to:\n{}", self.chat_state.system_prompt),
+                    );
+                }
             }
             "/quit" => {
                 self.chat_state.add_message("system", "Use Ctrl+C to quit");
@@ -1375,7 +1469,13 @@ impl TuiApp {
                     .add_message("system", &format!("Unknown command: {}", parts[0]));
             }
         }
-        self.chat_state.input_text.clear();
+        self.chat_input = tui_textarea::TextArea::default();
+        self.chat_input.set_block(
+            ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Input (Enter to send, Shift+Enter for newline) ")
+                .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
+        );
     }
 
     async fn load_model(&mut self, path: &str) {

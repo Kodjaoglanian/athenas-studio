@@ -29,6 +29,9 @@ pub struct ChatState {
     pub gpu_runtime: String,
     /// Number of GPU layers (e.g. -1, 0, 20)
     pub gpu_layers: i32,
+    /// Custom system prompt sent to the model (set via /system command).
+    /// Empty string = no custom system prompt.
+    pub system_prompt: String,
 }
 
 impl Default for ChatState {
@@ -54,6 +57,7 @@ impl Default for ChatState {
             gpu_info: String::new(),
             gpu_runtime: String::new(),
             gpu_layers: -1,
+            system_prompt: String::new(),
         }
     }
 }

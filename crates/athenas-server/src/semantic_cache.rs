@@ -290,6 +290,18 @@ pub type SharedSemanticCache = Arc<Mutex<SemanticCache>>;
 mod tests {
     use super::*;
 
+    /// Create a unique temp directory for each test to avoid cache file collisions.
+    fn test_data_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "athenas_cache_test_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
     #[test]
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 2.0, 3.0];
@@ -321,7 +333,7 @@ mod tests {
             similarity_threshold: 0.9,
             ttl_secs: 3600,
             max_entries: 100,
-            data_dir: std::env::temp_dir(),
+            data_dir: test_data_dir("exact"),
         };
         let mut cache = SemanticCache::new(config);
         let embedding = vec![1.0, 2.0, 3.0];
@@ -346,7 +358,7 @@ mod tests {
             similarity_threshold: 0.95,
             ttl_secs: 3600,
             max_entries: 100,
-            data_dir: std::env::temp_dir(),
+            data_dir: test_data_dir("similar"),
         };
         let mut cache = SemanticCache::new(config);
         cache.insert(
@@ -369,7 +381,7 @@ mod tests {
             similarity_threshold: 0.99,
             ttl_secs: 3600,
             max_entries: 100,
-            data_dir: std::env::temp_dir(),
+            data_dir: test_data_dir("miss"),
         };
         let mut cache = SemanticCache::new(config);
         cache.insert(
@@ -393,7 +405,7 @@ mod tests {
             similarity_threshold: 0.9,
             ttl_secs: 3600,
             max_entries: 3,
-            data_dir: std::env::temp_dir(),
+            data_dir: test_data_dir("eviction"),
         };
         let mut cache = SemanticCache::new(config);
         for i in 0..5 {
@@ -416,7 +428,7 @@ mod tests {
             similarity_threshold: 0.9,
             ttl_secs: 3600,
             max_entries: 100,
-            data_dir: std::env::temp_dir(),
+            data_dir: test_data_dir("clear"),
         };
         let mut cache = SemanticCache::new(config);
         cache.insert(

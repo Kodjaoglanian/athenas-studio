@@ -15,6 +15,7 @@ pub fn render_chat_area(
     f: &mut Frame,
     area: Rect,
     state: &mut ChatState,
+    chat_input: &mut tui_textarea::TextArea<'static>,
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
@@ -28,7 +29,7 @@ pub fn render_chat_area(
         .split(area);
 
     render_messages(f, chunks[0], state, is_loading_model, loading_spinner);
-    render_input(f, chunks[1], state);
+    f.render_widget(&*chat_input, chunks[1]);
     render_status_bar(f, chunks[2], state);
 }
 
@@ -348,23 +349,6 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     result
 }
 
-fn render_input(f: &mut Frame, area: Rect, state: &ChatState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Input ")
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    let input = Paragraph::new(state.input_text.as_str())
-        .block(block)
-        .style(Style::default().fg(Color::White));
-
-    f.render_widget(input, area);
-
-    let cursor_x = area.x + 1 + state.input_text.chars().count() as u16;
-    let cursor_y = area.y + 1;
-    f.set_cursor_position((cursor_x, cursor_y));
-}
-
 fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     let mut status_parts = Vec::new();
 
@@ -417,8 +401,15 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
         ));
     }
 
+    if !state.system_prompt.is_empty() {
+        status_parts.push(Span::styled(
+            " [system prompt] ",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+
     status_parts.push(Span::raw(
-        " | Enter: Send | Up/Down: Scroll | Tab: Thinking | Ctrl+C: Quit ",
+        " | Enter: Send | Shift+Enter: Newline | PgUp/PgDn: Scroll | Tab: Thinking | Ctrl+C: Quit ",
     ));
 
     let line = Line::from(status_parts);
