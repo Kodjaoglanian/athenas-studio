@@ -1290,6 +1290,8 @@ impl TuiApp {
             // Non-streaming: spawn chat() in background, show result when done
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
             let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            // Mark the initial value as seen so changed() doesn't fire immediately
+            cancel_rx.borrow_and_update();
             tokio::spawn(async move {
                 tokio::select! {
                     result = backend.chat(req) => {
@@ -1330,6 +1332,8 @@ impl TuiApp {
         // Start streaming in background — store receiver for polling
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        // Mark the initial value as seen so changed() doesn't fire immediately
+        cancel_rx.borrow_and_update();
         tokio::spawn(async move {
             // Wrap the stream in a select! so we can abort when cancel is signaled
             tokio::select! {
