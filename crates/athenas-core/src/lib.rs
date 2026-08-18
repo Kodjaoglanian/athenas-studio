@@ -5,8 +5,8 @@ pub mod model_registry;
 pub mod storage;
 
 pub use config::{
-    AppConfig, BackendType, GpuRuntime, InferenceConfig, OtelConfig, ServerConfig,
-    VectorStoreServerConfig,
+    AppConfig, BackendType, GpuRuntime, InferenceConfig, OtelConfig, SemanticCacheConfig,
+    ServerConfig, VectorStoreServerConfig,
 };
 pub use errors::{AthenasError, Result};
 pub use hardware::{

@@ -13,6 +13,7 @@ use crate::metrics::{Metrics, SharedMetrics};
 use crate::middleware::{RateLimiter, SharedRateLimiter};
 use crate::model_manager::{ModelManager, SharedModelManager};
 use crate::model_router::{ModelRouter, SharedModelRouter};
+use crate::semantic_cache::{SemanticCache, SharedSemanticCache};
 use crate::session_manager::{SessionManager, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 use crate::vector_store::{SharedVectorStore, VectorStore, VectorStoreConfig};
@@ -29,6 +30,7 @@ pub struct ApiServer {
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
     vector_store: Option<SharedVectorStore>,
+    semantic_cache: Option<SharedSemanticCache>,
 }
 
 impl ApiServer {
@@ -57,6 +59,7 @@ impl ApiServer {
             model_router: None,
             audit_logger: None,
             vector_store: None,
+            semantic_cache: None,
         }
     }
 
@@ -85,6 +88,7 @@ impl ApiServer {
             model_router: None,
             audit_logger: None,
             vector_store: None,
+            semantic_cache: None,
         }
     }
 
@@ -118,6 +122,12 @@ impl ApiServer {
         self
     }
 
+    /// Enable the semantic cache.
+    pub fn with_semantic_cache(mut self, cache: SemanticCache) -> Self {
+        self.semantic_cache = Some(Arc::new(Mutex::new(cache)));
+        self
+    }
+
     /// Get the shared model manager (for loading/unloading models at runtime).
     pub fn model_manager(&self) -> SharedModelManager {
         self.model_manager.clone()
@@ -145,6 +155,7 @@ impl ApiServer {
             self.model_router.clone(),
             self.audit_logger.clone(),
             self.vector_store.clone(),
+            self.semantic_cache.clone(),
             &self.config.server,
         );
 

@@ -152,6 +152,12 @@ pub async fn run(
     let vs_max_docs = config.server.vector_store.max_documents;
     let vs_top_k = config.server.vector_store.default_top_k;
 
+    // Check if semantic cache is enabled
+    let sc_enabled = config.server.semantic_cache.enabled;
+    let sc_threshold = config.server.semantic_cache.similarity_threshold;
+    let sc_ttl = config.server.semantic_cache.ttl_secs;
+    let sc_max_entries = config.server.semantic_cache.max_entries;
+
     print_startup_banner(&config, host, port, &hardware, &model);
 
     let mut server = ApiServer::new(config, backend)
@@ -162,11 +168,29 @@ pub async fn run(
     if vs_enabled {
         let vs_config = VectorStoreConfig {
             enabled: true,
-            data_dir,
+            data_dir: data_dir.clone(),
             max_documents: vs_max_docs,
             default_top_k: vs_top_k,
         };
         server = server.with_vector_store(vs_config);
+    }
+
+    if sc_enabled {
+        let sc_config = athenas_server::SemanticCacheConfig {
+            enabled: true,
+            similarity_threshold: sc_threshold,
+            ttl_secs: sc_ttl,
+            max_entries: sc_max_entries,
+            data_dir: data_dir.clone(),
+        };
+        let cache = athenas_server::SemanticCache::new(sc_config);
+        server = server.with_semantic_cache(cache);
+        tracing::info!(
+            "Semantic cache enabled (threshold={:.2}, ttl={}s, max_entries={})",
+            sc_threshold,
+            sc_ttl,
+            sc_max_entries
+        );
     }
 
     server.start(host, port).await

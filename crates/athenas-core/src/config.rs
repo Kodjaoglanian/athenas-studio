@@ -119,6 +119,9 @@ pub struct ServerConfig {
     /// for a semaphore permit. Does not change behavior — purely informational.
     #[serde(default)]
     pub queue_visibility: bool,
+    /// Semantic cache configuration
+    #[serde(default)]
+    pub semantic_cache: SemanticCacheConfig,
 }
 
 fn default_max_concurrent() -> u32 {
@@ -175,6 +178,46 @@ pub struct VectorStoreServerConfig {
 
 fn default_vs_top_k() -> usize {
     5
+}
+
+/// Configuration for the semantic cache.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticCacheConfig {
+    /// Whether the semantic cache is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum cosine similarity to consider a cache hit (0.0 - 1.0).
+    #[serde(default = "default_cache_threshold")]
+    pub similarity_threshold: f32,
+    /// Time-to-live for cache entries in seconds.
+    #[serde(default = "default_cache_ttl")]
+    pub ttl_secs: u64,
+    /// Maximum number of entries (LRU eviction when exceeded).
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+fn default_cache_threshold() -> f32 {
+    0.92
+}
+
+fn default_cache_ttl() -> u64 {
+    3600
+}
+
+fn default_cache_max_entries() -> usize {
+    1000
+}
+
+impl Default for SemanticCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            similarity_threshold: default_cache_threshold(),
+            ttl_secs: default_cache_ttl(),
+            max_entries: default_cache_max_entries(),
+        }
+    }
 }
 
 impl Default for VectorStoreServerConfig {
@@ -325,6 +368,7 @@ impl Default for AppConfig {
                 ip_denylist: Vec::new(),
                 otel: OtelConfig::default(),
                 queue_visibility: false,
+                semantic_cache: SemanticCacheConfig::default(),
             },
             huggingface: HuggingFaceConfig {
                 token: None,

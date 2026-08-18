@@ -32,6 +32,7 @@ use crate::middleware::{
 };
 use crate::model_manager::SharedModelManager;
 use crate::model_router::SharedModelRouter;
+use crate::semantic_cache::SharedSemanticCache;
 use crate::session_manager::{SessionInfo, SharedSessionManager};
 use crate::slot_manager::SlotManager;
 use crate::vector_store::SharedVectorStore;
@@ -45,6 +46,7 @@ struct AppState {
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
     vector_store: Option<SharedVectorStore>,
+    semantic_cache: Option<SharedSemanticCache>,
     metrics: SharedMetrics,
     semaphore: Arc<Semaphore>,
     start_time: std::time::Instant,
@@ -162,6 +164,7 @@ pub fn create_router(
     model_router: Option<SharedModelRouter>,
     audit_logger: Option<SharedAuditLogger>,
     vector_store: Option<SharedVectorStore>,
+    semantic_cache: Option<SharedSemanticCache>,
     config: &ServerConfig,
 ) -> Router {
     let state = AppState {
@@ -172,6 +175,7 @@ pub fn create_router(
         model_router,
         audit_logger,
         vector_store,
+        semantic_cache,
         metrics: metrics.clone(),
         semaphore,
         start_time: std::time::Instant::now(),
@@ -226,6 +230,9 @@ pub fn create_router(
         )
         .route("/v1/vector/clear", post(vs_clear))
         .route("/v1/vector/stats", get(vs_stats))
+        // Semantic cache endpoints
+        .route("/v1/cache/stats", get(cache_stats))
+        .route("/v1/cache/clear", post(cache_clear))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/health", get(health))
@@ -607,6 +614,87 @@ async fn chat_completions(
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
+    // ─── Semantic cache: check for a hit before inference ───
+    // Only cache non-streaming requests (streaming cache is complex)
+    let is_streaming = req.stream.unwrap_or(false);
+    let cache_enabled = state
+        .semantic_cache
+        .as_ref()
+        .map(|c| c.try_lock().map(|c| c.is_enabled()).unwrap_or(false))
+        .unwrap_or(false);
+
+    // Save cache-relevant fields before req is moved into chat_req
+    let cache_model = req.model.clone();
+    let cache_user_msg: String = if cache_enabled && !is_streaming {
+        req.messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .map(|m| m.content.as_text().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if cache_enabled && !is_streaming && !cache_user_msg.is_empty() {
+        // Generate embedding for the query
+        let mgr = state.model_manager.lock().await;
+        let backend_opt = mgr.get(cache_model.as_deref());
+        drop(mgr);
+
+        if let Some(backend) = backend_opt {
+            let embed_req = EmbeddingRequest {
+                model: cache_model.clone().unwrap_or_default(),
+                input: athenas_inference::types::EmbeddingInput::Single(cache_user_msg.clone()),
+                encoding_format: "float".to_string(),
+            };
+
+            if let Ok(embed_resp) = backend.embeddings(embed_req).await {
+                if let Some(embed_data) = embed_resp.data.first() {
+                    let query_embedding = embed_data.embedding.clone();
+
+                    // Check cache
+                    if let Some(ref cache_arc) = state.semantic_cache {
+                        let mut cache = cache_arc.lock().await;
+                        if let Some(cached) = cache.lookup(&query_embedding) {
+                            tracing::info!(
+                                "Semantic cache HIT for chat completion, tokens_saved={}",
+                                cached.tokens_saved
+                            );
+
+                            // Record audit
+                            record_audit(
+                                &state,
+                                AuditParams {
+                                    endpoint: "/v1/chat/completions",
+                                    method: "POST",
+                                    status: 200,
+                                    model: &cached.model,
+                                    tokens_prompt: 0,
+                                    tokens_generated: 0,
+                                    error: None,
+                                },
+                            )
+                            .await;
+
+                            let cached_json: serde_json::Value =
+                                serde_json::from_str(&cached.response_json)
+                                    .unwrap_or(serde_json::Value::Null);
+
+                            let mut resp = with_queue_headers(
+                                &state,
+                                queue_pos,
+                                Json(cached_json).into_response(),
+                            );
+                            resp.headers_mut().insert("X-Cache", "HIT".parse().unwrap());
+                            return resp;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let new_messages: Vec<ChatMessage> = req
         .messages
         .iter()
@@ -941,7 +1029,51 @@ async fn chat_completions(
                         "total_tokens": resp.stats.tokens_prompt + resp.stats.tokens_generated,
                     },
                 });
-                with_queue_headers(&state, queue_pos, Json(json).into_response())
+
+                // ─── Semantic cache: store the response ───
+                if cache_enabled && !is_streaming && !cache_user_msg.is_empty() {
+                    // Re-generate embedding for caching (we need it for the key)
+                    let mgr = state.model_manager.lock().await;
+                    let backend_opt = mgr.get(cache_model.as_deref());
+                    drop(mgr);
+
+                    if let Some(backend) = backend_opt {
+                        let embed_req = EmbeddingRequest {
+                            model: cache_model.clone().unwrap_or_default(),
+                            input: athenas_inference::types::EmbeddingInput::Single(
+                                cache_user_msg.clone(),
+                            ),
+                            encoding_format: "float".to_string(),
+                        };
+
+                        if let Ok(embed_resp) = backend.embeddings(embed_req).await {
+                            if let Some(embed_data) = embed_resp.data.first() {
+                                let tokens_saved =
+                                    (resp.stats.tokens_prompt + resp.stats.tokens_generated) as u64;
+                                let response_json =
+                                    serde_json::to_string(&json).unwrap_or_default();
+
+                                if let Some(ref cache_arc) = state.semantic_cache {
+                                    let mut cache = cache_arc.lock().await;
+                                    cache.insert(
+                                        cache_user_msg.clone(),
+                                        embed_data.embedding.clone(),
+                                        response_json,
+                                        resp.model.clone(),
+                                        tokens_saved,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let mut http_resp =
+                    with_queue_headers(&state, queue_pos, Json(json).into_response());
+                http_resp
+                    .headers_mut()
+                    .insert("X-Cache", "MISS".parse().unwrap());
+                http_resp
             }
             Err(e) => {
                 tracing::error!(
@@ -3188,4 +3320,52 @@ async fn vs_stats(State(state): State<AppState>, headers: HeaderMap) -> Response
 
     let count = vs.len().await;
     Json(serde_json::json!({"document_count": count, "enabled": vs.is_enabled()})).into_response()
+}
+
+// ─── Semantic Cache Endpoints ───
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/cache/stats"))]
+async fn cache_stats(State(state): State<AppState>) -> Response {
+    match &state.semantic_cache {
+        Some(cache) => {
+            let c = cache.lock().await;
+            let stats = c.stats();
+            Json(serde_json::json!({
+                "enabled": true,
+                "entries": stats.entries,
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "hit_rate": stats.hit_rate(),
+                "tokens_saved": stats.tokens_saved,
+                "evictions": stats.evictions,
+            }))
+            .into_response()
+        }
+        None => Json(serde_json::json!({
+            "enabled": false,
+            "entries": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "tokens_saved": 0,
+            "evictions": 0,
+        }))
+        .into_response(),
+    }
+}
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/cache/clear"))]
+async fn cache_clear(State(state): State<AppState>) -> Response {
+    match &state.semantic_cache {
+        Some(cache) => {
+            let mut c = cache.lock().await;
+            c.clear();
+            Json(serde_json::json!({"status": "cleared"})).into_response()
+        }
+        None => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error": "Semantic cache not enabled"})),
+        )
+            .into_response(),
+    }
 }
