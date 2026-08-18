@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::{HeaderMap, StatusCode},
     middleware::{from_fn, from_fn_with_state},
     response::sse::{Event, KeepAlive},
@@ -266,9 +266,21 @@ pub fn create_router(
 }
 
 /// Check auth for API key management endpoints.
-/// Allows access without auth when no keys exist yet (bootstrap mode),
-/// otherwise requires a valid multi-tenant key.
-async fn check_auth_for_key_mgmt(headers: &HeaderMap, state: &AppState) -> bool {
+/// Allows access without auth when:
+/// - Request comes from localhost (TUI admin), OR
+/// - No keys exist yet (bootstrap mode)
+/// Otherwise requires a valid multi-tenant key.
+async fn check_auth_for_key_mgmt(
+    headers: &HeaderMap,
+    state: &AppState,
+    client_ip: Option<std::net::IpAddr>,
+) -> bool {
+    // Localhost (TUI) can always manage keys — admin access
+    if let Some(ip) = client_ip {
+        if ip.is_loopback() {
+            return true;
+        }
+    }
     check_auth_any(headers, state).await
 }
 
@@ -2534,9 +2546,10 @@ fn default_token_limit() -> u64 {
 async fn create_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateKeyRequest>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2562,8 +2575,12 @@ async fn create_api_key(
     Json(key).into_response()
 }
 
-async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+async fn list_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2625,9 +2642,10 @@ async fn list_api_keys(State(state): State<AppState>, headers: HeaderMap) -> Res
 async fn get_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2662,9 +2680,10 @@ async fn get_api_key(
 async fn delete_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2688,9 +2707,10 @@ async fn delete_api_key(
 async fn revoke_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2714,9 +2734,10 @@ async fn revoke_api_key(
 async fn get_api_key_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state).await {
+    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
