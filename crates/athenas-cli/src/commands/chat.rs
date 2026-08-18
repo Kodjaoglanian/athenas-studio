@@ -22,12 +22,18 @@ pub async fn run(
     let mut backend = BackendFactory::create(backend, &hardware)?;
 
     println!("Loading model: {}", model_path);
+    // 0 = use config default (allows CLI to omit --context-size and still respect config.toml)
+    let effective_context_size = if context_size == 0 {
+        config.inference.default_context_size
+    } else {
+        context_size
+    };
     let load_config = ModelLoadConfig {
         model_path: model_path.clone(),
         gpu_layers,
         gpu_runtime: config.inference.gpu_runtime,
         gpu_device: config.inference.gpu_device,
-        context_size,
+        context_size: effective_context_size,
         batch_size: config.inference.default_batch_size,
         threads: config.inference.default_threads,
         flash_attention: config.inference.flash_attention,

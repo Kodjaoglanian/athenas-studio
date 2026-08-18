@@ -57,7 +57,12 @@ pub async fn run(
     // Apply auto resource limits if enabled
     let mut effective_threads = threads.unwrap_or(config.inference.default_threads);
     let mut effective_batch_size = batch_size.unwrap_or(config.inference.default_batch_size);
-    let mut effective_context_size = context_size;
+    // 0 = use config default (allows CLI to omit --context-size and still respect config.toml)
+    let mut effective_context_size = if context_size == 0 {
+        config.inference.default_context_size
+    } else {
+        context_size
+    };
 
     // Resolve draft model path (relative to models_dir or absolute)
     let draft_model_path = config.inference.draft_model.as_ref().map(|p| {

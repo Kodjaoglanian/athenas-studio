@@ -39,8 +39,8 @@ enum Commands {
         /// GPU layers to offload (-1 for all)
         #[arg(long, default_value = "-1", allow_hyphen_values = true)]
         gpu_layers: i32,
-        /// Context size
-        #[arg(long, default_value = "4096")]
+        /// Context size (0 = use config default)
+        #[arg(long, default_value = "0")]
         context_size: u32,
     },
 
@@ -66,8 +66,8 @@ enum Commands {
         /// GPU device index to use (0, 1, 2, ...)
         #[arg(long)]
         gpu_device: Option<u32>,
-        /// Context size
-        #[arg(long, default_value = "4096")]
+        /// Context size (0 = use config default)
+        #[arg(long, default_value = "0")]
         context_size: u32,
         /// Number of CPU threads (0 = auto-detect with auto_resource_limits)
         #[arg(long)]
