@@ -273,10 +273,9 @@ pub fn create_router(
 }
 
 /// Check auth for API key management endpoints.
-/// Allows access without auth when:
-/// - Request comes from localhost (TUI admin), OR
-/// - No keys exist yet (bootstrap mode)
-/// Otherwise requires a valid multi-tenant key.
+/// Allows access without auth when request comes from localhost (TUI admin)
+/// or no keys exist yet (bootstrap mode). Otherwise requires a valid
+/// multi-tenant key.
 async fn check_auth_for_key_mgmt(
     headers: &HeaderMap,
     state: &AppState,
