@@ -295,6 +295,7 @@ async fn check_auth_for_key_mgmt(
 /// Allows access without auth when:
 /// - No keys are configured at all (bootstrap mode)
 /// - Request comes from localhost (TUI admin)
+///
 /// Otherwise requires a valid multi-tenant key.
 async fn check_auth_any(
     headers: &HeaderMap,
