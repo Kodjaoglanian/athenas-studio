@@ -207,6 +207,7 @@ pub fn create_router(
         .route("/v1/slots/:id/restore", post(restore_slot))
         .route("/v1/slots/:id/erase", post(erase_slot))
         .route("/v1/files", post(upload_file))
+        .route("/v1/audio/transcriptions", post(transcribe_audio))
         // API Key management endpoints
         .route("/v1/keys", post(create_api_key).get(list_api_keys))
         .route("/v1/keys/:id", get(get_api_key).delete(delete_api_key))
@@ -1544,6 +1545,212 @@ async fn upload_file(
     });
 
     Json(response).into_response()
+}
+
+// ── Audio transcription endpoint (OpenAI-compatible) ──────────────────
+
+/// Transcribe audio using a Whisper model.
+///
+/// This endpoint accepts multipart form data with:
+/// - `file`: the audio file (wav, mp3, flac, etc.)
+/// - `model`: the Whisper model name/path (GGUF)
+/// - `language`: optional language hint (e.g. "en", "pt")
+/// - `response_format`: optional output format (text, json, srt, vtt)
+/// - `translate`: optional, translate to English
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/audio/transcriptions"))]
+async fn transcribe_audio(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    if !check_auth_any(&headers, &state).await {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let mut file_data: Option<Vec<u8>> = None;
+    let mut filename: Option<String> = None;
+    let mut model_name: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut response_format: Option<String> = None;
+    let mut translate: Option<bool> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" | "audio" => {
+                filename = field.file_name().map(|s| s.to_string());
+                match field.bytes().await {
+                    Ok(bytes) => file_data = Some(bytes.to_vec()),
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(
+                                serde_json::json!({"error": format!("Failed to read file: {}", e)}),
+                            ),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            "model" => {
+                if let Ok(bytes) = field.bytes().await {
+                    model_name = Some(String::from_utf8_lossy(&bytes).to_string());
+                }
+            }
+            "language" => {
+                if let Ok(bytes) = field.bytes().await {
+                    language = Some(String::from_utf8_lossy(&bytes).to_string());
+                }
+            }
+            "response_format" => {
+                if let Ok(bytes) = field.bytes().await {
+                    response_format = Some(String::from_utf8_lossy(&bytes).to_string());
+                }
+            }
+            "translate" => {
+                if let Ok(bytes) = field.bytes().await {
+                    let val = String::from_utf8_lossy(&bytes).to_string();
+                    translate = Some(val == "true" || val == "1");
+                }
+            }
+            _ => {
+                // Skip unknown fields
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    let audio_data = match file_data {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "No audio file uploaded. Use multipart form with 'file' field."})),
+            )
+                .into_response();
+        }
+    };
+
+    let model = match model_name {
+        Some(m) => m,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing 'model' field. Specify a Whisper model name or path."})),
+            )
+                .into_response();
+        }
+    };
+
+    // Resolve model path
+    let model_path = match resolve_model_path(&model, &state).await {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e})),
+            )
+                .into_response();
+        }
+    };
+
+    // Create WhisperBackend (auto-downloads whisper-cli if needed)
+    let backend = match athenas_inference::WhisperBackend::new().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error": format!("Failed to init whisper backend: {}", e)}),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    let request = athenas_inference::TranscriptionRequest {
+        audio_data,
+        filename: filename.unwrap_or_else(|| "audio.wav".to_string()),
+        model: model_path,
+        language: language.filter(|l| l != "auto"),
+        response_format: response_format.or(Some("json".to_string())),
+        translate,
+        max_len: None,
+    };
+
+    match backend.transcribe(&request).await {
+        Ok(resp) => {
+            let format = request.response_format.as_deref().unwrap_or("json");
+            match format {
+                "text" => (StatusCode::OK, resp.text).into_response(),
+                "srt" => {
+                    let mut srt = String::new();
+                    for seg in &resp.segments {
+                        srt.push_str(&format!(
+                            "{}\n{} --> {}\n{}\n\n",
+                            seg.id + 1,
+                            format_srt_time(seg.start),
+                            format_srt_time(seg.end),
+                            seg.text
+                        ));
+                    }
+                    (StatusCode::OK, [("content-type", "text/plain")], srt).into_response()
+                }
+                "vtt" => {
+                    let mut vtt = String::from("WEBVTT\n\n");
+                    for seg in &resp.segments {
+                        vtt.push_str(&format!(
+                            "{} --> {}\n{}\n\n",
+                            format_vtt_time(seg.start),
+                            format_vtt_time(seg.end),
+                            seg.text
+                        ));
+                    }
+                    (StatusCode::OK, [("content-type", "text/vtt")], vtt).into_response()
+                }
+                _ => Json(resp).into_response(),
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Transcription failed: {}", e)})),
+        )
+            .into_response(),
+    }
+}
+
+/// Resolve a model name/ID to a file path on disk.
+async fn resolve_model_path(model: &str, _state: &AppState) -> Result<String, String> {
+    // If it's a direct path that exists, use it
+    if std::path::Path::new(model).exists() {
+        return Ok(model.to_string());
+    }
+
+    // Search in model registry
+    let config = athenas_core::config::AppConfig::load()
+        .map_err(|e| format!("Failed to load config: {}", e))?;
+    let registry = athenas_core::model_registry::ModelRegistry::new(config.paths.models_dir);
+
+    registry
+        .find_model(model)
+        .map(|m| m.file_path.to_string_lossy().to_string())
+        .map_err(|e| format!("Model '{}' not found: {}", model, e))
+}
+
+fn format_srt_time(secs: f64) -> String {
+    let hours = (secs / 3600.0) as u64;
+    let mins = ((secs % 3600.0) / 60.0) as u64;
+    let seconds = (secs % 60.0) as u64;
+    let millis = ((secs % 1.0) * 1000.0) as u64;
+    format!("{:02}:{:02}:{:02},{:03}", hours, mins, seconds, millis)
+}
+
+fn format_vtt_time(secs: f64) -> String {
+    let hours = (secs / 3600.0) as u64;
+    let mins = ((secs % 3600.0) / 60.0) as u64;
+    let seconds = (secs % 60.0) as u64;
+    let millis = ((secs % 1.0) * 1000.0) as u64;
+    format!("{:02}:{:02}:{:02}.{:03}", hours, mins, seconds, millis)
 }
 
 // ── Multi-model management endpoints ──────────────────────────────────

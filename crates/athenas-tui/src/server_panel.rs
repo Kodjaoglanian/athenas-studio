@@ -1387,6 +1387,7 @@ mod tests {
             tags: Vec::new(),
             downloaded_at: chrono::Utc::now(),
             last_used_at: None,
+            category: None,
         }
     }
 

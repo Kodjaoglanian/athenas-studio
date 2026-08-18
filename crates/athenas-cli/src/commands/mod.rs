@@ -5,5 +5,6 @@ pub mod hardware;
 pub mod models;
 pub mod run;
 pub mod serve;
+pub mod transcribe;
 pub mod tui;
 pub mod update;

@@ -35,6 +35,7 @@
 - **HuggingFace Integration** — Search, download, and manage models from HuggingFace Hub with automatic mmproj download
 - **OpenAI-Compatible API Server** — Drop-in replacement for OpenAI API endpoints with multi-model support
 - **Reasoning/Thinking Mode** — Support for reasoning models (Qwen3.5, DeepSeek R1, etc.) with configurable thinking budget
+- **Audio Transcription (Whisper)** — Transcribe audio files with Whisper models via CLI (`athenas transcribe`) or API (`/v1/audio/transcriptions`). Auto-downloads whisper-cli binary, supports text/JSON/SRT/VTT output formats, and language hints
 - **Hardware Auto-Detection** — Automatically detects CUDA, ROCm, Vulkan, and Metal
 - **Auto Resource Limits** — Automatically caps threads, context size, and batch size based on available hardware
 - **RAM Pre-Flight Check** — Server panel shows live RAM/VRAM usage and blocks startup if the selected model doesn't fit (with Auto Resource Limits enabled)
@@ -320,6 +321,26 @@ athenas login --token hf_xxxxx
 athenas update
 ```
 
+### Transcribe audio with Whisper
+```bash
+# Basic transcription (text output)
+athenas transcribe audio.wav --model whisper-large-v3-Q4_K_M.gguf
+
+# With language hint and JSON output
+athenas transcribe audio.mp3 --model whisper-large-v3-Q4_K_M.gguf --language pt --format json
+
+# Translate to English with SRT subtitles
+athenas transcribe audio.flac --model whisper-large-v3-turbo-Q4_K_M.gguf --translate --format srt
+```
+
+Supported audio formats: WAV, MP3, FLAC, OGG, M4A, and more (whisper.cpp handles conversion automatically).
+
+Output formats:
+- `text` — Plain text transcription (default)
+- `json` — Structured JSON with segments and timestamps
+- `srt` — SubRip subtitle format
+- `vtt` — WebVTT subtitle format
+
 ## API Server Endpoints
 
 | Endpoint | Method | Description |
@@ -330,6 +351,7 @@ athenas update
 | `/v1/models/load` | POST | Load an additional model at runtime |
 | `/v1/models/unload` | POST | Unload a model by ID |
 | `/v1/files` | POST | Upload files for multimodal inference (images, documents) |
+| `/v1/audio/transcriptions` | POST | Transcribe audio with Whisper (multipart: file, model, language, response_format) |
 | `/v1/health` | GET | Health check with model info, uptime, and backend status |
 | `/v1/ready` | GET | Kubernetes readiness probe (503 if no model loaded) |
 | `/health` | GET | Alias for `/v1/health` |
@@ -416,6 +438,23 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Audio transcription via API
+
+```bash
+# Transcribe via curl (multipart form)
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F "file=@audio.wav" \
+  -F "model=whisper-large-v3-Q4_K_M.gguf" \
+  -F "language=pt" \
+  -F "response_format=json"
+
+# Get SRT subtitles
+curl http://127.0.0.1:8080/v1/audio/transcriptions \
+  -F "file=@audio.mp3" \
+  -F "model=whisper-large-v3-turbo-Q4_K_M.gguf" \
+  -F "response_format=srt"
+```
+
 ## Architecture
 
 ```
@@ -443,7 +482,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.8.7"
+version = "0.9.0"
 
 [paths]
 models_dir = "~/.athenas/models"

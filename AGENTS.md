@@ -52,6 +52,8 @@ Cargo workspace with 6 crates:
 | `crates/athenas-tui/src/markdown.rs` | Markdown renderer — converts markdown to styled ratatui Lines (headers, bold, code blocks, lists, etc.) |
 | `crates/athenas-tui/src/components.rs` | Rendering — chat area, status bar, model list, server panel, settings, logs |
 | `crates/athenas-server/src/semantic_cache.rs` | SemanticCache — cosine similarity cache with TTL, LRU eviction, disk persistence |
+| `crates/athenas-inference/src/whisper.rs` | WhisperBackend — wraps whisper-cli for audio transcription (JSON/SRT/VTT parsing) |
+| `crates/athenas-cli/src/commands/transcribe.rs` | `athenas transcribe` command — CLI audio transcription with Whisper |
 | `crates/athenas-cli/src/commands/serve.rs` | `athenas serve` command — loads model and starts API server |
 
 ## Important Patterns
@@ -144,6 +146,22 @@ The server-side semantic cache (`semantic_cache.rs`) caches chat completion
 responses based on embedding similarity. It uses cosine similarity, TTL,
 and LRU eviction with disk persistence to `~/.athenas/cache/`. Disabled
 by default; enable via `[server.semantic_cache]` in config.toml.
+
+### Whisper / Audio Transcription
+
+Whisper models (architecture: "whisper") are categorized separately from
+LLM models in the registry (`category: "whisper"`). They cannot be loaded
+by llama-server but can be used for audio transcription via whisper-cli.
+
+- **Auto-download**: `backend_setup::ensure_whisper_cli()` downloads the
+  whisper-cli binary to `~/.athenas/bin/whisper-cli` on first use
+- **CLI**: `athenas transcribe <audio> --model <whisper.gguf>` command
+- **API**: `POST /v1/audio/transcriptions` (OpenAI-compatible multipart)
+- **Output formats**: text, json, srt, vtt
+- **macOS**: No prebuilt binary — users must `brew install whisper-cpp`
+
+The `WhisperBackend` writes audio to a temp file, runs whisper-cli, and
+parses the output (JSON, SRT, or VTT) into a `TranscriptionResponse`.
 
 ## Release Process
 

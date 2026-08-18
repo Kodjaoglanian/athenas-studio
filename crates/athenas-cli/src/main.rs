@@ -139,6 +139,24 @@ enum Commands {
 
     /// Update athenas to the latest release
     Update,
+
+    /// Transcribe audio using Whisper
+    Transcribe {
+        /// Audio file path (wav, mp3, flac, ogg, etc.)
+        audio: String,
+        /// Whisper model path or model ID (GGUF format)
+        #[arg(long)]
+        model: String,
+        /// Language hint (e.g. "en", "pt", "auto")
+        #[arg(long, default_value = "auto")]
+        language: String,
+        /// Output format: text, json, srt, vtt
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Translate to English
+        #[arg(long)]
+        translate: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -324,6 +342,13 @@ async fn main() -> anyhow::Result<()> {
             },
             Commands::Login { token } => commands::config::login(token).await?,
             Commands::Update => commands::update::run().await?,
+            Commands::Transcribe {
+                audio,
+                model,
+                language,
+                format,
+                translate,
+            } => commands::transcribe::run(&audio, &model, &language, &format, translate).await?,
             Commands::Tui => {} // already handled above
         }
     }

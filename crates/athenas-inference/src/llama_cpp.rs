@@ -468,8 +468,28 @@ impl LlamaCppBackend {
                             msg.push_str(&format!("\nlast log line: {}", stderr_msg));
                         }
 
-                        // Check if --reasoning flags are unsupported by this version
+                        // Check for unsupported model architecture (whisper, tts, etc.)
                         let full_log = std::fs::read_to_string(&llama_log_path).unwrap_or_default();
+                        if full_log.contains("unknown model architecture") {
+                            // Extract the architecture name from the log
+                            let arch = full_log
+                                .lines()
+                                .find(|l| l.contains("unknown model architecture"))
+                                .and_then(|l| l.split('\'').nth(1))
+                                .unwrap_or("unknown");
+                            msg = format!(
+                                "This model uses the '{}' architecture, which is not a text LLM.\n\
+                                 llama-server only supports text generation models (llama, mistral, \
+                                 qwen, deepseek, gemma, phi, etc.).\n\
+                                 Models like Whisper (audio transcription), TTS, VITS, and Stable \
+                                 Diffusion cannot be loaded.\n\n\
+                                 Last log line: {}",
+                                arch, stderr_msg
+                            );
+                            return Err(AthenasError::Backend(msg));
+                        }
+
+                        // Check if --reasoning flags are unsupported by this version
                         if (full_log.contains("reasoning") || full_log.contains("unrecognized"))
                             && !self.skip_reasoning_flag
                         {

@@ -437,3 +437,55 @@ pub struct TokenizeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Whisper / Audio transcription types
+// ---------------------------------------------------------------------------
+
+/// Request for audio transcription (OpenAI-compatible).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscriptionRequest {
+    /// Audio file bytes (multipart upload)
+    pub audio_data: Vec<u8>,
+    /// Original filename (used to detect format: .wav, .mp3, .flac, etc.)
+    pub filename: String,
+    /// Whisper model path (GGUF)
+    pub model: String,
+    /// Language hint (e.g. "en", "pt", "auto")
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Output format: "text", "json", "srt", "vtt"
+    #[serde(default)]
+    pub response_format: Option<String>,
+    /// Translate to English
+    #[serde(default)]
+    pub translate: Option<bool>,
+    /// Max segment length in characters
+    #[serde(default)]
+    pub max_len: Option<u32>,
+}
+
+/// Response from audio transcription.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptionResponse {
+    /// Transcribed text
+    pub text: String,
+    /// Language detected (if auto-detected)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Duration in seconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<f64>,
+    /// Segments with timestamps (for SRT/VTT)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub segments: Vec<TranscriptionSegment>,
+}
+
+/// A single transcription segment with timing.
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptionSegment {
+    pub id: u32,
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
+}

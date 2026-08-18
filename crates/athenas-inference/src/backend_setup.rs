@@ -1094,3 +1094,191 @@ fn cleanup_bin_dir(bin_dir: &std::path::Path, server_path: &std::path::Path) {
         }
     }
 }
+
+// ===========================================================================
+// whisper.cpp auto-download
+// ===========================================================================
+
+const WHISPER_CPP_REPO: &str = "ggml-org/whisper.cpp";
+const WHISPER_CPP_VERSION: &str = "v1.7.6";
+
+/// Detect the platform-appropriate asset name for whisper.cpp releases.
+fn whisper_platform_asset_name() -> Option<String> {
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    match (os, arch) {
+        ("linux", "x86_64") => Some("whisper-bin-ubuntu-x64.tar.gz".to_string()),
+        ("linux", "aarch64") => Some("whisper-bin-ubuntu-arm64.tar.gz".to_string()),
+        ("windows", "x86_64") => Some("whisper-bin-x64.zip".to_string()),
+        ("windows", "x86") => Some("whisper-bin-Win32.zip".to_string()),
+        ("macos", "x86_64") | ("macos", "aarch64") => {
+            // whisper.cpp doesn't ship a macOS CLI binary in releases.
+            // Users need to install via Homebrew: `brew install whisper-cpp`
+            // or build from source.
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Auto-download and install whisper-cli to ~/.athenas/bin/
+pub async fn ensure_whisper_cli() -> Result<PathBuf> {
+    let bin_dir = athenas_bin_dir()?;
+
+    let cli_name = if std::env::consts::OS == "windows" {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    };
+
+    let cli_path = bin_dir.join(cli_name);
+
+    // Already installed?
+    if cli_path.exists() {
+        return Ok(cli_path);
+    }
+
+    let asset_suffix = whisper_platform_asset_name().ok_or_else(|| {
+        AthenasError::Backend(format!(
+            "No prebuilt whisper-cli available for {} {}. \
+                 On macOS, install via: brew install whisper-cpp",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+
+    info!("whisper-cli not found, auto-downloading...");
+
+    // whisper.cpp release assets are named differently from llama.cpp.
+    // They use: whisper-bin-ubuntu-x64.tar.gz (no tag prefix in the filename)
+    let download_url = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        WHISPER_CPP_REPO, WHISPER_CPP_VERSION, asset_suffix
+    );
+
+    let data = download_file(&download_url).await?;
+    info!(
+        "Downloaded {} ({} MB), extracting...",
+        asset_suffix,
+        data.len() / (1024 * 1024)
+    );
+
+    let is_zip = asset_suffix.ends_with(".zip");
+    let extracted_path = if is_zip {
+        extract_zip_whisper(&data, &bin_dir)?
+    } else {
+        extract_tar_gz_whisper(&data, &bin_dir)?
+    };
+
+    // Make executable on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&extracted_path)
+            .map_err(|e| AthenasError::Backend(format!("stat error: {}", e)))?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&extracted_path, perms)
+            .map_err(|e| AthenasError::Backend(format!("chmod error: {}", e)))?;
+    }
+
+    info!("whisper-cli installed to {}", extracted_path.display());
+    Ok(extracted_path)
+}
+
+/// Extract whisper-cli from a tar.gz archive.
+fn extract_tar_gz_whisper(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let decoder = GzDecoder::new(data);
+    let mut archive = Archive::new(decoder);
+
+    let cli_name = if std::env::consts::OS == "windows" {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    };
+
+    let mut cli_path = None;
+
+    for entry in archive
+        .entries()
+        .map_err(|e| AthenasError::Backend(format!("Failed to read tar entries: {}", e)))?
+    {
+        let mut entry =
+            entry.map_err(|e| AthenasError::Backend(format!("Failed to read tar entry: {}", e)))?;
+
+        let file_name = entry
+            .path()
+            .map_err(|e| AthenasError::Backend(format!("Failed to get entry path: {}", e)))?
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        if file_name.is_empty() || file_name == "." || file_name == ".." {
+            continue;
+        }
+
+        let dest = bin_dir.join(&file_name);
+
+        #[cfg(unix)]
+        {
+            entry.set_preserve_permissions(true);
+        }
+
+        entry.unpack(&dest).map_err(|e| {
+            AthenasError::Backend(format!("Failed to extract {}: {}", file_name, e))
+        })?;
+
+        if file_name == cli_name {
+            cli_path = Some(dest);
+        }
+    }
+
+    cli_path.ok_or_else(|| AthenasError::Backend("whisper-cli not found in archive".into()))
+}
+
+/// Extract whisper-cli from a zip archive.
+fn extract_zip_whisper(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| AthenasError::Backend(format!("Failed to open zip: {}", e)))?;
+
+    let cli_name = "whisper-cli.exe";
+    let mut cli_path = None;
+
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| AthenasError::Backend(format!("Failed to read zip entry: {}", e)))?;
+
+        let name = file.name().to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+
+        let file_name = std::path::Path::new(&name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        if file_name.is_empty() {
+            continue;
+        }
+
+        let dest = bin_dir.join(file_name);
+        let mut out = std::fs::File::create(&dest)
+            .map_err(|e| AthenasError::Backend(format!("Failed to create {}: {}", file_name, e)))?;
+        std::io::copy(&mut file, &mut out)
+            .map_err(|e| AthenasError::Backend(format!("Failed to write {}: {}", file_name, e)))?;
+
+        if file_name == cli_name {
+            cli_path = Some(dest);
+        }
+    }
+
+    cli_path.ok_or_else(|| AthenasError::Backend("whisper-cli.exe not found in zip".into()))
+}
