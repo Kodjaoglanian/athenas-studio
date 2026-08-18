@@ -1100,7 +1100,6 @@ fn cleanup_bin_dir(bin_dir: &std::path::Path, server_path: &std::path::Path) {
 // ===========================================================================
 
 const WHISPER_CPP_REPO: &str = "ggml-org/whisper.cpp";
-const WHISPER_CPP_VERSION: &str = "v1.7.6";
 
 /// Detect the platform-appropriate asset name for whisper.cpp releases.
 fn whisper_platform_asset_name() -> Option<String> {
@@ -1120,6 +1119,38 @@ fn whisper_platform_asset_name() -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Query GitHub API for the latest whisper.cpp release tag.
+async fn get_latest_whisper_release_tag() -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("athenas-studio")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| AthenasError::Backend(format!("Failed to create HTTP client: {}", e)))?;
+
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        WHISPER_CPP_REPO
+    );
+    let resp: serde_json::Value = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| AthenasError::Backend(format!("GitHub API request failed: {}", e)))?
+        .json()
+        .await
+        .map_err(|e| AthenasError::Backend(format!("Failed to parse GitHub response: {}", e)))?;
+
+    let tag = resp
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            AthenasError::Backend("No tag_name in whisper.cpp release response".into())
+        })?;
+
+    Ok(tag.to_string())
 }
 
 /// Auto-download and install whisper-cli to ~/.athenas/bin/
@@ -1150,11 +1181,15 @@ pub async fn ensure_whisper_cli() -> Result<PathBuf> {
 
     info!("whisper-cli not found, auto-downloading...");
 
+    // Query the latest whisper.cpp release tag from GitHub API
+    let tag = get_latest_whisper_release_tag().await?;
+    info!("Using whisper.cpp release: {}", tag);
+
     // whisper.cpp release assets are named differently from llama.cpp.
     // They use: whisper-bin-ubuntu-x64.tar.gz (no tag prefix in the filename)
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
-        WHISPER_CPP_REPO, WHISPER_CPP_VERSION, asset_suffix
+        WHISPER_CPP_REPO, tag, asset_suffix
     );
 
     let data = download_file(&download_url).await?;
