@@ -40,53 +40,85 @@ fn render_messages(
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
-    // Available width inside the block borders. We pre-wrap text to this
-    // width so that lines.len() accurately reflects the number of rendered
-    // rows. This fixes the scroll bug where wrapped lines weren't counted.
-    //
+    // Available width inside the block borders.
     // -2 for left/right borders, -2 for the "  " indent prefix on content.
     let content_width = area.width.saturating_sub(4) as usize;
-    let reasoning_width = area.width.saturating_sub(6) as usize; // "    " prefix
+    let reasoning_width = area.width.saturating_sub(6) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &state.messages {
-        let (role_color, role_str) = match msg.role.as_str() {
-            "user" => (Color::Green, "You"),
-            "assistant" => (Color::Cyan, "AI"),
-            "system" => (Color::Yellow, "System"),
-            _ => (Color::Gray, msg.role.as_str()),
+    for (idx, msg) in state.messages.iter().enumerate() {
+        // Separator line between messages (not before the first one)
+        if idx > 0 {
+            lines.push(Line::styled(
+                "  ────────────────────────────────────────────────────────────────".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        let (role_color, role_bg, avatar, label) = match msg.role.as_str() {
+            "user" => (Color::Black, Color::Green, " ▌ ", "You"),
+            "assistant" => (Color::Black, Color::Cyan, " ▌ ", "AI"),
+            "system" => (Color::Black, Color::Yellow, " ▌ ", "System"),
+            _ => (Color::White, Color::Gray, " ▌ ", msg.role.as_str()),
         };
 
-        lines.push(Line::styled(
-            format!(" {} ", role_str),
-            Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-        ));
+        // Header line: [avatar] Label  ·  HH:MM
+        let time_str = msg.time_str();
+        let mut header_spans = vec![
+            Span::styled(
+                avatar.to_string(),
+                Style::default().fg(role_color).bg(role_bg),
+            ),
+            Span::styled(
+                format!(" {} ", label),
+                Style::default()
+                    .fg(role_color)
+                    .bg(role_bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !time_str.is_empty() {
+            header_spans.push(Span::styled(
+                format!("  {}", time_str),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(header_spans));
+        lines.push(Line::from(""));
 
         // Render collapsible reasoning section for assistant messages
         if msg.role == "assistant" && !msg.reasoning.is_empty() {
             if msg.reasoning_expanded {
-                lines.push(Line::styled(
-                    "  [Thinking] ▼ (Tab to collapse)",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM),
-                ));
+                lines.push(Line::from(vec![
+                    Span::styled("  ╭─ ", Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        "Thinking".to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  (Tab to collapse)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
                 for line in msg.reasoning.lines() {
                     for wrapped in wrap_text(line, reasoning_width) {
-                        lines.push(Line::styled(
-                            format!("    {}", wrapped),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ));
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(Color::Magenta)),
+                            Span::styled(
+                                wrapped,
+                                Style::default()
+                                    .fg(Color::LightMagenta)
+                                    .add_modifier(Modifier::DIM),
+                            ),
+                        ]));
                     }
                 }
                 lines.push(Line::styled(
-                    "  [/Thinking]",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM),
+                    "  ╰────────────".to_string(),
+                    Style::default().fg(Color::Magenta),
                 ));
             } else {
                 let preview_len = 60;
@@ -96,13 +128,27 @@ fn render_messages(
                 } else {
                     ""
                 };
-                lines.push(Line::styled(
-                    format!("  [Thinking] ▶ {}{} (Tab to expand)", preview, suffix),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM),
-                ));
+                lines.push(Line::from(vec![
+                    Span::styled("  ▸ ", Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        "Thinking".to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" {}{}", preview, suffix),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                    Span::styled(
+                        "  (Tab to expand)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
             }
+            lines.push(Line::from(""));
         }
 
         // Render message content
@@ -110,11 +156,26 @@ fn render_messages(
             // Assistant messages get markdown rendering
             let md_lines = crate::markdown::render_markdown(&msg.content, content_width);
             lines.extend(md_lines);
-        } else {
-            // User and system messages stay as plain text
+        } else if msg.role == "user" {
+            // User messages in light green for readability
             for line in msg.content.lines() {
                 for wrapped in wrap_text(line, content_width) {
-                    lines.push(Line::from(format!("  {}", wrapped)));
+                    lines.push(Line::styled(
+                        format!("  {}", wrapped),
+                        Style::default().fg(Color::LightGreen),
+                    ));
+                }
+            }
+        } else {
+            // System messages in yellow with dim
+            for line in msg.content.lines() {
+                for wrapped in wrap_text(line, content_width) {
+                    lines.push(Line::styled(
+                        format!("  {}", wrapped),
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::DIM),
+                    ));
                 }
             }
         }
@@ -127,19 +188,39 @@ fn render_messages(
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0);
 
-        lines.push(Line::styled(
-            " AI",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
+        // Separator before streaming response
+        if !state.messages.is_empty() {
+            lines.push(Line::styled(
+                "  ────────────────────────────────────────────────────────────────".to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
+        // AI header for streaming
+        lines.push(Line::from(vec![
+            Span::styled(
+                " ▌ ".to_string(),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
+            Span::styled(
+                " AI ".to_string(),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
         if state.streaming_text.is_empty() && state.streaming_reasoning.is_empty() {
-            // Show animated spinner + elapsed time while waiting for first token
-            let spinner_char = match elapsed % 4 {
-                0 => "|",
-                1 => "/",
-                2 => "-",
-                _ => "\\",
+            // Animated spinner with braille dots for a smoother feel
+            let spinner_char = match elapsed % 6 {
+                0 => "⠋",
+                1 => "⠙",
+                2 => "⠹",
+                3 => "⠸",
+                4 => "⠼",
+                _ => "⠴",
             };
             let wait_msg = if elapsed > 60 {
                 format!(
@@ -167,46 +248,52 @@ fn render_messages(
         } else {
             // Show live reasoning if present
             if !state.streaming_reasoning.is_empty() {
-                lines.push(Line::styled(
-                    "  [Thinking] ▼ (live...)",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM),
-                ));
+                lines.push(Line::from(vec![
+                    Span::styled("  ╭─ ", Style::default().fg(Color::Magenta)),
+                    Span::styled(
+                        "Thinking".to_string(),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  (live...)".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
                 for line in state.streaming_reasoning.lines() {
                     for wrapped in wrap_text(line, reasoning_width) {
-                        lines.push(Line::styled(
-                            format!("    {}", wrapped),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::DIM),
-                        ));
+                        lines.push(Line::from(vec![
+                            Span::styled("  │ ", Style::default().fg(Color::Magenta)),
+                            Span::styled(
+                                wrapped,
+                                Style::default()
+                                    .fg(Color::LightMagenta)
+                                    .add_modifier(Modifier::DIM),
+                            ),
+                        ]));
                     }
                 }
                 lines.push(Line::styled(
-                    "  [/Thinking]",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::DIM),
+                    "  ╰────────────".to_string(),
+                    Style::default().fg(Color::Magenta),
                 ));
+                lines.push(Line::from(""));
             }
             for line in state.streaming_text.lines() {
                 for wrapped in wrap_text(line, content_width) {
                     lines.push(Line::from(format!("  {}", wrapped)));
                 }
             }
-            // Note: full markdown rendering during streaming would cause
-            // flickering as the parser re-parses incomplete markdown.
-            // We render as plain text during streaming and apply markdown
-            // when the message is finalized.
 
             // Show live elapsed + tok/s during streaming
             if elapsed > 2 {
                 let info = if let Some(tps) = state.tokens_per_second {
-                    format!("  ~{:.1} tok/s · {}s", tps, elapsed)
+                    format!("  {} {:.1} tok/s · {}s", "⚡", tps, elapsed)
                 } else {
-                    format!("  {}s", elapsed)
+                    format!("  {} {}s", "⏱", elapsed)
                 };
+                lines.push(Line::from(""));
                 lines.push(Line::styled(
                     info,
                     Style::default()
@@ -220,17 +307,20 @@ fn render_messages(
 
     if is_loading_model {
         let spinner = match loading_spinner {
-            0 => "|",
-            1 => "/",
-            2 => "-",
-            _ => "\\",
+            0 => "⠋",
+            1 => "⠙",
+            2 => "⠹",
+            _ => "⠸",
         };
-        lines.push(Line::styled(
-            format!(" {} Loading model... Please wait", spinner),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", spinner), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                "Loading model... Please wait".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
     }
 
     // Calculate visible area height (inside borders)
@@ -256,17 +346,17 @@ fn render_messages(
     // Show scroll indicator in title when content overflows
     let title = if total_lines > inner_height {
         if state.auto_scroll {
-            " Athenas Studio — Chat ".to_string()
+            " ✦ Athenas Studio — Chat ".to_string()
         } else {
             let pct = if max_scroll > 0 {
                 ((scroll as f32 / max_scroll as f32) * 100.0) as u32
             } else {
                 0
             };
-            format!(" Athenas Studio — Chat [{}%] ", pct)
+            format!(" ✦ Athenas Studio — Chat [{}%] ", pct)
         }
     } else {
-        " Athenas Studio — Chat ".to_string()
+        " ✦ Athenas Studio — Chat ".to_string()
     };
 
     let block = Block::default()
@@ -279,8 +369,6 @@ fn render_messages(
         ))
         .border_style(Style::default().fg(Color::DarkGray));
 
-    // No .wrap() — we pre-wrapped the text ourselves so lines.len()
-    // matches the actual rendered row count, making scroll accurate.
     let paragraph = Paragraph::new(lines)
         .block(block)
         .scroll((scroll as u16, 0));
@@ -363,28 +451,38 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
-    let mut status_parts = Vec::new();
+    let sep = Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray));
+    let mut parts: Vec<Span> = Vec::new();
 
+    // Model info
     if let Some(ref model) = state.current_model {
-        status_parts.push(Span::styled(
-            format!(" Model: {} ", model),
+        parts.push(Span::styled(
+            "◆ ".to_string(),
             Style::default().fg(Color::Cyan),
         ));
+        parts.push(Span::styled(
+            model.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     } else {
-        status_parts.push(Span::styled(
-            " No model loaded ",
+        parts.push(Span::styled(
+            "◆ No model loaded".to_string(),
             Style::default().fg(Color::Red),
         ));
     }
 
+    // Backend
     if let Some(ref backend) = state.current_backend {
-        status_parts.push(Span::styled(
-            format!(" {} ", backend),
+        parts.push(sep.clone());
+        parts.push(Span::styled(
+            backend.clone(),
             Style::default().fg(Color::Blue),
         ));
     }
 
-    // GPU info: show GPU name + runtime + layers, or CPU
+    // GPU info
     if !state.gpu_info.is_empty() {
         let layers_str = if state.gpu_layers < 0 {
             "all".to_string()
@@ -393,39 +491,50 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
         } else {
             state.gpu_layers.to_string()
         };
-        status_parts.push(Span::styled(
-            format!(
-                " GPU: {} [{}] {} layers ",
-                state.gpu_info, state.gpu_runtime, layers_str
-            ),
+        parts.push(sep.clone());
+        parts.push(Span::styled(
+            format!("{} [{}] {}L", state.gpu_info, state.gpu_runtime, layers_str),
             Style::default().fg(Color::Magenta),
         ));
     } else if state.gpu_layers == 0 {
-        status_parts.push(Span::styled(
-            " CPU mode ",
-            Style::default().fg(Color::Yellow),
-        ));
+        parts.push(sep.clone());
+        parts.push(Span::styled("CPU mode", Style::default().fg(Color::Yellow)));
     }
 
+    // tok/s
     if let Some(tps) = state.tokens_per_second {
-        status_parts.push(Span::styled(
-            format!(" {:.1} tok/s ", tps),
+        parts.push(sep.clone());
+        parts.push(Span::styled(
+            format!("{:.1} tok/s", tps),
             Style::default().fg(Color::Green),
         ));
     }
 
+    // System prompt indicator
     if !state.system_prompt.is_empty() {
-        status_parts.push(Span::styled(
-            " [system prompt] ",
+        parts.push(sep.clone());
+        parts.push(Span::styled(
+            "✦ system prompt".to_string(),
             Style::default().fg(Color::Magenta),
         ));
     }
 
-    status_parts.push(Span::raw(
-        " | Enter: Send | Shift+Enter: Newline | PgUp/PgDn: Scroll | Tab: Thinking | Ctrl+C: Quit ",
+    // Right-aligned shortcuts
+    let shortcuts =
+        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab: Thinking │ Ctrl+C: Quit";
+    let left_len: usize = parts.iter().map(|s| s.content.chars().count()).sum();
+    let sep_len = 3; // " │ "
+    let total_left = left_len + (parts.len().saturating_sub(1)) * sep_len;
+    let available = area.width as usize;
+    let padding = available.saturating_sub(total_left + shortcuts.chars().count() + 2);
+
+    parts.push(Span::raw(" ".repeat(padding)));
+    parts.push(Span::styled(
+        shortcuts.to_string(),
+        Style::default().fg(Color::DarkGray),
     ));
 
-    let line = Line::from(status_parts);
+    let line = Line::from(parts);
     let paragraph = Paragraph::new(line).style(Style::default().bg(Color::Black));
     f.render_widget(paragraph, area);
 }

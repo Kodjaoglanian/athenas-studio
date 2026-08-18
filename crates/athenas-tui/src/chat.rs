@@ -6,6 +6,28 @@ pub struct ChatMessage {
     pub reasoning: String,
     /// Whether the reasoning section is expanded or collapsed
     pub reasoning_expanded: bool,
+    /// Unix timestamp (seconds) when the message was created
+    pub timestamp: u64,
+}
+
+impl ChatMessage {
+    /// Format the timestamp as HH:MM
+    pub fn time_str(&self) -> String {
+        if self.timestamp == 0 {
+            return String::new();
+        }
+        let secs = self.timestamp;
+        let h = (secs / 3600) % 24;
+        let m = (secs / 60) % 60;
+        format!("{:02}:{:02}", h, m)
+    }
+}
+
+fn now_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub struct ChatState {
@@ -42,6 +64,7 @@ impl Default for ChatState {
                 content: "Welcome to Athenas Studio!\n\n  F1: Chat | F2: Models | F3: Browser | F4: Settings\n  Type /help for commands. Press Ctrl+C to quit.".to_string(),
                 reasoning: String::new(),
                 reasoning_expanded: false,
+                timestamp: now_timestamp(),
             }],
             input_text: String::new(),
             scroll: 0,
@@ -69,6 +92,7 @@ impl ChatState {
             content: content.to_string(),
             reasoning: String::new(),
             reasoning_expanded: false,
+            timestamp: now_timestamp(),
         });
     }
 
@@ -78,6 +102,7 @@ impl ChatState {
             content: content.to_string(),
             reasoning: reasoning.to_string(),
             reasoning_expanded: false,
+            timestamp: now_timestamp(),
         });
     }
 
@@ -112,6 +137,7 @@ impl ChatState {
                 content,
                 reasoning: self.streaming_reasoning.clone(),
                 reasoning_expanded: false,
+                timestamp: now_timestamp(),
             });
             self.streaming_text.clear();
             self.streaming_reasoning.clear();
