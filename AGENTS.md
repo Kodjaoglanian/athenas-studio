@@ -48,6 +48,10 @@ Cargo workspace with 6 crates:
 | `crates/athenas-tui/src/server_manager.rs` | Detached server process management (start/stop/check_running) |
 | `crates/athenas-tui/src/settings.rs` | SettingsState — F5 settings page state |
 | `crates/athenas-tui/src/server_panel.rs` | ServerPanelState — F4 server panel state |
+| `crates/athenas-tui/src/chat.rs` | ChatState, ChatMessage — chat data structures (messages, streaming, system prompt) |
+| `crates/athenas-tui/src/markdown.rs` | Markdown renderer — converts markdown to styled ratatui Lines (headers, bold, code blocks, lists, etc.) |
+| `crates/athenas-tui/src/components.rs` | Rendering — chat area, status bar, model list, server panel, settings, logs |
+| `crates/athenas-server/src/semantic_cache.rs` | SemanticCache — cosine similarity cache with TTL, LRU eviction, disk persistence |
 | `crates/athenas-cli/src/commands/serve.rs` | `athenas serve` command — loads model and starts API server |
 
 ## Important Patterns
@@ -113,6 +117,33 @@ Available RAM is stale at startup. The server panel re-reads it every 5s
 while the tab is open via `poll_mem_refresh()` (spawn_blocking → `detect_memory_mb`).
 Use `HardwareInfo::refresh_memory()` or `detect_memory_mb()` for fresh data;
 pre-flight checks in `start_server()` read memory before the estimate verdict.
+
+### Chat Generation & Cancellation
+
+Chat generation runs in a `tokio::spawn` background task. The TUI polls
+chunks via `poll_chat_stream()` every 100ms (non-blocking `try_recv()`).
+
+Cancellation uses `tokio::sync::watch::channel(false)`. The background task
+wraps the stream in `tokio::select!` with `cancel_rx.changed()`. When the
+user presses Esc, `cancel_generation()` sends `true` via the watch sender.
+
+**Critical:** After creating the watch channel, call `borrow_and_update()`
+to mark the initial value as seen. Without this, `changed()` fires
+immediately and cancels the stream before it starts (was a bug in v0.8.5).
+
+### Markdown Rendering
+
+Assistant messages are rendered with markdown (`markdown.rs`). User and
+system messages stay as plain text. During streaming, text renders as
+plain text (avoids flickering from incomplete markdown) and markdown is
+applied when the message finalizes via `finalize_streaming()`.
+
+### Semantic Cache
+
+The server-side semantic cache (`semantic_cache.rs`) caches chat completion
+responses based on embedding similarity. It uses cosine similarity, TTL,
+and LRU eviction with disk persistence to `~/.athenas/cache/`. Disabled
+by default; enable via `[server.semantic_cache]` in config.toml.
 
 ## Release Process
 

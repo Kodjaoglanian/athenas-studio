@@ -21,6 +21,12 @@
 ## Features
 
 - **TUI Interface** — Interactive chat with streaming, model selection, real-time stats, and server management
+- **Markdown Rendering** — Assistant messages render with markdown formatting (headers, bold, italic, code blocks, lists, blockquotes, links)
+- **Multi-line Input** — Write multi-line prompts with Shift+Enter for newlines, Enter to send
+- **System Prompt** — Set custom system prompts per conversation via `/system` command
+- **Cancel Generation** — Press Esc to cancel ongoing generation and save resources
+- **Chat Shortcuts** — PageUp/PageDown/Home/End for fast navigation, Tab to toggle reasoning
+- **Semantic Cache** — Server-side response caching based on semantic similarity (cosine similarity + TTL + LRU eviction), reducing token usage and latency for repeated queries
 - **Multi-Model Management** — Load, unload, and switch between multiple models simultaneously in the TUI server panel
 - **Multimodal Model Support** — Automatic mmproj (multimodal projector) detection and download for vision models (llama.cpp)
 - **CLI Commands** — Full command-line interface for scripting and automation
@@ -147,6 +153,42 @@ The settings page lets you configure all inference parameters:
 - **Flash Attention, Streaming, Reasoning** — Feature toggles
 
 All changes are saved to `~/.athenas/config.toml` and applied immediately.
+
+#### TUI Chat (F1)
+
+The chat tab provides an interactive conversation interface with the loaded model:
+
+**Keyboard shortcuts:**
+| Key | Action |
+|-----|--------|
+| Enter | Send message |
+| Shift+Enter | Insert newline (multi-line input) |
+| Esc | Cancel ongoing generation |
+| Tab | Toggle reasoning/thinking section |
+| Up/Down | Scroll chat (single-line input) / navigate input (multi-line) |
+| Ctrl+Up/Down | Always scroll chat |
+| PageUp/PageDown | Jump 20 lines |
+| Home/End | Jump to top/bottom |
+
+**Chat commands:**
+| Command | Description |
+|---------|-------------|
+| `/system <prompt>` | Set a custom system prompt for the model |
+| `/system` | Show current system prompt |
+| `/system clear` | Remove system prompt |
+| `/clear` | Clear all messages |
+| `/unload` | Unload the current model from memory |
+| `/model` or `/models` | Switch to model list (F2) |
+| `/browser` | Switch to HuggingFace browser (F3) |
+| `/server` | Switch to server panel (F4) |
+| `/settings` | Switch to settings (F5) |
+| `/logs` | Switch to logs (F6) |
+| `/help` | Show all commands |
+| `/quit` | Show quit instructions (Ctrl+C) |
+
+**Markdown rendering:** Assistant messages are rendered with markdown formatting — headers, bold, italic, inline code, code blocks (with language label), lists, blockquotes, horizontal rules, and links. User and system messages display as plain text.
+
+**Reasoning/thinking:** Models that produce reasoning tokens (Qwen3.5, DeepSeek R1) show a collapsible "Thinking" section. Press Tab to expand/collapse. The section shows a preview when collapsed.
 
 #### TUI Server Panel — Multi-Model Management (F4)
 
@@ -292,6 +334,8 @@ athenas update
 | `/v1/ready` | GET | Kubernetes readiness probe (503 if no model loaded) |
 | `/health` | GET | Alias for `/v1/health` |
 | `/metrics` | GET | Prometheus-compatible metrics (request count, latency, tokens, errors) |
+| `/v1/cache/stats` | GET | Semantic cache statistics (hits, misses, evictions, entries) |
+| `/v1/cache/clear` | POST | Clear the semantic cache |
 
 ### Multi-Model API
 
@@ -455,6 +499,12 @@ enabled = false                 # enable OpenTelemetry distributed tracing
 # endpoint = "http://localhost:4317"  # OTLP endpoint
 service_name = "athenas-studio" # service name for traces
 sample_ratio = 1.0              # sampling ratio 0.0-1.0
+
+[server.semantic_cache]
+enabled = false                 # enable semantic caching for chat completions
+similarity_threshold = 0.85     # cosine similarity threshold (0.0-1.0, higher = stricter matching)
+ttl_secs = 3600                 # cache entry time-to-live in seconds (1 hour default)
+max_entries = 1000              # maximum cache entries (LRU eviction when exceeded)
 
 [huggingface]
 # token = "hf_xxxxx"            # for gated models
