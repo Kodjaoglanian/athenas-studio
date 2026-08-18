@@ -19,11 +19,13 @@ pub fn render_chat_area(
     is_loading_model: bool,
     loading_spinner: usize,
 ) {
+    // Input area: 3 lines when empty (border + 1 line), grows if user types multiline
+    let input_height = chat_input.lines().len().max(1) as u16 + 2; // +2 for borders
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(input_height.min(8)), // cap at 8 lines
             Constraint::Length(1),
         ])
         .split(area);
@@ -46,12 +48,14 @@ fn render_messages(
     let reasoning_width = area.width.saturating_sub(6) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
+    let sep_width = (area.width.saturating_sub(4)) as usize;
+    let separator: String = format!("  {}", "─".repeat(sep_width));
 
     for (idx, msg) in state.messages.iter().enumerate() {
         // Separator line between messages (not before the first one)
         if idx > 0 {
             lines.push(Line::styled(
-                "  ────────────────────────────────────────────────────────────────".to_string(),
+                separator.clone(),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -191,7 +195,7 @@ fn render_messages(
         // Separator before streaming response
         if !state.messages.is_empty() {
             lines.push(Line::styled(
-                "  ────────────────────────────────────────────────────────────────".to_string(),
+                separator.clone(),
                 Style::default().fg(Color::DarkGray),
             ));
         }
@@ -450,25 +454,38 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     result
 }
 
+/// Extract just the filename from a model path.
+/// e.g. "/root/.athenas/models/Foo/Bar-Q4_K_M.gguf" → "Bar-Q4_K_M"
+fn short_model_name(path: &str) -> String {
+    // Get filename
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    // Strip common extensions
+    let name = filename
+        .strip_suffix(".gguf")
+        .or_else(|| filename.strip_suffix(".safetensors"))
+        .unwrap_or(filename);
+    name.to_string()
+}
+
 fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     let sep = Span::styled(" │ ".to_string(), Style::default().fg(Color::DarkGray));
     let mut parts: Vec<Span> = Vec::new();
 
-    // Model info
+    // Model info — show short name, not full path
     if let Some(ref model) = state.current_model {
         parts.push(Span::styled(
             "◆ ".to_string(),
             Style::default().fg(Color::Cyan),
         ));
         parts.push(Span::styled(
-            model.clone(),
+            short_model_name(model),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
     } else {
         parts.push(Span::styled(
-            "◆ No model loaded".to_string(),
+            "◆ No model".to_string(),
             Style::default().fg(Color::Red),
         ));
     }
@@ -482,7 +499,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
         ));
     }
 
-    // GPU info
+    // GPU info — compact format
     if !state.gpu_info.is_empty() {
         let layers_str = if state.gpu_layers < 0 {
             "all".to_string()
@@ -498,7 +515,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
         ));
     } else if state.gpu_layers == 0 {
         parts.push(sep.clone());
-        parts.push(Span::styled("CPU mode", Style::default().fg(Color::Yellow)));
+        parts.push(Span::styled("CPU", Style::default().fg(Color::Yellow)));
     }
 
     // tok/s
@@ -514,20 +531,34 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     if !state.system_prompt.is_empty() {
         parts.push(sep.clone());
         parts.push(Span::styled(
-            "✦ system prompt".to_string(),
+            "✦ sys".to_string(),
             Style::default().fg(Color::Magenta),
         ));
     }
 
-    // Right-aligned shortcuts
-    let shortcuts =
-        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab: Thinking │ Esc: Cancel │ Ctrl+C: Quit";
+    // Calculate widths for right-aligned shortcuts
     let left_len: usize = parts.iter().map(|s| s.content.chars().count()).sum();
     let sep_len = 3; // " │ "
     let total_left = left_len + (parts.len().saturating_sub(1)) * sep_len;
     let available = area.width as usize;
-    let padding = available.saturating_sub(total_left + shortcuts.chars().count() + 2);
 
+    // Shorter shortcuts that fit on narrow terminals
+    let shortcuts_full =
+        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab: Thinking │ Esc: Cancel │ Ctrl+C: Quit";
+    let shortcuts_mid =
+        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab │ Esc │ Ctrl+C";
+    let shortcuts_min = "Enter │ Shift+Enter │ PgUp/PgDn │ Tab │ Esc │ Ctrl+C";
+
+    let remaining = available.saturating_sub(total_left + 2);
+    let (shortcuts, sc_len) = if remaining >= shortcuts_full.chars().count() {
+        (shortcuts_full, shortcuts_full.chars().count())
+    } else if remaining >= shortcuts_mid.chars().count() {
+        (shortcuts_mid, shortcuts_mid.chars().count())
+    } else {
+        (shortcuts_min, shortcuts_min.chars().count())
+    };
+
+    let padding = available.saturating_sub(total_left + sc_len + 2);
     parts.push(Span::raw(" ".repeat(padding)));
     parts.push(Span::styled(
         shortcuts.to_string(),

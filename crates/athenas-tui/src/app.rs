@@ -151,7 +151,7 @@ impl TuiApp {
                 ta.set_block(
                     ratatui::widgets::Block::default()
                         .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input (Enter to send, Shift+Enter for newline) ")
+                        .title(" Input ")
                         .border_style(
                             ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
                         ),
@@ -1207,7 +1207,7 @@ impl TuiApp {
         self.chat_input.set_block(
             ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter to send, Shift+Enter for newline) ")
+                .title(" Input ")
                 .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
         );
         self.chat_state.is_generating = true;
@@ -1542,7 +1542,7 @@ impl TuiApp {
         self.chat_input.set_block(
             ratatui::widgets::Block::default()
                 .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input (Enter to send, Shift+Enter for newline) ")
+                .title(" Input ")
                 .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
         );
     }
