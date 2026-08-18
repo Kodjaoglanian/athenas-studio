@@ -2139,6 +2139,8 @@ impl TuiApp {
                 self.chat_state.current_backend = Some(state.backend);
                 // Fetch loaded models list from the detached server
                 self.refresh_remote_loaded_models().await;
+                // Auto-load API keys so auth works for subsequent requests
+                self.refresh_api_keys().await;
             }
             Ok(None) => {
                 // No running server found
@@ -2194,6 +2196,9 @@ impl TuiApp {
 
                 self.server_handle = Some(server_handle);
                 self.log(&format!("Server started on {}:{}", host, port));
+
+                // Auto-load API keys so auth works for subsequent requests
+                self.refresh_api_keys().await;
 
                 // Update chat state to show server model is available
                 if self.backend.is_none() {
