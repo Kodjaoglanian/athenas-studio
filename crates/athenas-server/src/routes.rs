@@ -288,13 +288,19 @@ async fn check_auth_for_key_mgmt(
             return true;
         }
     }
-    check_auth_any(headers, state).await
+    check_auth_any(headers, state, client_ip).await
 }
 
 /// Check auth for model management endpoints (load/unload/set default).
-/// Allows access without auth when no keys are configured at all.
+/// Allows access without auth when:
+/// - No keys are configured at all (bootstrap mode)
+/// - Request comes from localhost (TUI admin)
 /// Otherwise requires a valid multi-tenant key.
-async fn check_auth_any(headers: &HeaderMap, state: &AppState) -> bool {
+async fn check_auth_any(
+    headers: &HeaderMap,
+    state: &AppState,
+    client_ip: Option<std::net::IpAddr>,
+) -> bool {
     // If no key manager, allow all
     if state.api_key_manager.is_none() {
         return true;
@@ -304,6 +310,13 @@ async fn check_auth_any(headers: &HeaderMap, state: &AppState) -> bool {
     if let Some(ref mgr_arc) = state.api_key_manager {
         let mgr = mgr_arc.lock().await;
         if mgr.list_keys().is_empty() {
+            return true;
+        }
+    }
+
+    // Localhost (TUI) can always manage models — admin access
+    if let Some(ip) = client_ip {
+        if ip.is_loopback() {
             return true;
         }
     }
@@ -480,8 +493,12 @@ async fn metrics_endpoint() -> impl IntoResponse {
     )
 }
 
-async fn list_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+async fn list_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1466,7 +1483,7 @@ async fn upload_file(
     headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1563,7 +1580,7 @@ async fn transcribe_audio(
     headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1779,9 +1796,10 @@ struct LoadModelRequest {
 async fn load_model_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1877,9 +1895,10 @@ struct UnloadModelRequest {
 async fn unload_model_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<UnloadModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1910,9 +1929,10 @@ struct SetDefaultModelRequest {
 async fn set_default_model_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1946,7 +1966,7 @@ async fn create_session(
     headers: HeaderMap,
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1983,7 +2003,7 @@ async fn create_session(
 }
 
 async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2002,7 +2022,7 @@ async fn get_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2034,7 +2054,7 @@ async fn delete_session(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2055,7 +2075,7 @@ async fn get_session_messages(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2105,7 +2125,7 @@ async fn set_session_system_prompt(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<SetSystemPromptRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2124,7 +2144,7 @@ async fn set_session_system_prompt(
 }
 
 async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2142,7 +2162,7 @@ async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMa
 // ── Slot management endpoints ────────────────────────────────────────
 
 async fn list_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2175,7 +2195,7 @@ async fn save_slot(
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2208,7 +2228,7 @@ async fn restore_slot(
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2240,7 +2260,7 @@ async fn erase_slot(
     headers: HeaderMap,
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3123,7 +3143,7 @@ async fn create_alias(
     headers: HeaderMap,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3139,7 +3159,7 @@ async fn create_alias(
 }
 
 async fn list_aliases(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3170,7 +3190,7 @@ async fn create_chain(
     headers: HeaderMap,
     Json(req): Json<CreateChainRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3196,7 +3216,7 @@ async fn create_chain(
 }
 
 async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3211,7 +3231,7 @@ async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Respo
 }
 
 async fn routing_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3280,7 +3300,7 @@ async fn query_audit_logs(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3300,7 +3320,7 @@ async fn query_audit_logs(
 }
 
 async fn audit_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3329,7 +3349,7 @@ async fn vs_add_document(
     headers: HeaderMap,
     Json(req): Json<VsAddRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3367,7 +3387,7 @@ async fn vs_add_batch(
     headers: HeaderMap,
     Json(req): Json<VsAddBatchRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3411,7 +3431,7 @@ async fn vs_search(
     headers: HeaderMap,
     Json(req): Json<VsSearchRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3432,7 +3452,7 @@ async fn vs_search(
 }
 
 async fn vs_list_documents(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3456,7 +3476,7 @@ async fn vs_get_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3480,7 +3500,7 @@ async fn vs_delete_document(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3501,7 +3521,7 @@ async fn vs_delete_document(
 }
 
 async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3515,7 +3535,7 @@ async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response
 }
 
 async fn vs_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state).await {
+    if !check_auth_any(&headers, &state, None).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
