@@ -521,7 +521,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
 
     // Right-aligned shortcuts
     let shortcuts =
-        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab: Thinking │ Ctrl+C: Quit";
+        "Enter: Send │ Shift+Enter: Newline │ PgUp/PgDn: Scroll │ Tab: Thinking │ Esc: Cancel │ Ctrl+C: Quit";
     let left_len: usize = parts.iter().map(|s| s.content.chars().count()).sum();
     let sep_len = 3; // " │ "
     let total_left = left_len + (parts.len().saturating_sub(1)) * sep_len;

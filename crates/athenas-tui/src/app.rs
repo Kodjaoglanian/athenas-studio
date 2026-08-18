@@ -103,6 +103,9 @@ pub struct TuiApp {
     server_log_tailer: Option<tokio::task::JoinHandle<()>>,
     // Background chat streaming state
     chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
+    // Cancellation token for the current chat generation.
+    // Sending `true` signals the background stream task to abort.
+    chat_cancel: Option<tokio::sync::watch::Sender<bool>>,
     // API Key management modal
     api_key_modal: crate::api_key_modal::ApiKeyModalState,
     // Periodic system memory refresh (keeps the server panel's
@@ -176,6 +179,7 @@ impl TuiApp {
             logs_state: crate::log_buffer::LogsState::new(log_buffer),
             server_log_tailer: Some(log_tailer),
             chat_stream_rx: None,
+            chat_cancel: None,
             api_key_modal: crate::api_key_modal::ApiKeyModalState::new(),
             mem_refresh_task: None,
             // Start stale so the first server-tab visit refreshes immediately
@@ -644,6 +648,10 @@ impl TuiApp {
                 self.chat_state.auto_scroll = true;
                 self.chat_state.scroll = 0;
             }
+            // Esc cancels ongoing generation
+            KeyCode::Esc if self.chat_state.is_generating => {
+                self.cancel_generation();
+            }
             // All other keys go to the textarea
             _ => {
                 self.chat_input.input(tui_textarea::Input::from(key));
@@ -701,6 +709,7 @@ impl TuiApp {
                     self.chat_state.current_backend = None;
                     // Stop any ongoing stream
                     self.chat_stream_rx = None;
+                    self.chat_cancel = None;
                     self.log(&format!(
                         "Model '{}' [{}] unloaded from memory",
                         name, backend_name
@@ -1280,44 +1289,96 @@ impl TuiApp {
         if !self.config.inference.streaming_enabled {
             // Non-streaming: spawn chat() in background, show result when done
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+            let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
-                match backend.chat(req).await {
-                    Ok(resp) => {
-                        let _ = tx
-                            .send(StreamChunk {
-                                text: resp.message.content.as_text(),
-                                done: false,
-                                is_reasoning: false,
-                                stats: None,
-                            })
-                            .await;
-                        let _ = tx
-                            .send(StreamChunk {
-                                text: String::new(),
-                                done: true,
-                                is_reasoning: false,
-                                stats: Some(resp.stats),
-                            })
-                            .await;
+                tokio::select! {
+                    result = backend.chat(req) => {
+                        match result {
+                            Ok(resp) => {
+                                let _ = tx
+                                    .send(StreamChunk {
+                                        text: resp.message.content.as_text(),
+                                        done: false,
+                                        is_reasoning: false,
+                                        stats: None,
+                                    })
+                                    .await;
+                                let _ = tx
+                                    .send(StreamChunk {
+                                        text: String::new(),
+                                        done: true,
+                                        is_reasoning: false,
+                                        stats: Some(resp.stats),
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::error!("Chat error: {}", e);
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!("Chat error: {}", e);
+                    _ = cancel_rx.changed() => {
+                        tracing::info!("Chat request cancelled by user");
                     }
                 }
             });
             self.chat_stream_rx = Some(rx);
+            self.chat_cancel = Some(cancel_tx);
             return;
         }
 
         // Start streaming in background — store receiver for polling
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            if let Err(e) = backend.chat_stream(req, tx).await {
-                tracing::error!("Chat stream error: {}", e);
+            // Wrap the stream in a select! so we can abort when cancel is signaled
+            tokio::select! {
+                result = backend.chat_stream(req, tx) => {
+                    if let Err(e) = result {
+                        tracing::error!("Chat stream error: {}", e);
+                    }
+                }
+                _ = cancel_rx.changed() => {
+                    tracing::info!("Chat stream cancelled by user");
+                }
             }
         });
 
         self.chat_stream_rx = Some(rx);
+        self.chat_cancel = Some(cancel_tx);
+    }
+
+    /// Cancel the ongoing chat generation.
+    /// Sends the cancel signal, finalizes whatever was generated so far,
+    /// and cleans up the stream receiver.
+    fn cancel_generation(&mut self) {
+        // Send cancel signal to the background task
+        if let Some(cancel_tx) = &self.chat_cancel {
+            let _ = cancel_tx.send(true);
+        }
+        self.chat_cancel = None;
+
+        // Finalize whatever was generated so far as a partial response
+        let had_content = !self.chat_state.streaming_text.is_empty()
+            || !self.chat_state.streaming_reasoning.is_empty();
+        self.chat_state.finalize_streaming();
+
+        // If nothing was generated, add a system message
+        if !had_content {
+            self.chat_state
+                .add_message("system", "Generation cancelled.");
+        } else {
+            // Append a note that this was cancelled
+            if let Some(last) = self.chat_state.messages.last_mut() {
+                if last.role == "assistant" {
+                    last.content
+                        .push_str("\n\n_⚠ Generation cancelled by user._");
+                }
+            }
+        }
+
+        // Drop the stream receiver
+        self.chat_stream_rx = None;
     }
 
     async fn poll_chat_stream(&mut self) {
@@ -1339,6 +1400,7 @@ impl TuiApp {
                 );
                 self.chat_state.finalize_streaming();
                 self.chat_stream_rx = None;
+                self.chat_cancel = None;
                 return;
             }
         }
@@ -1352,6 +1414,7 @@ impl TuiApp {
                     }
                     self.chat_state.finalize_streaming();
                     self.chat_stream_rx = None;
+                    self.chat_cancel = None;
                     return;
                 } else {
                     if chunk.is_reasoning {
@@ -1372,6 +1435,7 @@ impl TuiApp {
                     self.chat_state.finalize_streaming();
                 }
                 self.chat_stream_rx = None;
+                self.chat_cancel = None;
             }
         }
     }
@@ -1432,6 +1496,7 @@ impl TuiApp {
                      /system <prompt> — set system prompt for the model\n\
                      /system — show current system prompt\n\
                      /system clear — remove system prompt\n\
+                     Esc — cancel ongoing generation\n\
                      F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | F6: Logs | Ctrl+C: Quit",
                 );
             }
