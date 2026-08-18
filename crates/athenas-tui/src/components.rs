@@ -105,9 +105,17 @@ fn render_messages(
             }
         }
 
-        for line in msg.content.lines() {
-            for wrapped in wrap_text(line, content_width) {
-                lines.push(Line::from(format!("  {}", wrapped)));
+        // Render message content
+        if msg.role == "assistant" {
+            // Assistant messages get markdown rendering
+            let md_lines = crate::markdown::render_markdown(&msg.content, content_width);
+            lines.extend(md_lines);
+        } else {
+            // User and system messages stay as plain text
+            for line in msg.content.lines() {
+                for wrapped in wrap_text(line, content_width) {
+                    lines.push(Line::from(format!("  {}", wrapped)));
+                }
             }
         }
         lines.push(Line::from(""));
@@ -187,6 +195,11 @@ fn render_messages(
                     lines.push(Line::from(format!("  {}", wrapped)));
                 }
             }
+            // Note: full markdown rendering during streaming would cause
+            // flickering as the parser re-parses incomplete markdown.
+            // We render as plain text during streaming and apply markdown
+            // when the message is finalized.
+
             // Show live elapsed + tok/s during streaming
             if elapsed > 2 {
                 let info = if let Some(tps) = state.tokens_per_second {
