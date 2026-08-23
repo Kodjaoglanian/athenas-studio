@@ -110,6 +110,12 @@ impl LlamaCppBackend {
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
         let server_bin = if let Some(path) = self.find_llama_server() {
+            // Managed ~/.athenas installs: always re-check the preferred GPU
+            // variant (e.g. switch from broken Windows HIP to Vulkan).
+            if path.contains(".athenas") {
+                let ensured = crate::backend_setup::ensure_llama_server().await?;
+                ensured.to_string_lossy().to_string()
+            } else {
             // Validate: check for shared libs next to the binary on Linux/macOS
             let p = std::path::Path::new(&path);
             if let Some(parent) = p.parent() {
@@ -178,6 +184,7 @@ impl LlamaCppBackend {
             } else {
                 path
             }
+            }
         } else {
             info!("llama-server not found, auto-downloading...");
             let path = crate::backend_setup::ensure_llama_server().await?;
@@ -239,13 +246,15 @@ impl LlamaCppBackend {
                         athenas_core::GpuRuntime::Cpu
                     }
                 } else {
-                    // Windows and others: prefer CUDA > ROCm > Vulkan > CPU
+                    // Windows and others: prefer CUDA > Vulkan > ROCm > CPU.
+                    // Vulkan before ROCm: consumer AMD GPUs on Windows typically
+                    // work with Vulkan, while HIP builds often list no devices.
                     if self.hardware.has_cuda {
                         athenas_core::GpuRuntime::Cuda
-                    } else if self.hardware.has_rocm {
-                        athenas_core::GpuRuntime::Rocm
                     } else if self.hardware.has_vulkan {
                         athenas_core::GpuRuntime::Vulkan
+                    } else if self.hardware.has_rocm {
+                        athenas_core::GpuRuntime::Rocm
                     } else {
                         athenas_core::GpuRuntime::Cpu
                     }

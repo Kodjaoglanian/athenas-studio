@@ -18,7 +18,8 @@ const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 ///
 /// Priority order on Windows:
 /// - NVIDIA: CUDA
-/// - AMD (dedicated): ROCm/HIP (versioned `bin-win-rocm-*`, Vulkan fallback)
+/// - AMD (dedicated): Vulkan (HIP/ROCm Windows builds often expose no devices
+///   on consumer Radeon GPUs; Vulkan is the reliable path)
 /// - AMD (APU): Vulkan
 /// - Vulkan fallback
 /// - CPU-only
@@ -107,11 +108,22 @@ async fn platform_asset_name() -> Option<String> {
                 return Some("bin-win-cuda-12.4-x64.zip".to_string());
             }
             if has_amd && !is_amd_apu() {
-                // Dedicated AMD GPU — use Windows ROCm/HIP binary.
-                // llama.cpp renamed bin-win-hip-radeon-x64.zip to a
-                // versioned ROCm asset (e.g. bin-win-rocm-7.14-x64.zip).
-                // Prefix match resolves the current toolchain version.
-                info!("Dedicated AMD GPU detected, using ROCm/HIP binary for GPU acceleration");
+                // Dedicated AMD GPU on Windows: prefer Vulkan.
+                // Official llama.cpp HIP/ROCm Windows zips frequently report
+                // "Available devices: (none)" on consumer Radeon cards
+                // (e.g. RX 6000/7000), which forces silent CPU inference.
+                if has_vulkan {
+                    info!(
+                        "Dedicated AMD GPU detected, using Vulkan binary for GPU acceleration \
+                         (HIP/ROCm Windows builds often see no devices on consumer GPUs)"
+                    );
+                    return Some("bin-win-vulkan-x64.zip".to_string());
+                }
+                // No Vulkan ICD — try versioned ROCm/HIP as last GPU option
+                info!(
+                    "Dedicated AMD GPU without Vulkan, trying ROCm/HIP binary \
+                     (may still fall back to CPU if no HIP devices are present)"
+                );
                 return Some("bin-win-rocm-".to_string());
             }
             if has_amd && is_amd_apu() && has_vulkan {
@@ -880,7 +892,8 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
 
     // Resolve the concrete asset. Versioned backends (ROCm) use a prefix
     // pattern; exact names (CUDA/Vulkan/CPU) resolve unchanged.
-    // On Windows AMD, fall back to Vulkan if no ROCm build is published.
+    // If a preferred ROCm prefix is still selected (no Vulkan), keep Vulkan
+    // as a secondary candidate when available.
     let mut candidates = vec![desired_asset_suffix.clone()];
     if desired_asset_suffix.starts_with("bin-win-rocm-") {
         candidates.push("bin-win-vulkan-x64.zip".to_string());
