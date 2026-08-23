@@ -569,7 +569,7 @@ file_logging = false
 | Linux + Intel | Yes | `bin-ubuntu-vulkan-x64.tar.gz` |
 | Linux | None | `bin-ubuntu-x64.tar.gz` (CPU-only) |
 | Windows + NVIDIA | Yes | `bin-win-cuda-12.4-x64.zip` |
-| Windows + AMD | Yes | `bin-win-rocm-*.zip` (Vulkan fallback) |
+| Windows + AMD | Yes | `bin-win-vulkan-x64.zip` (ROCm fallback) |
 | macOS | Apple Silicon | Metal (built into all macOS binaries) |
 
 **Note:** On Linux, there is no CUDA prebuilt binary from llama.cpp. We use Vulkan instead, which works with all GPU vendors. Performance is comparable to CUDA for inference.
