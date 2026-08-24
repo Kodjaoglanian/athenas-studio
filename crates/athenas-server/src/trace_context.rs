@@ -4,18 +4,12 @@
 //! requests and creates a server span linked to the caller's trace.
 //! This enables Autopsy's dependency topology to infer service-to-service
 //! edges when an instrumented client calls the Athenas API.
-//!
-//! Uses the OpenTelemetry API directly (not tracing-opentelemetry) to
-//! create the span, because `tracing-opentelemetry`'s `set_parent()`
-//! does not update the `trace_id` that was already assigned in
-//! `on_new_span`. By calling `tracer.start_with_context()` directly,
-//! we guarantee the span inherits the remote trace_id and parent_span_id.
 
 use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
 use opentelemetry::{
     propagation::Extractor,
-    trace::{Span, TraceContextExt, Tracer},
-    KeyValue,
+    trace::{Span, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer},
+    Context, KeyValue,
 };
 
 /// Adapter so opentelemetry's propagator can read from axum HeaderMap.
@@ -31,49 +25,70 @@ impl<'a> Extractor for HeaderExtractor<'a> {
     }
 }
 
+/// Manually parse a W3C traceparent header into a SpanContext.
+///
+/// The opentelemetry_sdk 0.27 TraceContextPropagator rejects trace_flags > 2
+/// for version 0, but the Python OTEL SDK sends flags=03. We parse manually
+/// to be permissive.
+fn parse_traceparent(header: &str) -> Option<SpanContext> {
+    let parts: Vec<&str> = header.trim().split('-').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let version = u8::from_str_radix(parts[0], 16).ok()?;
+    if version > 2 {
+        return None;
+    }
+
+    let trace_id = TraceId::from_hex(parts[1]).ok()?;
+    let span_id = SpanId::from_hex(parts[2]).ok()?;
+
+    // Parse trace flags — accept any value, mask to SAMPLED bit
+    let opts = u8::from_str_radix(parts[3], 16).ok()?;
+    let trace_flags = TraceFlags::new(opts) & TraceFlags::SAMPLED;
+
+    let span_context =
+        SpanContext::new(trace_id, span_id, trace_flags, true, TraceState::default());
+    if span_context.is_valid() {
+        Some(span_context)
+    } else {
+        None
+    }
+}
+
 /// Middleware that extracts W3C trace context from incoming request headers
 /// and creates a server span as a child of the caller's trace.
-///
-/// When a client instrumented with OpenTelemetry sends a request with a
-/// `traceparent` header, this middleware:
-/// 1. Extracts the remote span context from the headers
-/// 2. Creates a server span (`http.server.handle`) with the remote context
-///    as parent — inheriting the caller's trace_id and parent_span_id
-/// 3. Exports the span when the request completes
-///
-/// This enables Autopsy's dependency topology to infer the edge
-/// `client-service → athenas-studio`.
 pub async fn trace_context_middleware(req: Request, next: Next) -> Response {
-    // Extract the remote context from W3C traceparent/tracestate headers
-    let remote_context = opentelemetry::global::get_text_map_propagator(|propagator| {
-        propagator.extract(&HeaderExtractor(req.headers()))
-    });
-
-    // Debug: log what we extracted
-    let has_parent = remote_context.has_active_span();
-    if has_parent {
-        let parent_span = remote_context.span();
-        let span_ctx = parent_span.span_context();
-        eprintln!(
-            "trace_context: extracted parent trace_id={}, span_id={}",
-            span_ctx.trace_id(),
-            span_ctx.span_id(),
-        );
+    // Try manual parse of traceparent first (permissive), then fall back
+    // to the global propagator (for tracestate, baggage, etc.)
+    let remote_context = if let Some(tp) = req
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(span_context) = parse_traceparent(tp) {
+            eprintln!(
+                "trace_context: extracted parent trace_id={}, span_id={}",
+                span_context.trace_id(),
+                span_context.span_id(),
+            );
+            Context::current().with_remote_span_context(span_context)
+        } else {
+            eprintln!("trace_context: failed to parse traceparent={:?}", tp);
+            Context::current()
+        }
     } else {
-        eprintln!(
-            "trace_context: no parent found in headers — traceparent={:?}",
-            req.headers()
-                .get("traceparent")
-                .and_then(|v| v.to_str().ok())
-        );
-    }
+        // Fall back to global propagator (handles tracestate, baggage)
+        opentelemetry::global::get_text_map_propagator(|propagator| {
+            propagator.extract(&HeaderExtractor(req.headers()))
+        })
+    };
 
     let method = req.method().to_string();
     let route = req.uri().path().to_string();
 
     // Create a server span directly via the OTEL API.
-    // start_with_context uses the remote parent's trace_id and span_id,
-    // which is exactly what Autopsy needs to infer the dependency edge.
     let tracer = opentelemetry::global::tracer("athenas-server");
     let mut span = tracer.start_with_context("http.server.handle", &remote_context);
     span.set_attribute(KeyValue::new("http.method", method));
@@ -90,7 +105,6 @@ pub async fn trace_context_middleware(req: Request, next: Next) -> Response {
         span.set_attribute(KeyValue::new("error", true));
     }
 
-    // End the span — this queues it for batch export via OTLP
     span.end();
 
     response
