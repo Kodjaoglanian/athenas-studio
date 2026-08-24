@@ -26,8 +26,8 @@ hyper = "1.0"
 base64 = "0.22"
 reqwest = { workspace = true }
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
-opentelemetry-semantic-conventions = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "logs", "metrics"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic", "logs", "metrics"] }
+opentelemetry-appender-tracing = "0.27"
 tracing-opentelemetry = "0.28"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

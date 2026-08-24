@@ -89,6 +89,9 @@ pub enum ConfigField {
     OtelEndpoint,
     OtelServiceName,
     OtelSampleRatio,
+    OtelExportLogs,
+    OtelExportMetrics,
+    OtelEnvironment,
     // IP filter
     IpAllowlist,
     IpDenylist,
@@ -144,6 +147,9 @@ impl ConfigField {
             ConfigField::OtelEndpoint,
             ConfigField::OtelServiceName,
             ConfigField::OtelSampleRatio,
+            ConfigField::OtelExportLogs,
+            ConfigField::OtelExportMetrics,
+            ConfigField::OtelEnvironment,
             ConfigField::IpAllowlist,
             ConfigField::IpDenylist,
             ConfigField::StartServer,
@@ -196,6 +202,9 @@ impl ConfigField {
             ConfigField::OtelEndpoint => "OTLP Endpoint",
             ConfigField::OtelServiceName => "OTel Service Name",
             ConfigField::OtelSampleRatio => "OTel Sample Ratio",
+            ConfigField::OtelExportLogs => "OTel Export Logs",
+            ConfigField::OtelExportMetrics => "OTel Export Metrics",
+            ConfigField::OtelEnvironment => "OTel Environment",
             ConfigField::IpAllowlist => "IP Allowlist",
             ConfigField::IpDenylist => "IP Denylist",
             ConfigField::StartServer => "Start Server",
@@ -247,7 +256,10 @@ impl ConfigField {
             ConfigField::OtelEnabled
             | ConfigField::OtelEndpoint
             | ConfigField::OtelServiceName
-            | ConfigField::OtelSampleRatio => "TRACING",
+            | ConfigField::OtelSampleRatio
+            | ConfigField::OtelExportLogs
+            | ConfigField::OtelExportMetrics
+            | ConfigField::OtelEnvironment => "TRACING",
             ConfigField::IpAllowlist | ConfigField::IpDenylist => "SECURITY",
             ConfigField::StartServer
             | ConfigField::StopServer
@@ -283,6 +295,8 @@ impl ConfigField {
                 | ConfigField::AutoResourceLimits
                 | ConfigField::VectorStoreEnabled
                 | ConfigField::OtelEnabled
+                | ConfigField::OtelExportLogs
+                | ConfigField::OtelExportMetrics
         )
     }
 
@@ -396,6 +410,9 @@ pub struct ServerPanelState {
     pub otel_endpoint: String,
     pub otel_service_name: String,
     pub otel_sample_ratio: f64,
+    pub otel_export_logs: bool,
+    pub otel_export_metrics: bool,
+    pub otel_environment: String,
 
     // IP filter
     pub ip_allowlist: String,
@@ -476,6 +493,9 @@ impl ServerPanelState {
             otel_endpoint: config.server.otel.endpoint.clone().unwrap_or_default(),
             otel_service_name: config.server.otel.service_name.clone(),
             otel_sample_ratio: config.server.otel.sample_ratio,
+            otel_export_logs: config.server.otel.export_logs,
+            otel_export_metrics: config.server.otel.export_metrics,
+            otel_environment: config.server.otel.environment.clone().unwrap_or_default(),
             ip_allowlist: config.server.ip_allowlist.join(", "),
             ip_denylist: config.server.ip_denylist.join(", "),
             phase: ServerPhase::Configuring,
@@ -652,6 +672,15 @@ impl ServerPanelState {
             }
             ConfigField::OtelServiceName => self.otel_service_name.clone(),
             ConfigField::OtelSampleRatio => self.otel_sample_ratio.to_string(),
+            ConfigField::OtelExportLogs => on_off(self.otel_export_logs),
+            ConfigField::OtelExportMetrics => on_off(self.otel_export_metrics),
+            ConfigField::OtelEnvironment => {
+                if self.otel_environment.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    self.otel_environment.clone()
+                }
+            }
             ConfigField::IpAllowlist => {
                 if self.ip_allowlist.is_empty() {
                     "(allow all)".to_string()
@@ -759,6 +788,9 @@ impl ServerPanelState {
             ConfigField::OtelEndpoint => "OTLP endpoint (e.g. http://localhost:4317)",
             ConfigField::OtelServiceName => "Service name for traces",
             ConfigField::OtelSampleRatio => "Sampling ratio 0.0-1.0",
+            ConfigField::OtelExportLogs => "Export logs via OTLP (tracing events → OTEL logs)",
+            ConfigField::OtelExportMetrics => "Export metrics via OTLP (request counters, etc.)",
+            ConfigField::OtelEnvironment => "Deployment environment (e.g. production, staging)",
             ConfigField::IpAllowlist => "Comma-separated IPs/CIDRs (empty = allow all)",
             ConfigField::IpDenylist => "Comma-separated IPs/CIDRs to block",
             ConfigField::StartServer => "Loads model and starts the API server",
@@ -787,6 +819,7 @@ impl ServerPanelState {
             ConfigField::DraftMaxTokens => self.draft_max_tokens.to_string(),
             ConfigField::DraftMinCtx => self.draft_min_ctx.to_string(),
             ConfigField::OtelEndpoint => self.otel_endpoint.clone(),
+            ConfigField::OtelEnvironment => self.otel_environment.clone(),
             ConfigField::IpAllowlist => self.ip_allowlist.clone(),
             ConfigField::IpDenylist => self.ip_denylist.clone(),
             // Booleans are toggled, not edited — but keep a sane default.
@@ -1011,6 +1044,9 @@ impl ServerPanelState {
                 }
                 self.otel_sample_ratio = v;
             }
+            ConfigField::OtelEnvironment => {
+                self.otel_environment = value.to_string();
+            }
             ConfigField::IpAllowlist => {
                 self.ip_allowlist = value.to_string();
             }
@@ -1043,6 +1079,10 @@ impl ServerPanelState {
             }
             ConfigField::VectorStoreEnabled => self.vs_enabled = !self.vs_enabled,
             ConfigField::OtelEnabled => self.otel_enabled = !self.otel_enabled,
+            ConfigField::OtelExportLogs => self.otel_export_logs = !self.otel_export_logs,
+            ConfigField::OtelExportMetrics => {
+                self.otel_export_metrics = !self.otel_export_metrics;
+            }
             _ => {}
         }
     }
@@ -1266,6 +1306,13 @@ impl ServerPanelState {
         };
         config.server.otel.service_name = self.otel_service_name.clone();
         config.server.otel.sample_ratio = self.otel_sample_ratio;
+        config.server.otel.export_logs = self.otel_export_logs;
+        config.server.otel.export_metrics = self.otel_export_metrics;
+        config.server.otel.environment = if self.otel_environment.is_empty() {
+            None
+        } else {
+            Some(self.otel_environment.clone())
+        };
         config.server.ip_allowlist = if self.ip_allowlist.is_empty() {
             Vec::new()
         } else {
@@ -1405,6 +1452,7 @@ mod tests {
         assert_eq!(state.edit_value(&ConfigField::IpDenylist), "");
         assert_eq!(state.edit_value(&ConfigField::LoraPaths), "");
         assert_eq!(state.edit_value(&ConfigField::OtelEndpoint), "");
+        assert_eq!(state.edit_value(&ConfigField::OtelEnvironment), "");
         assert_eq!(state.edit_value(&ConfigField::GpuDevice), "");
         // "unlimited" display value must become the raw number
         assert_ne!(

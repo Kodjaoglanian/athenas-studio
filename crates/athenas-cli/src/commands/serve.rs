@@ -22,9 +22,9 @@ pub async fn run(
     let mut config = AppConfig::load()?;
     config.ensure_dirs()?;
 
-    // Initialize OpenTelemetry tracing
+    // Initialize OpenTelemetry tracing, logs, and metrics
     let otel_config = config.server.otel.clone();
-    let _otel_provider = athenas_server::tracing_setup::init_tracing(&otel_config);
+    let otel_guards = athenas_server::tracing_setup::init_tracing(&otel_config);
 
     if let Some(mc) = max_concurrent {
         config.server.max_concurrent_requests = mc;
@@ -198,7 +198,12 @@ pub async fn run(
         );
     }
 
-    server.start(host, port).await
+    let result = server.start(host, port).await;
+
+    // Flush and shut down OpenTelemetry providers
+    athenas_server::tracing_setup::shutdown_tracing(otel_guards);
+
+    result
 }
 
 fn print_startup_banner(

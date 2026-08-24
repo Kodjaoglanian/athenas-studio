@@ -230,7 +230,7 @@ impl Default for VectorStoreServerConfig {
     }
 }
 
-/// Configuration for OpenTelemetry distributed tracing.
+/// Configuration for OpenTelemetry distributed tracing, logs, and metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OtelConfig {
     /// Whether OpenTelemetry tracing is enabled.
@@ -245,6 +245,21 @@ pub struct OtelConfig {
     /// Sampling ratio (0.0 to 1.0).
     #[serde(default = "default_otel_sample_ratio")]
     pub sample_ratio: f64,
+    /// Whether to export logs via OTLP (requires `enabled` + `endpoint`).
+    #[serde(default = "default_true")]
+    pub export_logs: bool,
+    /// Whether to export metrics via OTLP (requires `enabled` + `endpoint`).
+    #[serde(default = "default_true")]
+    pub export_metrics: bool,
+    /// Service namespace (e.g. "production", "staging").
+    #[serde(default)]
+    pub service_namespace: Option<String>,
+    /// Deployment environment name (e.g. "production", "staging", "dev").
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Service instance ID — auto-generated from hostname+PID if not set.
+    #[serde(default)]
+    pub service_instance_id: Option<String>,
 }
 
 fn default_otel_service_name() -> String {
@@ -262,6 +277,11 @@ impl Default for OtelConfig {
             endpoint: None,
             service_name: default_otel_service_name(),
             sample_ratio: default_otel_sample_ratio(),
+            export_logs: true,
+            export_metrics: true,
+            service_namespace: None,
+            environment: None,
+            service_instance_id: None,
         }
     }
 }
