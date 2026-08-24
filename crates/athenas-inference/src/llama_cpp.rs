@@ -116,74 +116,77 @@ impl LlamaCppBackend {
                 let ensured = crate::backend_setup::ensure_llama_server().await?;
                 ensured.to_string_lossy().to_string()
             } else {
-            // Validate: check for shared libs next to the binary on Linux/macOS
-            let p = std::path::Path::new(&path);
-            if let Some(parent) = p.parent() {
-                let needs_lib = std::env::consts::OS == "linux" || std::env::consts::OS == "macos";
-                let has_lib = if std::env::consts::OS == "linux" {
-                    std::fs::read_dir(parent)
-                        .map(|entries| {
-                            entries
-                                .filter_map(|e| e.ok())
-                                .any(|e| e.file_name().to_string_lossy().starts_with("libllama"))
-                        })
-                        .unwrap_or(false)
-                } else if std::env::consts::OS == "macos" {
-                    std::fs::read_dir(parent)
-                        .map(|entries| {
-                            entries
-                                .filter_map(|e| e.ok())
-                                .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
-                        })
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
+                // Validate: check for shared libs next to the binary on Linux/macOS
+                let p = std::path::Path::new(&path);
+                if let Some(parent) = p.parent() {
+                    let needs_lib =
+                        std::env::consts::OS == "linux" || std::env::consts::OS == "macos";
+                    let has_lib = if std::env::consts::OS == "linux" {
+                        std::fs::read_dir(parent)
+                            .map(|entries| {
+                                entries.filter_map(|e| e.ok()).any(|e| {
+                                    e.file_name().to_string_lossy().starts_with("libllama")
+                                })
+                            })
+                            .unwrap_or(false)
+                    } else if std::env::consts::OS == "macos" {
+                        std::fs::read_dir(parent)
+                            .map(|entries| {
+                                entries
+                                    .filter_map(|e| e.ok())
+                                    .any(|e| e.file_name().to_string_lossy().ends_with(".dylib"))
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    };
 
-                // Check if GPU variant is needed but binary is CPU-only
-                let needs_gpu =
-                    config.gpu_layers != 0 && config.gpu_runtime != athenas_core::GpuRuntime::Cpu;
-                let variant_marker = parent.join(".llama-server-variant");
-                let current_variant = std::fs::read_to_string(&variant_marker).unwrap_or_default();
-                // No marker = old install (before v0.7.22) = CPU-only binary
-                let variant_is_cpu = current_variant.trim().is_empty()
-                    || current_variant.contains("bin-ubuntu-x64")
-                    || current_variant.contains("bin-win-cpu");
-                let needs_redownload_for_gpu =
-                    needs_gpu && variant_is_cpu && path.contains(".athenas");
+                    // Check if GPU variant is needed but binary is CPU-only
+                    let needs_gpu = config.gpu_layers != 0
+                        && config.gpu_runtime != athenas_core::GpuRuntime::Cpu;
+                    let variant_marker = parent.join(".llama-server-variant");
+                    let current_variant =
+                        std::fs::read_to_string(&variant_marker).unwrap_or_default();
+                    // No marker = old install (before v0.7.22) = CPU-only binary
+                    let variant_is_cpu = current_variant.trim().is_empty()
+                        || current_variant.contains("bin-ubuntu-x64")
+                        || current_variant.contains("bin-win-cpu");
+                    let needs_redownload_for_gpu =
+                        needs_gpu && variant_is_cpu && path.contains(".athenas");
 
-                if needs_redownload_for_gpu {
-                    info!(
+                    if needs_redownload_for_gpu {
+                        info!(
                         "llama-server is CPU-only but GPU is configured (gpu_layers={}, runtime={:?}) — \
                          re-downloading with GPU support...",
                         config.gpu_layers, config.gpu_runtime
                     );
-                    let new_path = crate::backend_setup::force_redownload_llama_server().await?;
-                    new_path.to_string_lossy().to_string()
-                } else if needs_lib && !has_lib {
-                    // Binary exists but shared libs are missing — force re-download
-                    info!("llama-server found but shared libs missing, re-downloading...");
-                    // Only delete if it's in our bin dir (don't touch system installs)
-                    if path.contains(".athenas") {
-                        let _ = std::fs::remove_file(&path);
-                        // Also clean up old .so files
-                        if let Ok(entries) = std::fs::read_dir(parent) {
-                            for entry in entries.flatten() {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if name.starts_with("libllama") || name.starts_with("libggml") {
-                                    let _ = std::fs::remove_file(entry.path());
+                        let new_path =
+                            crate::backend_setup::force_redownload_llama_server().await?;
+                        new_path.to_string_lossy().to_string()
+                    } else if needs_lib && !has_lib {
+                        // Binary exists but shared libs are missing — force re-download
+                        info!("llama-server found but shared libs missing, re-downloading...");
+                        // Only delete if it's in our bin dir (don't touch system installs)
+                        if path.contains(".athenas") {
+                            let _ = std::fs::remove_file(&path);
+                            // Also clean up old .so files
+                            if let Ok(entries) = std::fs::read_dir(parent) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    if name.starts_with("libllama") || name.starts_with("libggml") {
+                                        let _ = std::fs::remove_file(entry.path());
+                                    }
                                 }
                             }
                         }
+                        let new_path = crate::backend_setup::ensure_llama_server().await?;
+                        new_path.to_string_lossy().to_string()
+                    } else {
+                        path
                     }
-                    let new_path = crate::backend_setup::ensure_llama_server().await?;
-                    new_path.to_string_lossy().to_string()
                 } else {
                     path
                 }
-            } else {
-                path
-            }
             }
         } else {
             info!("llama-server not found, auto-downloading...");

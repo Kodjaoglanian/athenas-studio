@@ -1399,10 +1399,7 @@ mod tests {
             "bin-win-hip-radeon-x64.zip",
             "bin-win-rocm-"
         ));
-        assert!(!variant_matches(
-            "bin-win-vulkan-x64.zip",
-            "bin-win-rocm-"
-        ));
+        assert!(!variant_matches("bin-win-vulkan-x64.zip", "bin-win-rocm-"));
     }
 
     #[test]
