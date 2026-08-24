@@ -18,7 +18,9 @@ const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 ///
 /// Priority order on Windows:
 /// - NVIDIA: CUDA
-/// - AMD: HIP
+/// - AMD (dedicated): Vulkan (HIP/ROCm Windows builds often expose no devices
+///   on consumer Radeon GPUs; Vulkan is the reliable path)
+/// - AMD (APU): Vulkan
 /// - Vulkan fallback
 /// - CPU-only
 async fn platform_asset_name() -> Option<String> {
@@ -65,10 +67,12 @@ async fn platform_asset_name() -> Option<String> {
                      Please install manually: apt install -y libvulkan1 mesa-vulkan-drivers"
                 );
             }
-            // No Vulkan — try ROCm only for dedicated AMD GPUs (not APUs)
+            // No Vulkan — try ROCm only for dedicated AMD GPUs (not APUs).
+            // Prefix match: llama.cpp versions the ROCm toolchain in the asset
+            // name (e.g. bin-ubuntu-rocm-7.14-x64.tar.gz).
             if has_amd && detect_rocm() && !is_amd_apu() {
                 info!("Dedicated AMD GPU detected with ROCm (no Vulkan), using ROCm binary");
-                return Some("bin-ubuntu-rocm-7.2-x64.tar.gz".to_string());
+                return Some("bin-ubuntu-rocm-".to_string());
             }
             if has_amd && detect_rocm() && is_amd_apu() {
                 warn!(
@@ -104,9 +108,23 @@ async fn platform_asset_name() -> Option<String> {
                 return Some("bin-win-cuda-12.4-x64.zip".to_string());
             }
             if has_amd && !is_amd_apu() {
-                // Dedicated AMD GPU — use HIP binary
-                info!("Dedicated AMD GPU detected, using HIP binary for GPU acceleration");
-                return Some("bin-win-hip-radeon-x64.zip".to_string());
+                // Dedicated AMD GPU on Windows: prefer Vulkan.
+                // Official llama.cpp HIP/ROCm Windows zips frequently report
+                // "Available devices: (none)" on consumer Radeon cards
+                // (e.g. RX 6000/7000), which forces silent CPU inference.
+                if has_vulkan {
+                    info!(
+                        "Dedicated AMD GPU detected, using Vulkan binary for GPU acceleration \
+                         (HIP/ROCm Windows builds often see no devices on consumer GPUs)"
+                    );
+                    return Some("bin-win-vulkan-x64.zip".to_string());
+                }
+                // No Vulkan ICD — try versioned ROCm/HIP as last GPU option
+                info!(
+                    "Dedicated AMD GPU without Vulkan, trying ROCm/HIP binary \
+                     (may still fall back to CPU if no HIP devices are present)"
+                );
+                return Some("bin-win-rocm-".to_string());
             }
             if has_amd && is_amd_apu() && has_vulkan {
                 // AMD APU (integrated) — HIP doesn't work, use Vulkan
@@ -537,52 +555,37 @@ fn detect_vulkan_support() -> bool {
     }
 }
 
-/// Query GitHub API for the latest llama.cpp release tag.
-/// If `required_asset` is provided, searches recent releases for one
-/// that contains an asset with the given suffix (e.g. "bin-ubuntu-vulkan-x64.tar.gz").
-/// This is needed because the latest release sometimes doesn't have all assets.
-async fn get_latest_release_tag(required_asset: Option<&str>) -> Result<String> {
+/// Whether a stored variant marker matches the desired asset pattern.
+///
+/// Exact suffixes must match. Versioned prefixes (ending in `-`, e.g.
+/// `bin-win-rocm-`) match any concrete asset that starts with that prefix
+/// (e.g. `bin-win-rocm-7.14-x64.zip`).
+fn variant_matches(current: &str, desired: &str) -> bool {
+    let current = current.trim();
+    let desired = desired.trim();
+    if current == desired {
+        return true;
+    }
+    if desired.ends_with('-') && current.starts_with(desired) {
+        return true;
+    }
+    false
+}
+
+/// Find a recent llama.cpp release that has an asset matching `required_asset`.
+///
+/// `required_asset` may be an exact suffix (`bin-win-vulkan-x64.zip`) or a
+/// versioned prefix (`bin-win-rocm-`). Returns `(tag, asset_suffix)` where
+/// `asset_suffix` is the concrete name after `llama-{tag}-`.
+async fn find_release_asset(required_asset: &str) -> Result<(String, String)> {
     let client = reqwest::Client::builder()
         .user_agent("athenas-studio")
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| AthenasError::Backend(format!("Failed to create HTTP client: {}", e)))?;
 
-    // If no specific asset is needed, just get the latest release
-    if required_asset.is_none() {
-        let url = format!(
-            "https://api.github.com/repos/{}/releases/latest",
-            LLAMA_CPP_REPO
-        );
-        let resp = client
-            .get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .map_err(|e| AthenasError::Backend(format!("GitHub API request failed: {}", e)))?;
-
-        if !resp.status().is_success() {
-            return Err(AthenasError::Backend(format!(
-                "GitHub API returned {}",
-                resp.status()
-            )));
-        }
-
-        let json: serde_json::Value = resp.json().await.map_err(|e| {
-            AthenasError::Backend(format!("Failed to parse GitHub response: {}", e))
-        })?;
-
-        let tag = json["tag_name"]
-            .as_str()
-            .ok_or_else(|| AthenasError::Backend("No tag_name in GitHub response".into()))?;
-
-        return Ok(tag.to_string());
-    }
-
-    // Search recent releases for one that has the required asset
-    let required = required_asset.unwrap();
     let url = format!(
-        "https://api.github.com/repos/{}/releases?per_page=10",
+        "https://api.github.com/repos/{}/releases?per_page=15",
         LLAMA_CPP_REPO
     );
 
@@ -617,9 +620,22 @@ async fn get_latest_release_tag(required_asset: Option<&str>) -> Result<String> 
         if let Some(assets) = release["assets"].as_array() {
             for asset in assets {
                 if let Some(name) = asset["name"].as_str() {
-                    if name.contains(required) {
-                        info!("Found release {} with asset matching '{}'", tag, required);
-                        return Ok(tag.to_string());
+                    if name.contains(required_asset) {
+                        let prefix = format!("llama-{}-", tag);
+                        let suffix = if let Some(rest) = name.strip_prefix(&prefix) {
+                            rest.to_string()
+                        } else {
+                            // Unexpected naming — use everything from the match onward
+                            match name.find(required_asset) {
+                                Some(idx) => name[idx..].to_string(),
+                                None => name.to_string(),
+                            }
+                        };
+                        info!(
+                            "Found release {} with asset matching '{}' → {}",
+                            tag, required_asset, suffix
+                        );
+                        return Ok((tag.to_string(), suffix));
                     }
                 }
             }
@@ -629,7 +645,7 @@ async fn get_latest_release_tag(required_asset: Option<&str>) -> Result<String> 
     Err(AthenasError::Backend(format!(
         "No release found with asset containing '{}'. \
          The llama.cpp releases may have changed format.",
-        required
+        required_asset
     )))
 }
 
@@ -828,7 +844,7 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
         // Check if the variant matches what we need
         let current_variant = std::fs::read_to_string(&variant_marker).unwrap_or_default();
         let desired_variant = &desired_asset_suffix;
-        if current_variant.trim() != desired_variant.trim() {
+        if !variant_matches(&current_variant, desired_variant) {
             info!(
                 "llama-server variant mismatch: have '{}', need '{}' — re-downloading with GPU support...",
                 current_variant.trim(),
@@ -874,12 +890,48 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
 
     info!("llama-server not found or needs update, auto-downloading...");
 
-    // Search for a release that has the asset we need.
-    // The latest release sometimes doesn't have all platform assets.
-    let tag = get_latest_release_tag(Some(&desired_asset_suffix)).await?;
-    info!("Using llama.cpp release: {}", tag);
+    // Resolve the concrete asset. Versioned backends (ROCm) use a prefix
+    // pattern; exact names (CUDA/Vulkan/CPU) resolve unchanged.
+    // If a preferred ROCm prefix is still selected (no Vulkan), keep Vulkan
+    // as a secondary candidate when available.
+    let mut candidates = vec![desired_asset_suffix.clone()];
+    if desired_asset_suffix.starts_with("bin-win-rocm-") {
+        candidates.push("bin-win-vulkan-x64.zip".to_string());
+    }
 
-    let asset_name = format!("llama-{}-{}", tag, desired_asset_suffix);
+    let mut resolved: Option<(String, String)> = None;
+    let mut last_err = None;
+    for candidate in &candidates {
+        match find_release_asset(candidate).await {
+            Ok(found) => {
+                if candidate != &desired_asset_suffix {
+                    warn!(
+                        "Preferred asset '{}' unavailable; falling back to '{}'",
+                        desired_asset_suffix, found.1
+                    );
+                }
+                resolved = Some(found);
+                break;
+            }
+            Err(e) => {
+                warn!("Asset lookup failed for '{}': {}", candidate, e);
+                last_err = Some(e);
+            }
+        }
+    }
+
+    let (tag, resolved_suffix) = resolved.ok_or_else(|| {
+        last_err.unwrap_or_else(|| {
+            AthenasError::Backend(format!(
+                "No release found with asset containing '{}'. \
+                 The llama.cpp releases may have changed format.",
+                desired_asset_suffix
+            ))
+        })
+    })?;
+    info!("Using llama.cpp release: {} ({})", tag, resolved_suffix);
+
+    let asset_name = format!("llama-{}-{}", tag, resolved_suffix);
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         LLAMA_CPP_REPO, tag, asset_name
@@ -892,7 +944,7 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
         data.len() / (1024 * 1024)
     );
 
-    let is_zip = desired_asset_suffix.ends_with(".zip");
+    let is_zip = resolved_suffix.ends_with(".zip");
     let extracted_path = if is_zip {
         extract_zip(&data, &bin_dir)?
     } else {
@@ -1076,6 +1128,8 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
     }
 
     // Write variant marker so we know which GPU variant was installed
+    // Store the preferred pattern (not only the concrete file) so versioned
+    // ROCm assets and Vulkan fallbacks don't trigger a re-download loop.
     let _ = std::fs::write(&variant_marker, &desired_asset_suffix);
 
     info!("llama-server installed to {}", extracted_path.display());
@@ -1316,4 +1370,43 @@ fn extract_zip_whisper(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf
     }
 
     cli_path.ok_or_else(|| AthenasError::Backend("whisper-cli.exe not found in zip".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::variant_matches;
+
+    #[test]
+    fn variant_matches_exact() {
+        assert!(variant_matches(
+            "bin-win-vulkan-x64.zip",
+            "bin-win-vulkan-x64.zip"
+        ));
+        assert!(!variant_matches(
+            "bin-win-cpu-x64.zip",
+            "bin-win-vulkan-x64.zip"
+        ));
+    }
+
+    #[test]
+    fn variant_matches_versioned_rocm_prefix() {
+        assert!(variant_matches(
+            "bin-win-rocm-7.14-x64.zip",
+            "bin-win-rocm-"
+        ));
+        assert!(variant_matches("bin-win-rocm-", "bin-win-rocm-"));
+        assert!(!variant_matches(
+            "bin-win-hip-radeon-x64.zip",
+            "bin-win-rocm-"
+        ));
+        assert!(!variant_matches("bin-win-vulkan-x64.zip", "bin-win-rocm-"));
+    }
+
+    #[test]
+    fn variant_matches_ubuntu_rocm_prefix() {
+        assert!(variant_matches(
+            "bin-ubuntu-rocm-7.14-x64.tar.gz",
+            "bin-ubuntu-rocm-"
+        ));
+    }
 }
