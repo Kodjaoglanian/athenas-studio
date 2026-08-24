@@ -4,6 +4,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod model_manager;
 pub mod model_router;
+pub mod otel_metrics;
 pub mod routes;
 pub mod semantic_cache;
 pub mod server;

@@ -100,6 +100,8 @@ impl Metrics {
         self.tokens_generated_total
             .with_label_values(&[model])
             .inc_by(generated as u64);
+        // Mirror to OTEL metrics (no-op if OTEL is disabled)
+        crate::otel_metrics::record_tokens(model, prompt as u64, generated as u64);
     }
 
     pub fn render() -> String {
@@ -127,27 +129,38 @@ pub async fn metrics_middleware(
     let endpoint = req.uri().path().to_string();
     let method = req.method().to_string();
 
+    // Prometheus metrics
     metrics
         .requests_total
         .with_label_values(&[&endpoint, &method])
         .inc();
     metrics.requests_active.inc();
 
+    // OTEL metrics (no-op if OTEL is disabled)
+    crate::otel_metrics::record_request(&endpoint, &method);
+    crate::otel_metrics::inc_active();
+
     let start = Instant::now();
     let response = next.run(req).await;
     let duration = start.elapsed().as_secs_f64();
 
+    // Prometheus
     metrics.requests_active.dec();
     metrics
         .request_duration
         .with_label_values(&[&endpoint])
         .observe(duration);
 
+    // OTEL
+    crate::otel_metrics::dec_active();
+    crate::otel_metrics::record_duration(&endpoint, duration);
+
     if !response.status().is_success() {
         metrics
             .errors_total
             .with_label_values(&[&endpoint, "http_error"])
             .inc();
+        crate::otel_metrics::record_error(&endpoint, "http_error");
     }
 
     response
