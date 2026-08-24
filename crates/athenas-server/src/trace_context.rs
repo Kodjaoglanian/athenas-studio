@@ -14,7 +14,7 @@
 use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
 use opentelemetry::{
     propagation::Extractor,
-    trace::{Span, Tracer},
+    trace::{Span, TraceContextExt, Tracer},
     KeyValue,
 };
 
@@ -48,6 +48,25 @@ pub async fn trace_context_middleware(req: Request, next: Next) -> Response {
     let remote_context = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderExtractor(req.headers()))
     });
+
+    // Debug: log what we extracted
+    let has_parent = remote_context.has_active_span();
+    if has_parent {
+        let parent_span = remote_context.span();
+        let span_ctx = parent_span.span_context();
+        eprintln!(
+            "trace_context: extracted parent trace_id={}, span_id={}",
+            span_ctx.trace_id(),
+            span_ctx.span_id(),
+        );
+    } else {
+        eprintln!(
+            "trace_context: no parent found in headers — traceparent={:?}",
+            req.headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+        );
+    }
 
     let method = req.method().to_string();
     let route = req.uri().path().to_string();
