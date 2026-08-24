@@ -25,6 +25,11 @@ pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
         return None;
     }
 
+    eprintln!(
+        "OpenTelemetry: enabled, endpoint={:?}, service={}, sample_ratio={}",
+        config.endpoint, config.service_name, config.sample_ratio
+    );
+
     let resource = Resource::new(vec![opentelemetry::KeyValue::new(
         SERVICE_NAME,
         config.service_name.clone(),
@@ -44,12 +49,15 @@ pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
             .build()
             .expect("Failed to create OTLP exporter");
 
+        eprintln!("OpenTelemetry: OTLP exporter created for {}", endpoint);
+
         SdkTracerProvider::builder()
             .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
             .with_resource(resource)
             .with_sampler(sampler)
             .build()
     } else {
+        eprintln!("OpenTelemetry: no endpoint configured — traces will not be exported");
         // No exporter - just use a no-op provider with logging
         SdkTracerProvider::builder()
             .with_resource(resource)
@@ -61,11 +69,17 @@ pub fn init_tracing(config: &OtelConfig) -> Option<SdkTracerProvider> {
 
     let otel_layer = OpenTelemetryLayer::new(tracer);
 
-    let _ = tracing_subscriber::registry()
+    let init_result = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer().with_ansi(false))
         .with(otel_layer)
         .try_init();
+
+    if let Err(e) = &init_result {
+        eprintln!("OpenTelemetry: tracing subscriber init failed: {}", e);
+    } else {
+        eprintln!("OpenTelemetry: tracing subscriber initialized successfully");
+    }
 
     Some(provider)
 }
