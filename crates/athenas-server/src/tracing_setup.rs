@@ -166,6 +166,12 @@ pub fn init_tracing(config: &OtelConfig) -> OtelGuards {
     let tracer = TracerProviderTrait::tracer(&tracer_provider, config.service_name.clone());
     let otel_layer = OpenTelemetryLayer::new(tracer);
 
+    // Register the global tracer provider so that
+    // opentelemetry::global::tracer() returns a real tracer (not noop).
+    // This is used by trace_context_middleware to create server spans
+    // that inherit the remote W3C trace context.
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+
     // --- Logs ---
     let logger_provider = if config.export_logs {
         if let Some(endpoint) = &config.endpoint {
