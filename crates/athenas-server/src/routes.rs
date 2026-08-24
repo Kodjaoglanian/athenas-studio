@@ -266,6 +266,7 @@ pub fn create_router(
         .layer(from_fn(request_logging_middleware))
         .layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
         .layer(from_fn_with_state(metrics, metrics_middleware))
+        .layer(from_fn(crate::trace_context::trace_context_middleware))
         .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
             tower_http::request_id::MakeRequestUuid,
         ));

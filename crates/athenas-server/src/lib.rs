@@ -10,6 +10,7 @@ pub mod semantic_cache;
 pub mod server;
 pub mod session_manager;
 pub mod slot_manager;
+pub mod trace_context;
 pub mod tracing_setup;
 pub mod vector_store;
 

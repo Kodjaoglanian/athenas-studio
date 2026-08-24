@@ -234,6 +234,12 @@ pub fn init_tracing(config: &OtelConfig) -> OtelGuards {
         .as_ref()
         .map(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new);
 
+    // Register the W3C TraceContext propagator globally so that
+    // trace_context_middleware can extract traceparent headers.
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
     let init_result = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer().with_ansi(false))
