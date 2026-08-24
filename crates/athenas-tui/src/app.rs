@@ -1756,9 +1756,19 @@ impl TuiApp {
                 KeyCode::Enter => match self.server_panel_state.save_edit() {
                     Err(e) => self.server_panel_state.set_error(e),
                     Ok(()) => {
-                        if self.server_panel_state.phase == ServerPhase::Running {
+                        // Persist config to disk so changes survive restarts
+                        let config = self.server_panel_state.build_app_config(&self.config);
+                        if let Err(e) = config.save() {
                             self.server_panel_state
-                                .set_status("Saved — applies on next server start");
+                                .set_error(format!("Failed to save config: {}", e));
+                        } else {
+                            self.config = config;
+                            if self.server_panel_state.phase == ServerPhase::Running {
+                                self.server_panel_state
+                                    .set_status("Saved — applies on next server start");
+                            } else {
+                                self.server_panel_state.set_status("Saved");
+                            }
                         }
                     }
                 },
@@ -1816,9 +1826,19 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
-                        if self.server_panel_state.phase == ServerPhase::Running {
+                        // Persist config to disk so toggle changes survive restarts
+                        let config = self.server_panel_state.build_app_config(&self.config);
+                        if let Err(e) = config.save() {
                             self.server_panel_state
-                                .set_status("Toggled — applies on next server start");
+                                .set_error(format!("Failed to save config: {}", e));
+                        } else {
+                            self.config = config;
+                            if self.server_panel_state.phase == ServerPhase::Running {
+                                self.server_panel_state
+                                    .set_status("Toggled — applies on next server start");
+                            } else {
+                                self.server_panel_state.set_status("Toggled — saved");
+                            }
                         }
                     } else if field == ConfigField::GpuRuntime {
                         // Cycle through GPU runtimes on Enter
@@ -1832,8 +1852,16 @@ impl TuiApp {
                             GpuRuntime::Cpu => GpuRuntime::Auto,
                         };
                         self.server_panel_state.gpu_runtime = next;
-                        self.server_panel_state
-                            .set_status(format!("GPU runtime: {} (saved on server start)", next));
+                        // Persist config to disk
+                        let config = self.server_panel_state.build_app_config(&self.config);
+                        if let Err(e) = config.save() {
+                            self.server_panel_state
+                                .set_error(format!("Failed to save config: {}", e));
+                        } else {
+                            self.config = config;
+                            self.server_panel_state
+                                .set_status(format!("GPU runtime: {} — saved", next));
+                        }
                     } else if field.is_editable() {
                         self.server_panel_state.start_edit();
                     } else if field == ConfigField::StartServer {
