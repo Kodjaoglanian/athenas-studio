@@ -243,7 +243,11 @@ async fn main() -> anyhow::Result<()> {
 
     // For TUI mode, use a custom subscriber that captures logs into a buffer
     // instead of writing to stderr (which would corrupt the terminal display).
+    // For `serve`, let init_tracing() in serve.rs handle setup so that the
+    // OpenTelemetry layer is included when OTEL is enabled.
     // For other modes, use the standard fmt subscriber.
+    let skip_tracing_init = matches!(command, Commands::Serve { .. });
+
     if is_tui {
         let log_buffer = athenas_tui::log_buffer::LogBuffer::new(2000);
         let buffer_layer = athenas_tui::log_buffer::LogBufferLayer::new(log_buffer.clone());
@@ -254,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
             .init();
 
         commands::tui::run_with_log_buffer(log_buffer).await?;
-    } else {
+    } else if !skip_tracing_init {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
