@@ -48,7 +48,7 @@
 - **LoRA Adapters** — Load multiple LoRA adapters for model customization
 - **Parallel Inference Slots** — Configurable parallel decoding slots for batched inference
 - **Vector Store** — Integrated vector store for RAG (retrieval-augmented generation)
-- **OpenTelemetry Tracing** — Distributed tracing with OTLP export for observability
+- **OpenTelemetry Observability** — Full OTEL support: distributed traces, logs, and metrics via OTLP gRPC. W3C Trace Context extraction for cross-service dependency topology. Configurable resource attributes (service name, version, namespace, environment, instance ID)
 - **IP Filtering** — Allowlist/denylist for IP-based access control
 - **RemoteBackend** — TUI chat automatically connects to detached server via HTTP API
 
@@ -206,7 +206,7 @@ The server panel (F4) also provides full configuration for enterprise features:
 
 - **ADVANCED:** Parallel Slots, LoRA Adapters (comma-separated paths)
 - **VECTOR STORE:** Enable/disable, Max Documents, Default Top-K
-- **TRACING:** OpenTelemetry enable, OTLP Endpoint, Service Name, Sample Ratio
+- **TRACING:** OpenTelemetry enable, OTLP Endpoint, Service Name, Sample Ratio, Export Logs, Export Metrics, Service Namespace, Environment
 - **SECURITY:** IP Allowlist, IP Denylist (comma-separated IPs/CIDRs)
 
 The hardware banner shows live **free/total RAM** and **free VRAM**, plus an **Est. load** line with a colored verdict (✓ fits / ⚠ tight / ✗ does NOT fit) that updates as you cycle models — so you know whether a model will fit *before* starting the server.
@@ -455,6 +455,56 @@ curl http://127.0.0.1:8080/v1/audio/transcriptions \
   -F "response_format=srt"
 ```
 
+## OpenTelemetry Observability
+
+Athenas Studio exports three OpenTelemetry signals via OTLP gRPC:
+
+| Signal | Description |
+|--------|-------------|
+| **Traces** | Distributed spans for inference requests, model loading, and API handlers |
+| **Logs** | `tracing` events (info, warn, error) bridged to OTEL logs |
+| **Metrics** | Request count, latency histograms, token throughput, error rates |
+
+### W3C Trace Context (Dependency Topology)
+
+The server extracts the `traceparent` HTTP header from incoming requests and creates server spans as children of the caller's trace. This enables observability platforms (Autopsy, Jaeger, Grafana Tempo, Datadog) to infer service-to-service dependency edges.
+
+When an instrumented client (Python OTEL SDK, OpenTelemetry Java, etc.) sends a request with a `traceparent` header, the Athenas server span inherits the client's `trace_id` and `parent_span_id`, creating a cross-service trace.
+
+### Resource Attributes
+
+| Attribute | Source |
+|-----------|--------|
+| `service.name` | `service_name` config (default: `athenas-studio`) |
+| `service.version` | Crate version |
+| `host.name` | System hostname |
+| `service.instance.id` | `hostname:PID` (auto) or `service_instance_id` config |
+| `service.namespace` | `service_namespace` config |
+| `deployment.environment.name` | `environment` config |
+
+### Configuration
+
+```toml
+[server.otel]
+enabled = true
+endpoint = "http://10.70.41.204:4317"  # OTLP gRPC collector
+service_name = "athenas-studio s0062"
+sample_ratio = 1.0              # 1.0 = all traces, 0.1 = 10% sampled
+export_logs = true              # bridge tracing events to OTEL logs
+export_metrics = true           # export metrics via OTLP
+environment = "production"
+service_namespace = "athenas-cluster"
+```
+
+### Compatible Collectors
+
+Any OTLP-compatible collector works:
+- **Autopsy** — Local TUI observability platform (recommended for homelab/dev)
+- **Jaeger** — Distributed tracing backend
+- **Grafana Tempo / Loki / Mimir** — Full observability stack
+- **Datadog Agent** — OTLP ingestion
+- **OpenTelemetry Collector** — Standard collector with pipeline configuration
+
 ## Architecture
 
 ```
@@ -463,7 +513,7 @@ athenas-studio/
 │   ├── athenas-core/        # Config, storage, hardware detection, model registry
 │   ├── athenas-inference/   # Backend trait, llama.cpp, vLLM & RemoteBackend implementations
 │   ├── athenas-hub/         # HuggingFace API client, download manager
-│   ├── athenas-server/      # OpenAI-compatible API server (axum), multi-model manager
+│   ├── athenas-server/      # OpenAI-compatible API server (axum), multi-model manager, OTEL tracing/logs/metrics
 │   ├── athenas-tui/         # Terminal UI (ratatui + crossterm), server panel with multi-model, enterprise configs
 │   └── athenas-cli/         # CLI entry point (clap)
 ├── .github/workflows/       # CI, release & PR build pipelines
@@ -534,10 +584,15 @@ max_documents = 0               # 0 = unlimited
 default_top_k = 5               # default search results count
 
 [server.otel]
-enabled = false                 # enable OpenTelemetry distributed tracing
-# endpoint = "http://localhost:4317"  # OTLP endpoint
-service_name = "athenas-studio" # service name for traces
+enabled = false                 # enable OpenTelemetry (traces + logs + metrics)
+# endpoint = "http://localhost:4317"  # OTLP gRPC endpoint
+service_name = "athenas-studio" # service name for traces, logs, metrics
 sample_ratio = 1.0              # sampling ratio 0.0-1.0
+export_logs = true              # export tracing events as OTEL logs via OTLP
+export_metrics = true           # export metrics (request count, latency, etc.) via OTLP
+# service_namespace = "production"    # service namespace (e.g. "production", "staging")
+# environment = "production"          # deployment environment name
+# service_instance_id = "host-123"    # auto-generated from hostname+PID if not set
 
 [server.semantic_cache]
 enabled = false                 # enable semantic caching for chat completions

@@ -31,7 +31,7 @@ Cargo workspace with 6 crates:
 | `athenas-core` | `crates/athenas-core` | Config (`config.toml`), hardware detection, model registry, error types |
 | `athenas-inference` | `crates/athenas-inference` | Backend trait, llama.cpp backend, vLLM backend, RemoteBackend, llama-server auto-download |
 | `athenas-hub` | `crates/athenas-hub` | HuggingFace API client, download manager, mmproj auto-download |
-| `athenas-server` | `crates/athenas-server` | OpenAI-compatible API server (axum), multi-model manager, file upload, vector store, tracing |
+| `athenas-server` | `crates/athenas-server` | OpenAI-compatible API server (axum), multi-model manager, file upload, vector store, OTEL tracing/logs/metrics, W3C trace context extraction |
 | `athenas-tui` | `crates/athenas-tui` | Terminal UI (ratatui + crossterm), 6 tabs (Chat, Models, Browser, Server, Settings, Logs) |
 | `athenas-cli` | `crates/athenas-cli` | CLI entry point (clap), command dispatch |
 
@@ -55,6 +55,8 @@ Cargo workspace with 6 crates:
 | `crates/athenas-inference/src/whisper.rs` | WhisperBackend — wraps whisper-cli for audio transcription (JSON/SRT/VTT parsing) |
 | `crates/athenas-cli/src/commands/transcribe.rs` | `athenas transcribe` command — CLI audio transcription with Whisper |
 | `crates/athenas-cli/src/commands/serve.rs` | `athenas serve` command — loads model and starts API server |
+| `crates/athenas-server/src/tracing_setup.rs` | OTEL init — TracerProvider, LoggerProvider, MeterProvider with OTLP exporters, resource attributes, W3C propagator |
+| `crates/athenas-server/src/trace_context.rs` | W3C trace context extraction middleware — parses `traceparent` header, creates server spans linked to caller's trace |
 
 ## Important Patterns
 
@@ -163,6 +165,40 @@ by llama-server but can be used for audio transcription via whisper-cli.
 The `WhisperBackend` writes audio to a temp file, runs whisper-cli, and
 parses the output (JSON, SRT, or VTT) into a `TranscriptionResponse`.
 
+### OpenTelemetry (Traces, Logs, Metrics, Dependencies)
+
+Athenas exports three OTEL signals via OTLP gRPC:
+- **Traces** — `SdkTracerProvider` with `OTLPSpanExporter`, registered globally
+  via `set_tracer_provider()` so both `tracing-opentelemetry` (for
+  `#[tracing::instrument]` spans) and `opentelemetry::global::tracer()` (for
+  the trace context middleware) work.
+- **Logs** — `LoggerProvider` with `OTLPLogExporter`, bridged from `tracing`
+  events via `opentelemetry-appender-tracing`.
+- **Metrics** — `SdkMeterProvider` with `OTLPMetricExporter`, registered
+  globally via `set_meter_provider()`.
+
+Resource attributes: `service.name`, `service.version`, `host.name`,
+`service.instance.id`, `service.namespace`, `deployment.environment.name`.
+
+**W3C Trace Context (Dependency Topology):**
+`trace_context.rs` middleware extracts the `traceparent` header from
+incoming HTTP requests and creates a server span (`http.server.handle`)
+as a child of the caller's trace. This enables observability tools (like
+Autopsy) to infer service-to-service dependency edges.
+
+**Important:** The `traceparent` header is parsed **manually** (not via
+the SDK propagator) because `opentelemetry_sdk` 0.27 rejects
+`trace_flags > 2` for version 0, but the Python OTEL SDK sends `flags=03`.
+The manual parser accepts any flags value and masks to the `SAMPLED` bit.
+
+The `OtelGuards` struct holds the providers and must be kept alive for
+the duration of the server. On shutdown, `shutdown()` is called on each
+provider to flush pending exports.
+
+Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
+`service_name`, `sample_ratio`, `export_logs`, `export_metrics`,
+`service_namespace`, `environment`, `service_instance_id`.
+
 ## Release Process
 
 1. Bump version in `Cargo.toml` and `README.md`
@@ -181,3 +217,5 @@ parses the output (JSON, SRT, or VTT) into a `TranscriptionResponse`.
 - **The latest llama.cpp release may be incomplete** — search recent releases for the required asset
 - **Don't pre-fill edit buffers from `field_value()`** — use `edit_value()` or placeholders leak into config
 - **Don't write `server_panel_state.status_message` directly** — use `set_status()`/`set_error()` so the status bar colors correctly
+- **Don't use the SDK TraceContextPropagator for `traceparent` extraction** — it rejects `trace_flags > 2` (Python sends `03`). Use the manual `parse_traceparent()` in `trace_context.rs`
+- **Don't forget `set_tracer_provider()`** — without it, `opentelemetry::global::tracer()` returns a noop tracer and middleware spans are never exported

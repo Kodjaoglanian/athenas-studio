@@ -24,7 +24,7 @@ The project is organized as a Cargo workspace with 6 crates:
 | `athenas-core` | Config, storage, hardware detection, model registry, resource limits |
 | `athenas-inference` | Backend trait, llama.cpp & vLLM implementations, mmproj auto-detection |
 | `athenas-hub` | HuggingFace API client, download manager, mmproj auto-download |
-| `athenas-server` | OpenAI-compatible API server (axum), multi-model manager, file upload |
+| `athenas-server` | OpenAI-compatible API server (axum), multi-model manager, file upload, OTEL tracing/logs/metrics, W3C trace context |
 | `athenas-tui` | Terminal UI (ratatui + crossterm), server panel with multi-model management |
 | `athenas-cli` | CLI entry point (clap) |
 
@@ -39,6 +39,7 @@ The project is organized as a Cargo workspace with 6 crates:
 - **API Key Generation** — Generate random admin keys with OS entropy from the TUI
 - **RemoteBackend** — TUI chat connects to detached server via HTTP API
 - **Detached Server** — Server runs as a separate process, surviving TUI restarts
+- **OpenTelemetry Observability** — Full OTEL support (traces, logs, metrics) via OTLP gRPC with W3C trace context extraction for cross-service dependency topology
 
 ## Coding Guidelines
 
