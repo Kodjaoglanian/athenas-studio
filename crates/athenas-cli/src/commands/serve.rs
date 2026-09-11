@@ -142,6 +142,7 @@ pub async fn run(
         draft_model_path,
         draft_max_tokens: config.inference.draft_max_tokens,
         draft_min_ctx: config.inference.draft_min_ctx,
+        auto_install_deps: config.inference.auto_install_deps,
     };
 
     backend.load_model(load_config).await?;

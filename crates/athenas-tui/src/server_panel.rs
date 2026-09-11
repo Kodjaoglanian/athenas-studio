@@ -399,6 +399,9 @@ pub struct ServerPanelState {
     pub draft_model: String,
     pub draft_max_tokens: u32,
     pub draft_min_ctx: u32,
+    /// Pass-through from config — allows auto-installing system deps
+    /// (libgomp, Vulkan loader) via the OS package manager.
+    pub auto_install_deps: bool,
 
     // Vector store
     pub vs_enabled: bool,
@@ -486,6 +489,7 @@ impl ServerPanelState {
             draft_model: config.inference.draft_model.clone().unwrap_or_default(),
             draft_max_tokens: config.inference.draft_max_tokens,
             draft_min_ctx: config.inference.draft_min_ctx,
+            auto_install_deps: config.inference.auto_install_deps,
             vs_enabled: config.server.vector_store.enabled,
             vs_max_documents: config.server.vector_store.max_documents,
             vs_top_k: config.server.vector_store.default_top_k,
@@ -1247,6 +1251,7 @@ impl ServerPanelState {
             },
             draft_max_tokens: self.draft_max_tokens,
             draft_min_ctx: self.draft_min_ctx,
+            auto_install_deps: self.auto_install_deps,
         }
     }
 

@@ -113,7 +113,8 @@ impl LlamaCppBackend {
             // Managed ~/.athenas installs: always re-check the preferred GPU
             // variant (e.g. switch from broken Windows HIP to Vulkan).
             if path.contains(".athenas") {
-                let ensured = crate::backend_setup::ensure_llama_server().await?;
+                let ensured =
+                    crate::backend_setup::ensure_llama_server(config.auto_install_deps).await?;
                 ensured.to_string_lossy().to_string()
             } else {
                 // Validate: check for shared libs next to the binary on Linux/macOS
@@ -160,8 +161,10 @@ impl LlamaCppBackend {
                          re-downloading with GPU support...",
                         config.gpu_layers, config.gpu_runtime
                     );
-                        let new_path =
-                            crate::backend_setup::force_redownload_llama_server().await?;
+                        let new_path = crate::backend_setup::force_redownload_llama_server(
+                            config.auto_install_deps,
+                        )
+                        .await?;
                         new_path.to_string_lossy().to_string()
                     } else if needs_lib && !has_lib {
                         // Binary exists but shared libs are missing — force re-download
@@ -179,7 +182,9 @@ impl LlamaCppBackend {
                                 }
                             }
                         }
-                        let new_path = crate::backend_setup::ensure_llama_server().await?;
+                        let new_path =
+                            crate::backend_setup::ensure_llama_server(config.auto_install_deps)
+                                .await?;
                         new_path.to_string_lossy().to_string()
                     } else {
                         path
@@ -190,7 +195,7 @@ impl LlamaCppBackend {
             }
         } else {
             info!("llama-server not found, auto-downloading...");
-            let path = crate::backend_setup::ensure_llama_server().await?;
+            let path = crate::backend_setup::ensure_llama_server(config.auto_install_deps).await?;
             path.to_string_lossy().to_string()
         };
 
@@ -516,37 +521,52 @@ impl LlamaCppBackend {
 
                         if status.code() == Some(127) {
                             // Check if it's libgomp missing — try to auto-install
+                            // (only with inference.auto_install_deps = true)
                             if full_log.contains("libgomp.so.1") {
-                                info!("libgomp.so.1 missing, attempting auto-install...");
-                                let installed = try_install_libgomp().await;
-                                if installed {
-                                    info!(
-                                        "libgomp1 installed successfully, retrying server start..."
-                                    );
-                                    // Kill the failed child and retry
-                                    if let Some(ref mut child) = self.server_handle {
-                                        let _ = child.kill().await;
+                                if config.auto_install_deps {
+                                    info!("libgomp.so.1 missing, attempting auto-install...");
+                                    let installed = try_install_libgomp().await;
+                                    if installed {
+                                        info!(
+                                            "libgomp1 installed successfully, retrying server start..."
+                                        );
+                                        // Kill the failed child and retry
+                                        if let Some(ref mut child) = self.server_handle {
+                                            let _ = child.kill().await;
+                                        }
+                                        self.server_handle = None;
+                                        // Retry the spawn by returning a special error
+                                        // that the caller can retry, or just retry inline
+                                        return self.retry_start_server(config).await;
                                     }
-                                    self.server_handle = None;
-                                    // Retry the spawn by returning a special error
-                                    // that the caller can retry, or just retry inline
-                                    return self.retry_start_server(config).await;
+                                } else {
+                                    msg.push_str(
+                                        "\n\nHint: libgomp.so.1 is missing.\n\
+                                         On Ubuntu/Debian: apt install -y libgomp1\n\
+                                         On Fedora: dnf install -y libgomp\n\
+                                         On Arch: pacman -S gcc-libs\n\
+                                         \n\
+                                         Or set inference.auto_install_deps = true in \
+                                         config.toml to let Athenas install it automatically.",
+                                    );
                                 }
                             }
                             // Check if libvulkan is missing (Vulkan binary needs it)
                             if full_log.contains("libvulkan.so") || full_log.contains("libvulkan") {
-                                info!("libvulkan missing, attempting auto-install...");
-                                let installed =
-                                    crate::backend_setup::try_install_vulkan_libs_pub().await;
-                                if installed {
-                                    info!(
-                                        "Vulkan libraries installed successfully, retrying server start..."
-                                    );
-                                    if let Some(ref mut child) = self.server_handle {
-                                        let _ = child.kill().await;
+                                if config.auto_install_deps {
+                                    info!("libvulkan missing, attempting auto-install...");
+                                    let installed =
+                                        crate::backend_setup::try_install_vulkan_libs_pub().await;
+                                    if installed {
+                                        info!(
+                                            "Vulkan libraries installed successfully, retrying server start..."
+                                        );
+                                        if let Some(ref mut child) = self.server_handle {
+                                            let _ = child.kill().await;
+                                        }
+                                        self.server_handle = None;
+                                        return self.retry_start_server(config).await;
                                     }
-                                    self.server_handle = None;
-                                    return self.retry_start_server(config).await;
                                 }
                                 msg.push_str(
                                     "\n\nHint: Vulkan library missing. The GPU-accelerated \
@@ -556,7 +576,9 @@ impl LlamaCppBackend {
                                      On Arch: pacman -S vulkan-icd-loader\n\
                                      \n\
                                      For NVIDIA: also install nvidia-vulkan-icd or ensure \
-                                     your NVIDIA driver supports Vulkan (driver >= 390.x).",
+                                     your NVIDIA driver supports Vulkan (driver >= 390.x).\n\
+                                     Or set inference.auto_install_deps = true in \
+                                     config.toml to let Athenas install it automatically.",
                                 );
                             }
                             msg.push_str(

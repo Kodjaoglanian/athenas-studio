@@ -23,7 +23,7 @@ const LLAMA_CPP_REPO: &str = "ggml-org/llama.cpp";
 /// - AMD (APU): Vulkan
 /// - Vulkan fallback
 /// - CPU-only
-async fn platform_asset_name() -> Option<String> {
+async fn platform_asset_name(auto_install_deps: bool) -> Option<String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
@@ -52,20 +52,28 @@ async fn platform_asset_name() -> Option<String> {
             }
             // No Vulkan libs installed. Check if we have an AMD GPU that
             // could benefit from Vulkan — if so, try to auto-install the
-            // Vulkan libraries before falling back.
+            // Vulkan libraries before falling back (opt-in only).
             if has_amd || has_nvidia {
-                warn!(
-                    "GPU detected but Vulkan libraries not found. \
-                     Attempting to install Vulkan libraries..."
-                );
-                if try_install_vulkan_libs_pub().await {
-                    info!("Vulkan libraries installed successfully, using Vulkan binary");
-                    return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+                if auto_install_deps {
+                    warn!(
+                        "GPU detected but Vulkan libraries not found. \
+                         Attempting to install Vulkan libraries..."
+                    );
+                    if try_install_vulkan_libs_pub().await {
+                        info!("Vulkan libraries installed successfully, using Vulkan binary");
+                        return Some("bin-ubuntu-vulkan-x64.tar.gz".to_string());
+                    }
+                    warn!(
+                        "Failed to auto-install Vulkan libraries. \
+                         Please install manually: apt install -y libvulkan1 mesa-vulkan-drivers"
+                    );
+                } else {
+                    warn!(
+                        "GPU detected but Vulkan libraries not found. \
+                         Install manually: apt install -y libvulkan1 mesa-vulkan-drivers \
+                         (or set inference.auto_install_deps = true in config.toml)"
+                    );
                 }
-                warn!(
-                    "Failed to auto-install Vulkan libraries. \
-                     Please install manually: apt install -y libvulkan1 mesa-vulkan-drivers"
-                );
             }
             // No Vulkan — try ROCm only for dedicated AMD GPUs (not APUs).
             // Prefix match: llama.cpp versions the ROCm toolchain in the asset
@@ -799,17 +807,20 @@ fn extract_zip(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
 /// If `force_variant` is Some, re-downloads with the specified variant
 /// even if a binary already exists. This is used when the user changes
 /// GPU settings and needs a GPU-accelerated binary.
-pub async fn ensure_llama_server() -> Result<PathBuf> {
-    ensure_llama_server_with_variant(None).await
+pub async fn ensure_llama_server(auto_install_deps: bool) -> Result<PathBuf> {
+    ensure_llama_server_with_variant(None, auto_install_deps).await
 }
 
 /// Force re-download of llama-server with a specific GPU variant.
 /// This removes the existing binary and downloads the correct one.
-pub async fn force_redownload_llama_server() -> Result<PathBuf> {
-    ensure_llama_server_with_variant(Some(true)).await
+pub async fn force_redownload_llama_server(auto_install_deps: bool) -> Result<PathBuf> {
+    ensure_llama_server_with_variant(Some(true), auto_install_deps).await
 }
 
-async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Result<PathBuf> {
+async fn ensure_llama_server_with_variant(
+    force_redownload: Option<bool>,
+    auto_install_deps: bool,
+) -> Result<PathBuf> {
     let bin_dir = athenas_bin_dir()?;
 
     let server_name = if std::env::consts::OS == "windows" {
@@ -822,13 +833,15 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
     let variant_marker = bin_dir.join(".llama-server-variant");
 
     // Determine the desired asset (GPU-aware)
-    let desired_asset_suffix = platform_asset_name().await.ok_or_else(|| {
-        AthenasError::Backend(format!(
-            "No prebuilt llama-server available for {} {}. Please install llama.cpp manually.",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        ))
-    })?;
+    let desired_asset_suffix = platform_asset_name(auto_install_deps)
+        .await
+        .ok_or_else(|| {
+            AthenasError::Backend(format!(
+                "No prebuilt llama-server available for {} {}. Please install llama.cpp manually.",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ))
+        })?;
 
     // Check if we need to re-download:
     // 1. Binary doesn't exist → download
@@ -1007,9 +1020,10 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
             let stdout = String::from_utf8_lossy(&output.stdout);
 
             // On Linux, if libgomp.so.1 is missing, try to auto-install it
+            // (only with inference.auto_install_deps = true)
             #[cfg(target_os = "linux")]
             {
-                if stderr.contains("libgomp.so.1") {
+                if stderr.contains("libgomp.so.1") && auto_install_deps {
                     info!("libgomp.so.1 missing during verification, attempting auto-install...");
                     if crate::llama_cpp::try_install_libgomp().await {
                         info!("libgomp1 installed, re-verifying llama-server...");
@@ -1048,7 +1062,7 @@ async fn ensure_llama_server_with_variant(force_redownload: Option<bool>) -> Res
                             extracted_path.display()
                         )));
                     }
-                } else if stderr.contains("libvulkan") {
+                } else if stderr.contains("libvulkan") && auto_install_deps {
                     info!("libvulkan missing during verification, attempting auto-install...");
                     if try_install_vulkan_libs_pub().await {
                         info!("Vulkan libraries installed, re-verifying llama-server...");

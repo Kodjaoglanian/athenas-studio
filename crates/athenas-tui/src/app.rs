@@ -1672,6 +1672,7 @@ impl TuiApp {
             draft_model_path: None,
             draft_max_tokens: 16,
             draft_min_ctx: 512,
+            auto_install_deps: self.config.inference.auto_install_deps,
         };
 
         let task = tokio::spawn(async move {

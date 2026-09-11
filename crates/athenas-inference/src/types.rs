@@ -260,6 +260,10 @@ pub struct ModelLoadConfig {
     /// Minimum context size for the draft model.
     #[serde(default = "default_draft_min_ctx")]
     pub draft_min_ctx: u32,
+    /// Allow installing missing system libraries (libgomp, Vulkan loader)
+    /// via the OS package manager. Default false.
+    #[serde(default)]
+    pub auto_install_deps: bool,
 }
 
 fn default_draft_max_tokens() -> u32 {
@@ -299,6 +303,7 @@ impl Default for ModelLoadConfig {
             draft_model_path: None,
             draft_max_tokens: 16,
             draft_min_ctx: 512,
+            auto_install_deps: false,
         }
     }
 }

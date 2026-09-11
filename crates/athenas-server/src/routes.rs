@@ -1909,6 +1909,7 @@ async fn load_model_endpoint(
         draft_model_path: None,
         draft_max_tokens: 16,
         draft_min_ctx: 512,
+        auto_install_deps: state.auto_install_deps,
     };
 
     if let Err(e) = backend.load_model(load_config).await {

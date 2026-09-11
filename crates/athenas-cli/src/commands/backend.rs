@@ -140,6 +140,7 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
             draft_model_path: None,
             draft_max_tokens: 16,
             draft_min_ctx: 512,
+            auto_install_deps: config.inference.auto_install_deps,
         })
         .await?;
     let load_time = load_start.elapsed();
