@@ -1867,6 +1867,9 @@ struct LoadModelRequest {
     /// Number of parallel slots for batched inference
     parallel_slots: Option<u32>,
     set_default: Option<bool>,
+    /// Bypass the RAM pre-flight check and model-count limit.
+    #[serde(default)]
+    force: bool,
 }
 
 #[tracing::instrument(skip_all, fields(endpoint = "/v1/models/load"))]
@@ -1876,8 +1879,69 @@ async fn load_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // Pre-flight: enforce the model count limit
+    if state.max_loaded_models > 0 && !req.force {
+        let count = state.model_manager.lock().await.count();
+        if count >= state.max_loaded_models as usize {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "Model limit reached: {} model(s) loaded (max_loaded_models={}). \
+                         Unload a model first, or retry with \"force\": true.",
+                        count, state.max_loaded_models
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Pre-flight: estimate RAM needed (model file + context overhead) and
+    // compare against available memory. Each loaded model spawns its own
+    // llama-server process — without this, OOM is one request away.
+    if state.load_ram_check && !req.force {
+        let model_path = req.model_path.clone();
+        let ctx = req.context_size.unwrap_or(4096);
+        let check = tokio::task::spawn_blocking(move || {
+            let size_mb = std::fs::metadata(&model_path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0);
+            let (total_mb, avail_mb) = athenas_core::detect_memory_mb();
+            (size_mb, total_mb, avail_mb)
+        })
+        .await;
+
+        if let Ok((size_mb, _total_mb, avail_mb)) = check {
+            if size_mb > 0 {
+                let needed = athenas_core::estimate_model_ram_mb(size_mb, ctx);
+                if needed > avail_mb {
+                    return (
+                        StatusCode::INSUFFICIENT_STORAGE,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "Not enough RAM: model needs ~{}MB but only {}MB available. \
+                                 Reduce context_size, or retry with \"force\": true.",
+                                needed, avail_mb
+                            ),
+                            "estimated_ram_mb": needed,
+                            "available_ram_mb": avail_mb,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
     }
 
     let backend_type = match req.backend.as_deref() {
