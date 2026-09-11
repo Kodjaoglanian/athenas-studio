@@ -68,14 +68,14 @@ pub async fn trace_context_middleware(req: Request, next: Next) -> Response {
         .and_then(|v| v.to_str().ok())
     {
         if let Some(span_context) = parse_traceparent(tp) {
-            eprintln!(
+            tracing::debug!(
                 "trace_context: extracted parent trace_id={}, span_id={}",
                 span_context.trace_id(),
                 span_context.span_id(),
             );
             Context::current().with_remote_span_context(span_context)
         } else {
-            eprintln!("trace_context: failed to parse traceparent={:?}", tp);
+            tracing::debug!("trace_context: failed to parse traceparent={:?}", tp);
             Context::current()
         }
     } else {

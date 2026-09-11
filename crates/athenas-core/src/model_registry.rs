@@ -187,14 +187,21 @@ fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()>
                 || filename_lower.contains("-mmproj");
 
             if ext == "gguf" && !is_mmproj {
-                // Read GGUF metadata to detect architecture
-                let arch = read_gguf_architecture(&path);
+                // Read GGUF metadata (architecture, context length, license)
+                let meta = read_gguf_metadata(&path);
 
                 // Categorize model based on architecture
-                let category = arch.as_ref().map(|a| categorize_model(a));
+                let category = meta
+                    .as_ref()
+                    .and_then(|m| m.architecture.as_ref())
+                    .map(|a| categorize_model(a));
 
                 let mut model = create_model_info_from_file(&path, ModelFormat::Gguf)?;
-                model.architecture = arch;
+                if let Some(meta) = meta {
+                    model.architecture = meta.architecture;
+                    model.context_length = meta.context_length;
+                    model.license = meta.license;
+                }
                 model.category = category;
                 models.push(model);
             } else if ext == "safetensors" && !is_mmproj {
@@ -222,9 +229,18 @@ fn categorize_model(arch: &str) -> String {
     }
 }
 
-/// Read the "general.architecture" field from a GGUF file header.
-/// Returns None if the file can't be parsed or the field is missing.
-fn read_gguf_architecture(path: &PathBuf) -> Option<String> {
+/// Metadata extracted from a GGUF file header.
+#[derive(Debug, Default)]
+struct GgufMetadata {
+    architecture: Option<String>,
+    context_length: Option<u32>,
+    license: Option<String>,
+    name: Option<String>,
+}
+
+/// Read metadata fields from a GGUF file header.
+/// Returns None if the file can't be parsed.
+fn read_gguf_metadata(path: &PathBuf) -> Option<GgufMetadata> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).ok()?;
@@ -245,18 +261,25 @@ fn read_gguf_architecture(path: &PathBuf) -> Option<String> {
 
     // In v1/v2, tensor_count and metadata_kv_count are u32.
     // In v3+, they are u64.
-    if version >= 3 {
+    let kv_count = if version >= 3 {
         let _tensor_count: u64 = read_u64(&mut cursor)?;
-        let metadata_kv_count: u64 = read_u64(&mut cursor)?;
-        parse_gguf_metadata(&mut cursor, metadata_kv_count as usize)
+        read_u64(&mut cursor)? as usize
     } else {
         let _tensor_count: u32 = read_u32(&mut cursor)?;
-        let metadata_kv_count: u32 = read_u32(&mut cursor)?;
-        parse_gguf_metadata(&mut cursor, metadata_kv_count as usize)
-    }
+        read_u32(&mut cursor)? as usize
+    };
+    parse_gguf_metadata(&mut cursor, kv_count)
 }
 
-fn parse_gguf_metadata(cursor: &mut std::io::Cursor<&Vec<u8>>, kv_count: usize) -> Option<String> {
+fn parse_gguf_metadata(
+    cursor: &mut std::io::Cursor<&Vec<u8>>,
+    kv_count: usize,
+) -> Option<GgufMetadata> {
+    let mut meta = GgufMetadata::default();
+    // Context length keys are per-architecture (e.g. "llama.context_length")
+    // and may appear before general.architecture — collect them all.
+    let mut ctx_lengths: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
     for _ in 0..kv_count {
         // Read key (gguf string: u64 length + bytes)
         let key = read_gguf_string(cursor)?;
@@ -264,15 +287,42 @@ fn parse_gguf_metadata(cursor: &mut std::io::Cursor<&Vec<u8>>, kv_count: usize) 
         // Read value type (u32)
         let value_type: u32 = read_u32(cursor)?;
 
-        // We only care about "general.architecture" (string type = 8)
-        if key == "general.architecture" && value_type == 8 {
-            return read_gguf_string(cursor);
+        match key.as_str() {
+            "general.architecture" if value_type == 8 => {
+                meta.architecture = read_gguf_string(cursor);
+            }
+            "general.license" if value_type == 8 => {
+                meta.license = read_gguf_string(cursor);
+            }
+            "general.name" if value_type == 8 => {
+                meta.name = read_gguf_string(cursor);
+            }
+            "general.context_length" if value_type == 4 => {
+                meta.context_length = Some(read_u32(cursor)?);
+            }
+            _ if key.ends_with(".context_length") && value_type == 4 => {
+                ctx_lengths.insert(key, read_u32(cursor)?);
+            }
+            _ => {
+                // Skip the value based on its type
+                skip_gguf_value(cursor, value_type)?;
+            }
         }
-
-        // Skip the value based on its type
-        skip_gguf_value(cursor, value_type)?;
     }
-    None
+
+    // Prefer the architecture-specific context length
+    if meta.context_length.is_none() {
+        if let Some(ref arch) = meta.architecture {
+            meta.context_length = ctx_lengths
+                .get(&format!("{}.context_length", arch))
+                .copied();
+        }
+        if meta.context_length.is_none() {
+            meta.context_length = ctx_lengths.values().next().copied();
+        }
+    }
+
+    Some(meta)
 }
 
 fn read_u32(cursor: &mut std::io::Cursor<&Vec<u8>>) -> Option<u32> {

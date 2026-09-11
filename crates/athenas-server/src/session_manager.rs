@@ -87,6 +87,11 @@ impl Session {
 }
 
 /// Manages conversation sessions with optional slot assignment for KV cache persistence.
+///
+/// Sessions are intentionally **in-memory only**: each session may pin a
+/// KV-cache slot on the backing llama-server, and that state dies with
+/// the llama-server process anyway — persisting message history without
+/// the warm slot would give a false sense of continuity.
 pub struct SessionManager {
     sessions: HashMap<String, Session>,
     max_history: usize,

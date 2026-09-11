@@ -65,7 +65,11 @@ impl From<athenas_core::SemanticCacheConfig> for SemanticCacheConfig {
             similarity_threshold: c.similarity_threshold,
             ttl_secs: c.ttl_secs,
             max_entries: c.max_entries,
-            data_dir: PathBuf::from("~/.athenas/data"),
+            // Expand ~ properly — PathBuf::from("~/...") is literal
+            data_dir: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".athenas")
+                .join("data"),
         }
     }
 }
