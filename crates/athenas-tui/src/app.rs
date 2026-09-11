@@ -3262,6 +3262,8 @@ impl TuiApp {
                     .set_status(format!("Loaded {} API key(s)", count));
                 // Also update the modal if it's open
                 self.api_key_modal.set_keys(keys);
+                // Provision the TUI's own key if the server enforces auth
+                self.ensure_tui_key().await;
             }
             Ok(Err(e)) => {
                 let msg = format!("Failed to fetch API keys: {}", e);
@@ -3276,6 +3278,107 @@ impl TuiApp {
                 if self.api_key_modal.open {
                     self.api_key_modal.set_error(msg);
                 }
+            }
+        }
+    }
+
+    /// Ensure the TUI has a working API key for TUI→server auth.
+    ///
+    /// The server only returns masked keys in listings, so the TUI keeps
+    /// its own key persisted in ~/.athenas/tui_key.json. This runs after
+    /// refresh_api_keys():
+    /// - Zero keys on the server = bootstrap mode, no key needed.
+    /// - Stored key_id still present and active = reuse it.
+    /// - Otherwise create a new "athenas-tui" key (loopback is allowed
+    ///   to manage keys) and persist it.
+    async fn ensure_tui_key(&mut self) {
+        if self.server_panel_state.api_keys.is_empty() {
+            // Bootstrap mode — server accepts unauthenticated requests.
+            self.server_panel_state.tui_api_key = None;
+            self.server_panel_state.tui_key_id = None;
+            return;
+        }
+
+        // Load the persisted key if we don't have one in memory.
+        if self.server_panel_state.tui_api_key.is_none() {
+            if let Some((key_id, api_key)) = crate::server_panel::load_tui_key() {
+                self.server_panel_state.tui_key_id = Some(key_id);
+                self.server_panel_state.tui_api_key = Some(api_key);
+            }
+        }
+
+        // Reuse the stored key if it's still listed and active.
+        if let Some(ref kid) = self.server_panel_state.tui_key_id {
+            let still_valid = self
+                .server_panel_state
+                .api_keys
+                .iter()
+                .any(|k| &k.key_id == kid && k.active);
+            if still_valid {
+                return;
+            }
+        }
+
+        // Create a fresh key via loopback admin access.
+        let Some(ref state) = self.server_state else {
+            return;
+        };
+        let host = self.connect_host();
+        let port = state.port;
+
+        let result = tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .map_err(|e| e.to_string())?;
+            let url = format!("http://{}:{}/v1/keys", host, port);
+            let body = serde_json::json!({
+                "name": "athenas-tui",
+                "rate_limit_per_minute": 0,
+                "daily_token_limit": 0,
+                "allowed_models": [],
+            });
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(format!("Server returned {}", resp.status()));
+            }
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse response: {}", e))?;
+            Ok::<serde_json::Value, String>(json)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(json)) => {
+                let key_id = json
+                    .get("key_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let api_key = json
+                    .get("api_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if !key_id.is_empty() && !api_key.is_empty() {
+                    crate::server_panel::save_tui_key(&key_id, &api_key);
+                    self.server_panel_state.tui_key_id = Some(key_id);
+                    self.server_panel_state.tui_api_key = Some(api_key);
+                    tracing::info!("Provisioned TUI API key");
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Failed to provision TUI API key: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("TUI key provisioning request failed: {}", e);
             }
         }
     }

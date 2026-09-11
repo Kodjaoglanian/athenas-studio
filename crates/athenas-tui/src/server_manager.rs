@@ -29,8 +29,22 @@ impl ServerState {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("Failed to save server state: {}", e);
+            // May contain sensitive fields — restrict to owner (0600)
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&path) {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(json.as_bytes()) {
+                        warn!("Failed to save server state: {}", e);
+                    }
+                }
+                Err(e) => warn!("Failed to save server state: {}", e),
             }
         }
     }

@@ -94,7 +94,7 @@ impl ApiKeyManager {
         }
         let keys: Vec<&ApiKey> = self.keys.values().collect();
         if let Ok(json) = serde_json::to_string_pretty(&keys) {
-            if let Err(e) = std::fs::write(self.keys_file(), json) {
+            if let Err(e) = write_private_file(&self.keys_file(), json.as_bytes()) {
                 warn!("Failed to save API keys: {}", e);
             }
         }
@@ -105,7 +105,7 @@ impl ApiKeyManager {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(json) = serde_json::to_string_pretty(&self.usage) {
-            if let Err(e) = std::fs::write(self.usage_file(), json) {
+            if let Err(e) = write_private_file(&self.usage_file(), json.as_bytes()) {
                 warn!("Failed to save key usage: {}", e);
             }
         }
@@ -289,6 +289,20 @@ impl ApiKeyManager {
         self.save_keys();
         self.save_usage();
     }
+}
+
+/// Write a file with owner-only permissions (0600 on Unix).
+/// Used for files that contain API secrets.
+fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    std::io::Write::write_all(&mut f, contents)
 }
 
 pub type SharedApiKeyManager = Arc<Mutex<ApiKeyManager>>;

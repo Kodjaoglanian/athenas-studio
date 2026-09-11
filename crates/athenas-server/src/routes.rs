@@ -373,6 +373,24 @@ async fn check_auth_any(
     false
 }
 
+/// Mask an API key for display: `sk-ath-…<last4>`.
+/// The full secret is only returned once by POST /v1/keys (create).
+fn mask_api_key(api_key: &str) -> String {
+    let last4: String = api_key
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if api_key.starts_with("sk-ath-") {
+        format!("sk-ath-…{}", last4)
+    } else {
+        format!("…{}", last4)
+    }
+}
+
 /// Extract the bearer token from the Authorization header.
 fn extract_bearer(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
@@ -3144,7 +3162,7 @@ async fn list_api_keys(
             let rate_limit_remaining = mgr.rate_limit_remaining(k);
             serde_json::json!({
                 "key_id": k.key_id,
-                "api_key": k.api_key,
+                "api_key": mask_api_key(&k.api_key),
                 "name": k.name,
                 "created_at": k.created_at,
                 "expires_at": k.expires_at,
@@ -3192,7 +3210,7 @@ async fn get_api_key(
     match mgr.get_key(&id) {
         Some(key) => Json(serde_json::json!({
             "key_id": key.key_id,
-            "api_key": key.api_key,
+            "api_key": mask_api_key(&key.api_key),
             "name": key.name,
             "created_at": key.created_at,
             "expires_at": key.expires_at,

@@ -457,7 +457,16 @@ impl AppConfig {
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| AthenasError::Config(e.to_string()))?;
-        std::fs::write(&path, content)?;
+        // Owner-only permissions: the config stores the HuggingFace token.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
+        std::io::Write::write_all(&mut f, content.as_bytes())?;
         Ok(())
     }
 

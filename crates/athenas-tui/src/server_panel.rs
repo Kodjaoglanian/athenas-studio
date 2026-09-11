@@ -4,6 +4,48 @@ use athenas_core::{
 };
 use athenas_inference::{Backend, BackendFactory, ModelLoadConfig};
 
+/// Persisted TUI API key — created via POST /v1/keys on first connect
+/// and stored in ~/.athenas/tui_key.json with mode 0600.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TuiKeyFile {
+    key_id: String,
+    api_key: String,
+}
+
+fn tui_key_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".athenas")
+        .join("tui_key.json")
+}
+
+/// Load the persisted TUI API key. Returns (key_id, api_key).
+pub fn load_tui_key() -> Option<(String, String)> {
+    let content = std::fs::read_to_string(tui_key_path()).ok()?;
+    let parsed: TuiKeyFile = serde_json::from_str(&content).ok()?;
+    Some((parsed.key_id, parsed.api_key))
+}
+
+/// Save the TUI API key with owner-only permissions (0600 on Unix).
+pub fn save_tui_key(key_id: &str, api_key: &str) {
+    let path = tui_key_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::json!({"key_id": key_id, "api_key": api_key});
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        use std::io::Write;
+        let _ = f.write_all(json.to_string().as_bytes());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ServerPhase {
     Configuring,
@@ -438,6 +480,11 @@ pub struct ServerPanelState {
 
     // Multi-tenant API key management
     pub api_keys: Vec<ApiKeyInfo>,
+    /// The TUI's own API key (created via POST /v1/keys on first connect
+    /// and persisted in ~/.athenas/tui_key.json). Listing endpoints only
+    /// return masked keys, so this is the only usable secret the TUI has.
+    pub tui_api_key: Option<String>,
+    pub tui_key_id: Option<String>,
     pub api_key_selected: usize,
     pub new_key_name: String,
     pub new_key_rate_limit: String,
@@ -513,6 +560,8 @@ impl ServerPanelState {
             default_model_selected: 0,
             hardware,
             api_keys: Vec::new(),
+            tui_api_key: None,
+            tui_key_id: None,
             api_key_selected: 0,
             new_key_name: String::new(),
             new_key_rate_limit: "60".to_string(),
@@ -1187,13 +1236,11 @@ impl ServerPanelState {
         })
     }
 
-    /// Returns the first active multi-tenant API key to use for TUI→server auth.
-    /// Returns None when no keys exist (bootstrap mode — server allows no-auth).
+    /// Returns the TUI's own API key for TUI→server auth.
+    /// Returns None when no key was provisioned (bootstrap mode —
+    /// server allows no-auth, and admin routes accept loopback).
     pub fn auth_bearer(&self) -> Option<&str> {
-        self.api_keys
-            .iter()
-            .find(|k| k.active)
-            .map(|k| k.api_key.as_str())
+        self.tui_api_key.as_deref()
     }
 
     pub fn api_key_select_next(&mut self) {
