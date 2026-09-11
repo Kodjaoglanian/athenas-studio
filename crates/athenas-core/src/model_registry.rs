@@ -499,3 +499,120 @@ fn dir_size(path: &PathBuf) -> u64 {
     }
     total
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantization_detection() {
+        assert_eq!(
+            detect_quantization("model-Q4_K_M.gguf"),
+            Some("Q4_K_M".to_string())
+        );
+        assert_eq!(
+            detect_quantization("llama-3.2-3b-instruct-q8_0.gguf"),
+            Some("Q8_0".to_string())
+        );
+        assert_eq!(
+            detect_quantization("model-f16.gguf"),
+            Some("F16".to_string())
+        );
+        assert_eq!(detect_quantization("model.gguf"), None);
+    }
+
+    #[test]
+    fn categorize_whisper_vs_llm() {
+        assert_eq!(categorize_model("whisper"), "whisper");
+        assert_eq!(categorize_model("llama"), "llm");
+        assert_eq!(categorize_model("qwen2"), "llm");
+        assert_eq!(categorize_model("t5"), "tts");
+    }
+
+    /// Build a minimal GGUF v3 header with metadata KV pairs for testing.
+    fn write_test_gguf(dir: &std::path::Path, name: &str, kvs: &[(&str, u32, &[u8])]) -> PathBuf {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF"); // magic
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version 3
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&(kvs.len() as u64).to_le_bytes()); // kv_count
+        for (key, vtype, val) in kvs {
+            buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            buf.extend_from_slice(key.as_bytes());
+            buf.extend_from_slice(&vtype.to_le_bytes());
+            buf.extend_from_slice(val);
+        }
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(&buf).unwrap();
+        path
+    }
+
+    fn gguf_string(s: &str) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    #[test]
+    fn gguf_metadata_parsing() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kvs: Vec<(String, u32, Vec<u8>)> = vec![
+            ("general.architecture".into(), 8, gguf_string("llama")),
+            ("general.license".into(), 8, gguf_string("apache-2.0")),
+            ("general.name".into(), 8, gguf_string("Test Model")),
+            (
+                "llama.context_length".into(),
+                4,
+                8192u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let kv_refs: Vec<(&str, u32, &[u8])> = kvs
+            .iter()
+            .map(|(k, t, v)| (k.as_str(), *t, v.as_slice()))
+            .collect();
+
+        let path = write_test_gguf(&dir, "test.gguf", &kv_refs);
+        let meta = read_gguf_metadata(&path).unwrap();
+        assert_eq!(meta.architecture.as_deref(), Some("llama"));
+        assert_eq!(meta.license.as_deref(), Some("apache-2.0"));
+        assert_eq!(meta.name.as_deref(), Some("Test Model"));
+        assert_eq!(meta.context_length, Some(8192));
+    }
+
+    #[test]
+    fn gguf_bad_magic() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.gguf");
+        std::fs::write(&path, b"NOTGGUF").unwrap();
+        assert!(read_gguf_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn gguf_context_length_fallback_any_arch() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only a ctx key whose arch doesn't match "general.architecture"
+        let kvs: Vec<(String, u32, Vec<u8>)> = vec![
+            ("general.architecture".into(), 8, gguf_string("mistral")),
+            (
+                "qwen2.context_length".into(),
+                4,
+                32768u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let kv_refs: Vec<(&str, u32, &[u8])> = kvs
+            .iter()
+            .map(|(k, t, v)| (k.as_str(), *t, v.as_slice()))
+            .collect();
+        let path = write_test_gguf(&dir, "m.gguf", &kv_refs);
+        let meta = read_gguf_metadata(&path).unwrap();
+        // Falls back to any *.context_length when arch-specific key missing
+        assert_eq!(meta.context_length, Some(32768));
+    }
+}

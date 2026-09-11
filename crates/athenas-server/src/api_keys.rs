@@ -322,3 +322,105 @@ pub enum AuthResult {
     /// Key is valid but not allowed to use the requested model.
     Forbidden,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_mgr() -> ApiKeyManager {
+        let dir = std::env::temp_dir().join(format!("athenas-test-{}", uuid::Uuid::new_v4()));
+        ApiKeyManager::new(dir)
+    }
+
+    #[test]
+    fn create_and_validate() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("test", 60, 0, vec![], None);
+        assert!(key.api_key.starts_with("sk-ath-"));
+        assert!(mgr.validate(&key.api_key).is_some());
+        assert!(mgr.validate("sk-ath-bogus").is_none());
+    }
+
+    #[test]
+    fn revoked_key_fails_validation() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 60, 0, vec![], None);
+        assert!(mgr.revoke_key(&key.key_id));
+        assert!(mgr.validate(&key.api_key).is_none());
+    }
+
+    #[test]
+    fn deleted_key_gone() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 60, 0, vec![], None);
+        assert!(mgr.delete_key(&key.key_id));
+        assert!(mgr.validate(&key.api_key).is_none());
+        assert!(mgr.get_key(&key.key_id).is_none());
+    }
+
+    #[test]
+    fn expired_key_fails_validation() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 60, 0, vec![], None);
+        // Manually expire it
+        let k = mgr.keys.get_mut(&key.api_key).unwrap();
+        k.expires_at = Some(Utc::now() - chrono::Duration::hours(1));
+        assert!(mgr.validate(&key.api_key).is_none());
+    }
+
+    #[test]
+    fn model_access() {
+        let mut mgr = tmp_mgr();
+        let open = mgr.create_key("open", 60, 0, vec![], None);
+        let restricted = mgr.create_key("r", 60, 0, vec!["model-a".to_string()], None);
+        assert!(mgr.check_model_access(&open, "anything"));
+        assert!(mgr.check_model_access(&restricted, "model-a"));
+        assert!(!mgr.check_model_access(&restricted, "model-b"));
+    }
+
+    #[test]
+    fn rate_limit_enforced() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 2, 0, vec![], None);
+        assert!(mgr.check_rate_limit(&key)); // 1
+        assert!(mgr.check_rate_limit(&key)); // 2
+        assert!(!mgr.check_rate_limit(&key)); // exhausted
+    }
+
+    #[test]
+    fn zero_rate_limit_unlimited() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 0, 0, vec![], None);
+        for _ in 0..100 {
+            assert!(mgr.check_rate_limit(&key));
+        }
+    }
+
+    #[test]
+    fn daily_token_quota() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 60, 100, vec![], None);
+        assert!(mgr.check_token_quota(&key));
+        mgr.record_usage(&key, 50, 50); // 100 total → at limit
+        assert!(!mgr.check_token_quota(&key));
+    }
+
+    #[test]
+    fn zero_quota_unlimited() {
+        let mut mgr = tmp_mgr();
+        let key = mgr.create_key("t", 60, 0, vec![], None);
+        mgr.record_usage(&key, 1_000_000, 0);
+        assert!(mgr.check_token_quota(&key));
+    }
+
+    #[test]
+    fn keys_persist_across_instances() {
+        let dir = std::env::temp_dir().join(format!("athenas-test-{}", uuid::Uuid::new_v4()));
+        let mut mgr = ApiKeyManager::new(dir.clone());
+        let key = mgr.create_key("persist", 60, 0, vec![], None);
+
+        let mgr2 = ApiKeyManager::new(dir);
+        assert!(mgr2.validate(&key.api_key).is_some());
+        assert_eq!(mgr2.get_key(&key.key_id).unwrap().name, "persist");
+    }
+}

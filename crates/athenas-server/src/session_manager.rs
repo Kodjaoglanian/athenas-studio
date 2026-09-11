@@ -205,3 +205,90 @@ impl Default for SessionManager {
         Self::new(DEFAULT_MAX_HISTORY, 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(text: &str) -> ChatMessage {
+        ChatMessage {
+            role: Role::User,
+            content: MessageContent::Text(text.to_string()),
+        }
+    }
+
+    #[test]
+    fn create_get_remove() {
+        let mut mgr = SessionManager::new(10, 2);
+        let id = mgr.create(Some("s1".into()));
+        assert_eq!(id, "s1");
+        assert!(mgr.get("s1").is_some());
+        assert_eq!(mgr.count(), 1);
+        assert!(mgr.remove("s1"));
+        assert!(mgr.get("s1").is_none());
+        assert!(!mgr.remove("s1")); // already gone
+    }
+
+    #[test]
+    fn auto_generated_id() {
+        let mut mgr = SessionManager::new(10, 2);
+        let id = mgr.create(None);
+        assert!(id.starts_with("sess_"));
+        assert_eq!(id.len(), 5 + 32);
+    }
+
+    #[test]
+    fn slot_round_robin() {
+        let mut mgr = SessionManager::new(10, 3);
+        mgr.create(Some("a".into()));
+        mgr.create(Some("b".into()));
+        mgr.create(Some("c".into()));
+        mgr.create(Some("d".into())); // wraps to slot 0
+        let slots: Vec<Option<i32>> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|s| mgr.get(s).and_then(|s| s.slot_id))
+            .collect();
+        assert_eq!(slots, vec![Some(0), Some(1), Some(2), Some(0)]);
+    }
+
+    #[test]
+    fn no_slots_when_max_slots_zero() {
+        let mut mgr = SessionManager::new(10, 0);
+        mgr.create(Some("a".into()));
+        assert_eq!(mgr.get("a").and_then(|s| s.slot_id), None);
+    }
+
+    #[test]
+    fn history_trims_to_max() {
+        let mut s = Session::new("s".into(), 3);
+        for i in 0..10 {
+            s.append(msg(&format!("m{}", i)));
+        }
+        assert_eq!(s.messages.len(), 3);
+        // keeps the most recent
+        assert_eq!(s.messages[0].content.as_text(), "m7");
+    }
+
+    #[test]
+    fn system_prompt_prepended() {
+        let mut s = Session::new("s".into(), 10);
+        s.system_prompt = Some("be helpful".into());
+        s.append(msg("hi"));
+        let built = s.build_messages(&[msg("new")]);
+        assert_eq!(built.len(), 3);
+        assert!(matches!(built[0].role, Role::System));
+        assert_eq!(built[0].content.as_text(), "be helpful");
+    }
+
+    #[test]
+    fn purge_expired() {
+        let mut mgr = SessionManager::new(10, 1);
+        mgr.create(Some("fresh".into()));
+        mgr.create(Some("stale".into()));
+        // Force the second session to look old
+        mgr.get_mut("stale").unwrap().last_active = Instant::now() - Duration::from_secs(7200 + 60);
+        assert_eq!(mgr.purge_expired(), 1);
+        assert!(mgr.get("fresh").is_some());
+        assert!(mgr.get("stale").is_none());
+    }
+}

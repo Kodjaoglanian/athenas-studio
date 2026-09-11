@@ -367,3 +367,94 @@ impl WhisperBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_srt_basic() {
+        let srt = "1\n00:00:00,000 --> 00:00:02,500\nHello world\n\n2\n00:00:03,000 --> 00:00:05,000\nSecond line\n";
+        let segs = WhisperBackend::parse_srt(srt);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "Hello world");
+        assert!((segs[0].start - 0.0).abs() < 0.001);
+        assert!((segs[0].end - 2.5).abs() < 0.001);
+        assert!((segs[1].start - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_vtt_basic() {
+        let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nFirst caption\n\n00:00:05.500 --> 00:00:07.000\nSecond caption\n";
+        let segs = WhisperBackend::parse_vtt(vtt);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "First caption");
+        assert!((segs[0].start - 1.0).abs() < 0.001);
+        assert!((segs[0].end - 4.0).abs() < 0.001);
+        assert!((segs[1].start - 5.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_vtt_multiline() {
+        let vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nline one\nline two\n";
+        let segs = WhisperBackend::parse_vtt(vtt);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "line one line two");
+    }
+
+    #[test]
+    fn parse_srt_empty() {
+        assert!(WhisperBackend::parse_srt("").is_empty());
+        assert!(WhisperBackend::parse_vtt("WEBVTT\n").is_empty());
+    }
+
+    fn test_backend() -> WhisperBackend {
+        // cli_path is never touched by the parsers
+        WhisperBackend {
+            cli_path: std::path::PathBuf::from("/nonexistent/whisper-cli"),
+        }
+    }
+
+    #[test]
+    fn parse_json_new_format() {
+        let json = r#"{
+            "text": "Hello world",
+            "language": "en",
+            "segments": [
+                {"id": 0, "start": 0.0, "end": 2.5, "text": "Hello world"}
+            ]
+        }"#;
+        let backend = test_backend();
+        let resp = backend.parse_json_output(json).unwrap();
+        assert_eq!(resp.text, "Hello world");
+        assert_eq!(resp.language, Some("en".to_string()));
+        assert_eq!(resp.segments.len(), 1);
+        assert!((resp.segments[0].end - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_json_old_format() {
+        let json = r#"{
+            "transcription": [
+                {
+                    "timestamps": {"from": "00:00:00", "to": "00:00:03"},
+                    "offsets": {"from": 0, "to": 3000},
+                    "text": "Hello"
+                }
+            ]
+        }"#;
+        let backend = test_backend();
+        let resp = backend.parse_json_output(json).unwrap();
+        assert_eq!(resp.text, "Hello");
+        assert_eq!(resp.segments.len(), 1);
+        assert!((resp.segments[0].end - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn subtitle_output_combines_text() {
+        let srt = "1\n00:00:00,000 --> 00:00:01,000\npart one\n\n2\n00:00:01,500 --> 00:00:02,000\npart two\n";
+        let resp = WhisperBackend::parse_subtitle_output(srt, "srt");
+        assert_eq!(resp.text, "part one part two");
+        assert_eq!(resp.segments.len(), 2);
+    }
+}

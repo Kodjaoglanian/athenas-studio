@@ -228,3 +228,83 @@ impl Default for ModelRouter {
 }
 
 pub type SharedModelRouter = Arc<Mutex<ModelRouter>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chain(primary: &str, fallbacks: &[&str]) -> FallbackChain {
+        FallbackChain {
+            primary: primary.to_string(),
+            fallbacks: fallbacks.iter().map(|s| s.to_string()).collect(),
+            max_retries: 1,
+            timeout_secs: 0,
+        }
+    }
+
+    #[test]
+    fn alias_resolve() {
+        let mut r = ModelRouter::new();
+        r.add_alias("fast", "model-7b-q4");
+        assert_eq!(r.resolve("fast"), "model-7b-q4");
+        assert_eq!(r.resolve("other"), "other"); // no alias → identity
+    }
+
+    #[test]
+    fn chain_sequence_through_alias() {
+        let mut r = ModelRouter::new();
+        r.add_alias("big", "model-a");
+        r.add_chain(chain("model-a", &["model-b", "model-c"]));
+        assert_eq!(
+            r.get_model_sequence("big"),
+            vec!["model-a", "model-b", "model-c"]
+        );
+    }
+
+    #[test]
+    fn fallback_alias_is_resolved() {
+        let mut r = ModelRouter::new();
+        r.add_chain(chain("primary", &["fb-alias"]));
+        r.add_alias("fb-alias", "fb-real");
+        assert_eq!(r.get_model_sequence("primary"), vec!["primary", "fb-real"]);
+    }
+
+    #[test]
+    fn circuit_breaker_marks_unhealthy() {
+        let mut r = ModelRouter::new();
+        r.set_max_failures(3);
+        assert!(!r.record_failure("m")); // 1
+        assert!(r.is_healthy("m"));
+        assert!(!r.record_failure("m")); // 2
+        assert!(r.is_healthy("m"));
+        assert!(r.record_failure("m")); // 3 → unhealthy
+        assert!(!r.is_healthy("m"));
+    }
+
+    #[test]
+    fn record_success_resets_health() {
+        let mut r = ModelRouter::new();
+        r.set_max_failures(3);
+        r.record_failure("m");
+        r.record_failure("m");
+        r.record_success("m");
+        assert!(!r.record_failure("m")); // counter was reset → still healthy
+        assert!(r.is_healthy("m"));
+    }
+
+    #[test]
+    fn cooldown_allows_retry() {
+        let mut r = ModelRouter::new();
+        r.set_max_failures(1);
+        r.set_cooldown_secs(0); // instant cooldown for the test
+        r.record_failure("m");
+        assert!(r.is_healthy("m")); // cooldown elapsed → retry allowed
+    }
+
+    #[test]
+    fn duplicate_fallbacks_deduped() {
+        let mut r = ModelRouter::new();
+        r.add_chain(chain("a", &["a", "b", "b"]));
+        assert_eq!(r.get_model_sequence("a"), vec!["a", "b"]);
+    }
+}

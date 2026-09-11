@@ -3997,3 +3997,78 @@ async fn cache_clear(State(state): State<AppState>) -> Response {
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn mask_api_key_standard() {
+        assert_eq!(mask_api_key("sk-ath-abcdef1234567890"), "sk-ath-…7890");
+    }
+
+    #[test]
+    fn mask_api_key_no_prefix() {
+        assert_eq!(mask_api_key("someotherkey"), "…rkey");
+    }
+
+    #[test]
+    fn mask_api_key_short() {
+        assert_eq!(mask_api_key("abc"), "…abc");
+    }
+
+    #[test]
+    fn client_ip_no_proxy() {
+        let state_addr: std::net::SocketAddr = "1.2.3.4:5678".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("9.9.9.9"),
+        );
+        // trust_proxy_headers = false → socket IP wins, XFF ignored
+        let state = test_app_state();
+        let ip = client_ip_from_req(&headers, &state, &state_addr);
+        assert_eq!(ip, Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_ip_with_proxy() {
+        let state_addr: std::net::SocketAddr = "10.0.0.1:5678".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_static("9.9.9.9, 8.8.8.8"),
+        );
+        let mut state = test_app_state();
+        state.trust_proxy_headers = true;
+        let ip = client_ip_from_req(&headers, &state, &state_addr);
+        // First XFF entry wins
+        assert_eq!(ip, Some("9.9.9.9".parse().unwrap()));
+    }
+
+    fn test_app_state() -> AppState {
+        AppState {
+            model_manager: Arc::new(Mutex::new(crate::model_manager::ModelManager::new())),
+            session_manager: Arc::new(
+                Mutex::new(crate::session_manager::SessionManager::default()),
+            ),
+            slot_manager: None,
+            api_key_manager: None,
+            model_router: None,
+            audit_logger: None,
+            vector_store: None,
+            semantic_cache: None,
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            semaphore: Arc::new(Semaphore::new(10)),
+            start_time: std::time::Instant::now(),
+            waiting_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            active_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            queue_visibility: false,
+            auto_install_deps: false,
+            trust_proxy_headers: false,
+            max_loaded_models: 0,
+            load_ram_check: true,
+        }
+    }
+}
