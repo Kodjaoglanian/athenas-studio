@@ -199,6 +199,43 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
 `service_name`, `sample_ratio`, `export_logs`, `export_metrics`,
 `service_namespace`, `environment`, `service_instance_id`.
 
+### API Keys & Auth
+
+- **Masked listings**: `GET /v1/keys` and `GET /v1/keys/:id` return
+  `sk-ath-…last4` — never the full secret. The full key is only
+  returned once by `POST /v1/keys`. The TUI keeps its own key in
+  `~/.athenas/tui_key.json` (0600), created via loopback on first
+  connect; `auth_bearer()` uses that, not the listing.
+- **Client IP**: every protected handler must extract
+  `ConnectInfo<SocketAddr>` and pass `client_ip_from_req(&headers,
+  &state, &addr)` to `check_auth_any`/`check_auth_for_key_mgmt`.
+  Passing `None` loses the loopback bypass. When
+  `server.trust_proxy_headers = true` (default false), the first
+  `X-Forwarded-For` entry is used instead of the TCP peer — only
+  enable behind a trusted reverse proxy (XFF is spoofable).
+- **Secret files** (`api_keys.json`, `key_usage.json`,
+  `server_state.json`, `tui_key.json`, `config.toml`) are written with
+  mode 0600 on Unix — keep it that way.
+- **Public bind warning**: `ApiServer::start` logs a loud `warn!` when
+  binding to a non-loopback address with zero API keys configured.
+
+### Resource Safety
+
+- **`inference.auto_install_deps`** (default `false`): gates all OS
+  package-manager calls (`apt/dnf/pacman/apk` for libgomp/Vulkan).
+  When off, errors include the manual install hint. Never call
+  `try_install_*` without checking this flag — `ensure_llama_server`,
+  `force_redownload_llama_server` and `ModelLoadConfig` all carry it.
+- **`server.max_loaded_models`** (0 = unlimited) and
+  **`server.load_ram_check`** (default true): `POST /v1/models/load`
+  rejects with 507 when the count limit is hit or
+  `estimate_model_ram_mb` exceeds available RAM. `"force": true` in
+  the request body bypasses both checks.
+- **Download integrity**: use `ModelDownloader::download_model_verify`
+  with `lfs.sha256` when available — it hashes in `spawn_blocking` and
+  deletes the file on mismatch. `mirror_url` applies to downloads too
+  (`download_url` derives the host from `base_url`).
+
 ## Release Process
 
 1. Bump version in `Cargo.toml` and `README.md`
@@ -219,3 +256,8 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
 - **Don't write `server_panel_state.status_message` directly** — use `set_status()`/`set_error()` so the status bar colors correctly
 - **Don't use the SDK TraceContextPropagator for `traceparent` extraction** — it rejects `trace_flags > 2` (Python sends `03`). Use the manual `parse_traceparent()` in `trace_context.rs`
 - **Don't forget `set_tracer_provider()`** — without it, `opentelemetry::global::tracer()` returns a noop tracer and middleware spans are never exported
+- **Don't forget `ConnectInfo` in auth'd handlers** — without it `check_auth_*` gets no client IP and loopback bypass/XFF break
+- **Don't trust X-Forwarded-For unconditionally** — only when `server.trust_proxy_headers = true`
+- **Don't call `try_install_*` (apt/dnf/pacman) without checking `auto_install_deps`** — default is OFF; show the manual hint instead
+- **Don't return raw `api_key` from list/detail endpoints** — only `POST /v1/keys` may return the full secret (one-time reveal)
+- **Don't use `download_model` when a `lfs.sha256` is available** — prefer `download_model_verify` so corrupted/poisoned weights get rejected
