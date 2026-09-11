@@ -201,10 +201,11 @@ impl HuggingFaceClient {
     }
 
     pub fn download_url(&self, repo_id: &str, filename: &str, revision: &str) -> String {
-        format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            repo_id, revision, filename
-        )
+        // Derive the resolve host from base_url so mirrors (e.g.
+        // hf-mirror.com) apply to downloads too, not just the API.
+        let base = self.base_url.trim_end_matches('/');
+        let host = base.strip_suffix("/api").unwrap_or(base);
+        format!("{}/{}/resolve/{}/{}", host, repo_id, revision, filename)
     }
 
     pub fn client(&self) -> &Client {

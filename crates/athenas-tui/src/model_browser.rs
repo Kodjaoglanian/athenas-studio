@@ -17,7 +17,8 @@ pub struct ModelBrowserState {
     pub status_is_error: bool,
     pub download_progress: Option<(u64, u64, f64)>,
     pub download_filename: Option<String>,
-    pub file_options: Vec<(String, Option<u64>)>,
+    /// (filename, size_bytes, expected sha256 from LFS metadata)
+    pub file_options: Vec<(String, Option<u64>, Option<String>)>,
     pub file_selected: usize,
 }
 

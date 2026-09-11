@@ -143,10 +143,11 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
         }
     };
 
-    // Get file size for progress bar
+    // Get file size for progress bar and sha256 for integrity check
     let files = client.get_model_files(repo_id, revision).await?;
     let file_info = files.iter().find(|f| f.path == filename);
     let total_size = file_info.and_then(|f| f.size.or(f.lfs.as_ref().and_then(|l| l.size)));
+    let expected_sha = file_info.and_then(|f| f.lfs.as_ref().and_then(|l| l.sha256.clone()));
 
     let pb = if let Some(size) = total_size {
         ProgressBar::new(size)
@@ -177,7 +178,7 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
 
     println!("Downloading {} from {}/{}", filename, repo_id, revision);
     let path = downloader
-        .download_model(repo_id, &filename, revision, Some(tx))
+        .download_model_verify(repo_id, &filename, revision, Some(tx), expected_sha)
         .await?;
 
     progress_task.await.ok();
@@ -233,7 +234,13 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
             });
 
             if let Err(e) = downloader
-                .download_model(repo_id, &mmproj.path, revision, Some(tx2))
+                .download_model_verify(
+                    repo_id,
+                    &mmproj.path,
+                    revision,
+                    Some(tx2),
+                    mmproj.lfs.as_ref().and_then(|l| l.sha256.clone()),
+                )
                 .await
             {
                 println!(

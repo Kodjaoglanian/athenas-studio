@@ -39,6 +39,21 @@ impl ModelDownloader {
         revision: &str,
         progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
     ) -> Result<PathBuf> {
+        self.download_model_verify(repo_id, filename, revision, progress_tx, None)
+            .await
+    }
+
+    /// Download a model file and verify its SHA256 against the expected
+    /// digest from the HF API (lfs.sha256). On mismatch the file is
+    /// removed and an error returned.
+    pub async fn download_model_verify(
+        &self,
+        repo_id: &str,
+        filename: &str,
+        revision: &str,
+        progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+        expected_sha256: Option<String>,
+    ) -> Result<PathBuf> {
         let safe_repo = repo_id.replace('/', "__");
         let model_dir = self.models_dir.join(&safe_repo);
         std::fs::create_dir_all(&model_dir)?;
@@ -51,6 +66,8 @@ impl ModelDownloader {
         // Check if file already exists
         if file_path.exists() {
             info!("File already exists: {}", file_path.display());
+            self.verify_sha256(&file_path, expected_sha256.as_deref())
+                .await?;
             return Ok(file_path);
         }
 
@@ -66,7 +83,11 @@ impl ModelDownloader {
                 .parallel_download(&download_url, &file_path, progress_tx.clone())
                 .await
             {
-                Ok(path) => return Ok(path),
+                Ok(path) => {
+                    self.verify_sha256(&path, expected_sha256.as_deref())
+                        .await?;
+                    return Ok(path);
+                }
                 Err(e) => {
                     warn!(
                         "Parallel download failed ({}), falling back to single-stream",
@@ -80,8 +101,50 @@ impl ModelDownloader {
         }
 
         info!("Using single-stream download");
-        self.single_stream_download(&download_url, &file_path, progress_tx)
-            .await
+        let path = self
+            .single_stream_download(&download_url, &file_path, progress_tx)
+            .await?;
+        self.verify_sha256(&path, expected_sha256.as_deref())
+            .await?;
+        Ok(path)
+    }
+
+    /// Verify a downloaded file against an expected SHA256 hex digest.
+    /// Runs in spawn_blocking since model files can be many GB.
+    /// On mismatch the file is deleted.
+    async fn verify_sha256(&self, path: &PathBuf, expected: Option<&str>) -> Result<()> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let expected = expected.to_lowercase();
+        let hash_path = path.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            use sha2::Digest;
+            let mut file = std::fs::File::open(&hash_path)?;
+            let mut hasher = sha2::Sha256::new();
+            std::io::copy(&mut file, &mut hasher)?;
+            Ok::<String, std::io::Error>(hex::encode(hasher.finalize()))
+        })
+        .await
+        .map_err(|e| AthenasError::Download(format!("SHA256 task failed: {}", e)))?
+        .map_err(|e| AthenasError::Download(format!("SHA256 read failed: {}", e)))?;
+
+        if actual == expected {
+            info!("SHA256 verified: {}", &actual[..16.min(actual.len())]);
+            return Ok(());
+        }
+
+        warn!(
+            "SHA256 mismatch for {}: expected {}, got {} — removing file",
+            path.display(),
+            expected,
+            actual
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+        Err(AthenasError::Download(format!(
+            "SHA256 mismatch: expected {}, got {}",
+            expected, actual
+        )))
     }
 
     async fn check_range_support(&self, url: &str) -> Result<bool> {

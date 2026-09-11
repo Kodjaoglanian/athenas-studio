@@ -917,7 +917,7 @@ impl TuiApp {
                     self.browser_state.prev_file();
                 }
                 KeyCode::Enter => {
-                    if let Some((filename, _)) = self
+                    if let Some((filename, _, sha256)) = self
                         .browser_state
                         .file_options
                         .get(self.browser_state.file_selected)
@@ -933,7 +933,7 @@ impl TuiApp {
                         self.browser_state.download_progress = None;
                         self.browser_state.status_message = None;
                         self.browser_state.status_is_error = false;
-                        self.start_download(&repo_id, &filename);
+                        self.start_download(&repo_id, &filename, sha256);
                     }
                 }
                 KeyCode::Esc => {
@@ -989,13 +989,14 @@ impl TuiApp {
 
         match client.get_model_files(repo_id, "main").await {
             Ok(files) => {
-                let gguf_files: Vec<(String, Option<u64>)> = files
+                let gguf_files: Vec<(String, Option<u64>, Option<String>)> = files
                     .iter()
                     .filter(|f| f.path.ends_with(".gguf"))
                     .map(|f| {
                         (
                             f.path.clone(),
                             f.size.or(f.lfs.as_ref().and_then(|l| l.size)),
+                            f.lfs.as_ref().and_then(|l| l.sha256.clone()),
                         )
                     })
                     .collect();
@@ -1022,7 +1023,7 @@ impl TuiApp {
         }
     }
 
-    fn start_download(&mut self, repo_id: &str, filename: &str) {
+    fn start_download(&mut self, repo_id: &str, filename: &str, expected_sha256: Option<String>) {
         let token = self.config.huggingface.token.clone();
         let client = athenas_hub::HuggingFaceClient::new(token);
         let downloader =
@@ -1043,7 +1044,13 @@ impl TuiApp {
 
         let download_task = tokio::spawn(async move {
             let result = downloader
-                .download_model(&repo_id_owned, &filename_owned, "main", Some(tx))
+                .download_model_verify(
+                    &repo_id_owned,
+                    &filename_owned,
+                    "main",
+                    Some(tx),
+                    expected_sha256,
+                )
                 .await;
 
             if result.is_ok() {
@@ -1063,11 +1070,12 @@ impl TuiApp {
 
                     for mmproj in &mmproj_files {
                         let _ = downloader_clone
-                            .download_model(
+                            .download_model_verify(
                                 &repo_id_owned,
                                 &mmproj.path,
                                 "main",
                                 Some(tx_clone.clone()),
+                                mmproj.lfs.as_ref().and_then(|l| l.sha256.clone()),
                             )
                             .await;
                     }

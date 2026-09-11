@@ -1038,7 +1038,7 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
             ));
             lines.push(Line::from(""));
 
-            for (i, (name, size)) in state.file_options.iter().enumerate() {
+            for (i, (name, size, _sha)) in state.file_options.iter().enumerate() {
                 let is_selected = i == state.file_selected;
                 let prefix = if is_selected { " > " } else { "   " };
                 let style = if is_selected {
