@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "athenas"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "athenas-core",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "athenas-core"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "chrono",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "athenas-hub"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "athenas-core",
@@ -218,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "athenas-inference"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "athenas-server"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "athenas-tui"
-version = "0.9.15"
+version = "0.9.16"
 dependencies = [
  "anyhow",
  "athenas-core",

@@ -532,7 +532,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.9.15"
+version = "0.9.16"
 
 [paths]
 models_dir = "~/.athenas/models"
@@ -562,6 +562,7 @@ auto_resource_limits = true     # auto-cap threads/ctx/batch based on hardware
 # Advanced inference
 lora_paths = []                 # LoRA adapter paths (e.g. ["/path/to/adapter.gguf"])
 parallel_slots = 4              # parallel decoding slots (1=safe, 4=resilient but more RAM)
+auto_install_deps = false       # allow apt/dnf/pacman to install missing libs (libgomp, Vulkan)
 
 [server]
 default_host = "127.0.0.1"
@@ -577,6 +578,9 @@ enable_compression = true       # gzip response compression
 # IP filtering (empty allowlist = allow all)
 ip_allowlist = []               # e.g. ["10.0.0.0/8", "192.168.1.100"]
 ip_denylist = []                # e.g. ["10.0.0.5"]
+# trust_proxy_headers = false   # read client IP from X-Forwarded-For (only behind a trusted proxy)
+# max_loaded_models = 0         # 0 = unlimited simultaneous loaded models
+# load_ram_check = true         # reject /v1/models/load when estimated RAM exceeds available
 
 [server.vector_store]
 enabled = false                 # enable integrated vector store for RAG
