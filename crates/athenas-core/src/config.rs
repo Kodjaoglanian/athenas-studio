@@ -55,6 +55,11 @@ pub struct InferenceConfig {
     /// When false, use the configured values as-is without auto-capping.
     #[serde(default = "default_true")]
     pub auto_resource_limits: bool,
+    /// When true, missing system libraries (libgomp, Vulkan loader) may be
+    /// installed via the system package manager (apt/dnf/pacman/apk).
+    /// Default false — never modify the OS without explicit opt-in.
+    #[serde(default)]
+    pub auto_install_deps: bool,
     /// LoRA adapter paths (comma-separated in config, stored as Vec)
     #[serde(default)]
     pub lora_paths: Vec<String>,
@@ -122,6 +127,22 @@ pub struct ServerConfig {
     /// Semantic cache configuration
     #[serde(default)]
     pub semantic_cache: SemanticCacheConfig,
+    /// When true, the real client IP is read from X-Forwarded-For (first
+    /// entry) instead of the TCP peer address. Only enable when running
+    /// behind a trusted reverse proxy — otherwise clients can spoof their
+    /// IP to bypass IP filters, rate limits, and loopback admin checks.
+    #[serde(default)]
+    pub trust_proxy_headers: bool,
+    /// Maximum number of models that can be loaded simultaneously via
+    /// /v1/models/load. 0 = unlimited. Each loaded model spawns its own
+    /// llama-server process with full RAM/VRAM cost.
+    #[serde(default)]
+    pub max_loaded_models: u32,
+    /// When true (default), /v1/models/load rejects the request with 507
+    /// if the estimated RAM (model file + context overhead) exceeds
+    /// available memory. The caller can bypass with `"force": true`.
+    #[serde(default = "default_true")]
+    pub load_ram_check: bool,
 }
 
 fn default_max_concurrent() -> u32 {
@@ -367,6 +388,7 @@ impl Default for AppConfig {
                 ram_reserve_mb: 2048,
                 cpu_reserve_cores: 1,
                 auto_resource_limits: true,
+                auto_install_deps: false,
                 lora_paths: Vec::new(),
                 parallel_slots: 4,
                 draft_model: None,
@@ -389,6 +411,9 @@ impl Default for AppConfig {
                 otel: OtelConfig::default(),
                 queue_visibility: false,
                 semantic_cache: SemanticCacheConfig::default(),
+                trust_proxy_headers: false,
+                max_loaded_models: 0,
+                load_ram_check: true,
             },
             huggingface: HuggingFaceConfig {
                 token: None,
