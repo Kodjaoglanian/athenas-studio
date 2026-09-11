@@ -42,6 +42,7 @@ impl ApiServer {
         let rate_limiter = Arc::new(RateLimiter::new(
             config.server.rate_limit_per_second,
             config.server.rate_limit_per_second,
+            config.server.trust_proxy_headers,
         ));
 
         let model_manager = Arc::new(Mutex::new(ModelManager::with_default(backend)));
@@ -72,6 +73,7 @@ impl ApiServer {
         let rate_limiter = Arc::new(RateLimiter::new(
             config.server.rate_limit_per_second,
             config.server.rate_limit_per_second,
+            config.server.trust_proxy_headers,
         ));
 
         let session_manager = Arc::new(Mutex::new(SessionManager::new(100, 4)));
@@ -144,6 +146,27 @@ impl ApiServer {
     }
 
     pub async fn start(&self, host: &str, port: u16) -> Result<()> {
+        // Warn loudly when exposing the API without any authentication:
+        // non-loopback bind + zero API keys = every route is open.
+        let bind_ip: Option<std::net::IpAddr> = host.parse().ok();
+        let is_loopback = bind_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+        let is_wildcard = bind_ip.map(|ip| ip.is_unspecified()).unwrap_or(false);
+        if !is_loopback || is_wildcard {
+            let key_count = match &self.api_key_manager {
+                Some(mgr) => mgr.lock().await.list_keys().len(),
+                None => 0,
+            };
+            if key_count == 0 {
+                tracing::warn!(
+                    "⚠️  Server binding to '{}' with NO API keys configured — \
+                     the API is OPEN to anyone who can reach this address. \
+                     Create a key with POST /v1/keys (from localhost) or via \
+                     the TUI API Keys section.",
+                    host
+                );
+            }
+        }
+
         let app = crate::routes::create_router(
             self.model_manager.clone(),
             self.metrics.clone(),
@@ -157,6 +180,7 @@ impl ApiServer {
             self.vector_store.clone(),
             self.semantic_cache.clone(),
             &self.config.server,
+            self.config.inference.auto_install_deps,
         );
 
         let addr = format!("{}:{}", host, port);

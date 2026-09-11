@@ -56,6 +56,35 @@ struct AppState {
     active_requests: Arc<std::sync::atomic::AtomicU32>,
     /// Whether to include queue position headers in responses.
     queue_visibility: bool,
+    /// Whether system package managers may install missing libraries
+    /// (libgomp, Vulkan loader) — from inference.auto_install_deps.
+    auto_install_deps: bool,
+    /// Read client IP from X-Forwarded-For instead of TCP peer.
+    trust_proxy_headers: bool,
+    /// Max simultaneous loaded models (0 = unlimited).
+    max_loaded_models: u32,
+    /// Reject /v1/models/load when estimated RAM exceeds available memory.
+    load_ram_check: bool,
+}
+
+/// Resolve the real client IP for auth checks — X-Forwarded-For (first
+/// entry) when `server.trust_proxy_headers` is enabled, else the TCP
+/// peer address from ConnectInfo.
+fn client_ip_from_req(
+    headers: &HeaderMap,
+    state: &AppState,
+    addr: &std::net::SocketAddr,
+) -> Option<std::net::IpAddr> {
+    if state.trust_proxy_headers {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first) = xff.split(',').next() {
+                if let Ok(ip) = first.trim().parse() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    Some(addr.ip())
 }
 
 /// RAII guard that decrements the active request counter when dropped.
@@ -166,6 +195,7 @@ pub fn create_router(
     vector_store: Option<SharedVectorStore>,
     semantic_cache: Option<SharedSemanticCache>,
     config: &ServerConfig,
+    auto_install_deps: bool,
 ) -> Router {
     let state = AppState {
         model_manager,
@@ -182,6 +212,10 @@ pub fn create_router(
         waiting_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         active_requests: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         queue_visibility: config.queue_visibility,
+        auto_install_deps,
+        trust_proxy_headers: config.trust_proxy_headers,
+        max_loaded_models: config.max_loaded_models,
+        load_ram_check: config.load_ram_check,
     };
 
     let mut router = Router::new()
@@ -250,8 +284,11 @@ pub fn create_router(
     // IP filter (only if allowlist or denylist is configured)
     let has_ip_filter = !config.ip_allowlist.is_empty() || !config.ip_denylist.is_empty();
     if has_ip_filter {
-        let ip_filter =
-            IpFilterConfig::new(config.ip_allowlist.clone(), config.ip_denylist.clone());
+        let ip_filter = IpFilterConfig::new(
+            config.ip_allowlist.clone(),
+            config.ip_denylist.clone(),
+            config.trust_proxy_headers,
+        );
         router = router.layer(from_fn_with_state(ip_filter, ip_filter_middleware));
     }
 
@@ -500,7 +537,13 @@ async fn list_models(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1483,9 +1526,16 @@ async fn completions(
 async fn upload_file(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1580,9 +1630,16 @@ async fn upload_file(
 async fn transcribe_audio(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     mut multipart: axum::extract::Multipart,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1900,7 +1957,13 @@ async fn unload_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<UnloadModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1934,7 +1997,13 @@ async fn set_default_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -1966,9 +2035,16 @@ struct CreateSessionRequest {
 async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2004,8 +2080,18 @@ async fn create_session(
     .into_response()
 }
 
-async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2022,9 +2108,16 @@ async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> Res
 async fn get_session(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2054,9 +2147,16 @@ async fn get_session(
 async fn delete_session(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2075,9 +2175,16 @@ async fn delete_session(
 async fn get_session_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2124,10 +2231,17 @@ struct SetSystemPromptRequest {
 async fn set_session_system_prompt(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<SetSystemPromptRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2145,8 +2259,18 @@ async fn set_session_system_prompt(
     }
 }
 
-async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn purge_expired_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2163,8 +2287,18 @@ async fn purge_expired_sessions(State(state): State<AppState>, headers: HeaderMa
 
 // ── Slot management endpoints ────────────────────────────────────────
 
-async fn list_slots(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn list_slots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2194,10 +2328,17 @@ struct SaveSlotRequest {
 async fn save_slot(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2227,10 +2368,17 @@ async fn save_slot(
 async fn restore_slot(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
     Json(req): Json<SaveSlotRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2260,9 +2408,16 @@ async fn restore_slot(
 async fn erase_slot(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Path(slot_id): axum::extract::Path<i32>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2909,7 +3064,13 @@ async fn create_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateKeyRequest>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -2940,7 +3101,13 @@ async fn list_api_keys(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3005,7 +3172,13 @@ async fn get_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3043,7 +3216,13 @@ async fn delete_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3070,7 +3249,13 @@ async fn revoke_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3097,7 +3282,13 @@ async fn get_api_key_usage(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(&headers, &state, Some(addr.ip())).await {
+    if !check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3143,9 +3334,16 @@ struct CreateAliasRequest {
 async fn create_alias(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3160,8 +3358,18 @@ async fn create_alias(
         .into_response()
 }
 
-async fn list_aliases(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn list_aliases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3190,9 +3398,16 @@ struct CreateChainRequest {
 async fn create_chain(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateChainRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3217,8 +3432,18 @@ async fn create_chain(
     .into_response()
 }
 
-async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn list_chains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3232,8 +3457,18 @@ async fn list_chains(State(state): State<AppState>, headers: HeaderMap) -> Respo
     Json(serde_json::json!({"chains": chains})).into_response()
 }
 
-async fn routing_health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn routing_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3300,9 +3535,16 @@ struct AuditQueryParams {
 async fn query_audit_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3321,8 +3563,18 @@ async fn query_audit_logs(
     Json(serde_json::json!({"logs": entries, "count": entries.len()})).into_response()
 }
 
-async fn audit_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn audit_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3349,9 +3601,16 @@ struct VsAddRequest {
 async fn vs_add_document(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VsAddRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3387,9 +3646,16 @@ struct VsAddBatchRequest {
 async fn vs_add_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VsAddBatchRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3431,9 +3697,16 @@ struct VsSearchRequest {
 async fn vs_search(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VsSearchRequest>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3453,8 +3726,18 @@ async fn vs_search(
     Json(serde_json::json!({"results": results, "count": results.len()})).into_response()
 }
 
-async fn vs_list_documents(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn vs_list_documents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3476,9 +3759,16 @@ async fn vs_list_documents(State(state): State<AppState>, headers: HeaderMap) ->
 async fn vs_get_document(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3500,9 +3790,16 @@ async fn vs_get_document(
 async fn vs_delete_document(
     State(state): State<AppState>,
     headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3522,8 +3819,18 @@ async fn vs_delete_document(
     }
 }
 
-async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn vs_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
@@ -3536,8 +3843,18 @@ async fn vs_clear(State(state): State<AppState>, headers: HeaderMap) -> Response
     Json(serde_json::json!({"status": "cleared"})).into_response()
 }
 
-async fn vs_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !check_auth_any(&headers, &state, None).await {
+async fn vs_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if !check_auth_any(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    {
         return StatusCode::UNAUTHORIZED.into_response();
     }
 

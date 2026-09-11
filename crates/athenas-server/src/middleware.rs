@@ -11,10 +11,37 @@ use axum::{
 };
 use tokio::sync::Mutex;
 
+/// Extract the real client IP for a request.
+///
+/// When `trust_proxy` is enabled, reads the first address in the
+/// `X-Forwarded-For` header; otherwise uses the TCP peer address from
+/// ConnectInfo. Only enable behind a trusted reverse proxy — a direct
+/// client can spoof XFF otherwise.
+pub fn client_ip(req: &Request, trust_proxy: bool) -> IpAddr {
+    if trust_proxy {
+        if let Some(xff) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let Some(first) = xff.split(',').next() {
+                if let Ok(ip) = first.trim().parse::<IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+    }
+    req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+}
+
 pub struct RateLimiter {
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
     max_tokens: u32,
     refill_rate: Duration,
+    trust_proxy: bool,
 }
 
 struct Bucket {
@@ -23,11 +50,14 @@ struct Bucket {
 }
 
 impl RateLimiter {
-    pub fn new(max_tokens: u32, refill_per_second: u32) -> Self {
+    pub fn new(max_tokens: u32, refill_per_second: u32, trust_proxy: bool) -> Self {
+        // Clamp to >= 1 req/s — 0 would produce a NaN/inf refill rate
+        let refill = refill_per_second.max(1);
         Self {
             buckets: Mutex::new(HashMap::new()),
             max_tokens,
-            refill_rate: Duration::from_secs_f64(1.0 / refill_per_second as f64),
+            refill_rate: Duration::from_secs_f64(1.0 / refill as f64),
+            trust_proxy,
         }
     }
 
@@ -60,11 +90,7 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let ip = req
-        .extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    let ip = client_ip(&req, limiter.trust_proxy);
 
     if !limiter.check(ip).await {
         return (
@@ -86,13 +112,16 @@ pub struct IpFilterConfig {
     pub allowlist: Vec<String>,
     /// List of denied IPs/CIDRs. These are always blocked.
     pub denylist: Vec<String>,
+    /// Read client IP from X-Forwarded-For instead of TCP peer.
+    pub trust_proxy: bool,
 }
 
 impl IpFilterConfig {
-    pub fn new(allowlist: Vec<String>, denylist: Vec<String>) -> Self {
+    pub fn new(allowlist: Vec<String>, denylist: Vec<String>, trust_proxy: bool) -> Self {
         Self {
             allowlist,
             denylist,
+            trust_proxy,
         }
     }
 
@@ -186,11 +215,7 @@ pub async fn ip_filter_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let ip = req
-        .extensions()
-        .get::<ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    let ip = client_ip(&req, filter.trust_proxy);
 
     if !filter.is_allowed(&ip) {
         tracing::warn!("IP {} blocked by filter", ip);
