@@ -70,9 +70,3 @@ impl From<toml::ser::Error> for AthenasError {
         AthenasError::Config(e.to_string())
     }
 }
-
-impl From<rusqlite::Error> for AthenasError {
-    fn from(e: rusqlite::Error) -> Self {
-        AthenasError::Storage(e.to_string())
-    }
-}
