@@ -31,6 +31,9 @@ pub struct LlamaCppBackend {
     watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     /// Shared flag to signal the watchdog to stop
     watchdog_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the watchdog after 3 consecutive health failures, cleared
+    /// on recovery. health_check() fails fast while this is set.
+    unresponsive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LlamaCppBackend {
@@ -58,6 +61,7 @@ impl LlamaCppBackend {
             reasoning_enabled: true,
             watchdog_handle: None,
             watchdog_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            unresponsive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -639,7 +643,10 @@ impl LlamaCppBackend {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         self.watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.unresponsive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let stop_flag = self.watchdog_stop.clone();
+        let unresponsive_flag = self.unresponsive.clone();
         let port = self.server_port;
         let client = self.client.clone();
 
@@ -670,6 +677,7 @@ impl LlamaCppBackend {
                             );
                         }
                         consecutive_failures = 0;
+                        unresponsive_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
                     Ok(resp) => {
                         consecutive_failures += 1;
@@ -678,12 +686,17 @@ impl LlamaCppBackend {
                             resp.status(),
                             consecutive_failures
                         );
+                        if consecutive_failures >= 3 {
+                            unresponsive_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     Err(e) => {
                         consecutive_failures += 1;
                         if consecutive_failures >= 3 {
+                            unresponsive_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                             error!(
                                 "llama-server unresponsive after 3 consecutive failures ({}). \
+                                 Marked unhealthy — health_check() now fails fast. \
                                  It may be deadlocked or out of memory. \
                                  Consider restarting the server.",
                                 e
@@ -727,6 +740,10 @@ impl LlamaCppBackend {
     /// when all inference slots are stuck (llama.cpp issue #7071).
     async fn check_server_alive(&self) -> bool {
         if self.server_port == 0 {
+            return false;
+        }
+        // Fail fast when the watchdog has marked the server unresponsive
+        if self.unresponsive.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
         // Try a minimal tokenization request first (fast, doesn't need a slot)
@@ -1675,6 +1692,10 @@ impl Backend for LlamaCppBackend {
         if !self.loaded || self.server_port == 0 {
             return Ok(false);
         }
+        // Fail fast when the watchdog has marked the server unresponsive
+        if self.unresponsive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
         let url = format!("http://127.0.0.1:{}/health", self.server_port);
         let result = self
             .client
@@ -1703,6 +1724,7 @@ impl Backend for LlamaCppBackend {
             reasoning_enabled: self.reasoning_enabled,
             watchdog_handle: None, // Watchdog is not cloned
             watchdog_stop: self.watchdog_stop.clone(),
+            unresponsive: self.unresponsive.clone(),
         })
     }
 }
