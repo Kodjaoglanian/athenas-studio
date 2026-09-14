@@ -1907,51 +1907,23 @@ async fn load_model_endpoint(
         }
     }
 
-    // Pre-flight: estimate RAM needed (model file + context overhead) and
-    // compare against available memory. Each loaded model spawns its own
-    // llama-server process — without this, OOM is one request away.
-    if state.load_ram_check && !req.force {
-        let model_path = req.model_path.clone();
-        let ctx = req.context_size.unwrap_or(4096);
-        let check = tokio::task::spawn_blocking(move || {
-            let size_mb = std::fs::metadata(&model_path)
-                .map(|m| m.len() / (1024 * 1024))
-                .unwrap_or(0);
-            let (total_mb, avail_mb) = athenas_core::detect_memory_mb();
-            (size_mb, total_mb, avail_mb)
-        })
-        .await;
-
-        if let Ok((size_mb, _total_mb, avail_mb)) = check {
-            if size_mb > 0 {
-                let needed = athenas_core::estimate_model_ram_mb(size_mb, ctx);
-                if needed > avail_mb {
-                    return (
-                        StatusCode::INSUFFICIENT_STORAGE,
-                        Json(serde_json::json!({
-                            "error": format!(
-                                "Not enough RAM: model needs ~{}MB but only {}MB available. \
-                                 Reduce context_size, or retry with \"force\": true.",
-                                needed, avail_mb
-                            ),
-                            "estimated_ram_mb": needed,
-                            "available_ram_mb": avail_mb,
-                        })),
-                    )
-                        .into_response();
-                }
-            }
-        }
-    }
-
     let backend_type = match req.backend.as_deref() {
         Some("llama.cpp") | Some("llamacpp") | Some("llama") => athenas_core::BackendType::LlamaCpp,
         Some("vllm") => athenas_core::BackendType::Vllm,
         _ => athenas_core::BackendType::Auto,
     };
 
-    let hardware = match athenas_core::HardwareDetector::detect() {
-        Ok(h) => h,
+    // Hardware detection doubles as a fresh memory/VRAM read for the
+    // pre-flight check below (vram_used reflects already-loaded models).
+    let hardware = match tokio::task::spawn_blocking(athenas_core::HardwareDetector::detect).await {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Hardware detection failed: {}", e)})),
+            )
+                .into_response();
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1960,6 +1932,43 @@ async fn load_model_endpoint(
                 .into_response();
         }
     };
+
+    // Pre-flight: estimate where the model footprint lands (RAM vs VRAM
+    // depends on gpu_layers) and compare against what's actually free.
+    // Each loaded model spawns its own llama-server process — without
+    // this, OOM is one request away.
+    if state.load_ram_check && !req.force {
+        let model_path = req.model_path.clone();
+        let size_mb = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&model_path)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
+
+        if size_mb > 0 {
+            let ctx = req.context_size.unwrap_or(4096);
+            let gpu_layers = req.gpu_layers.unwrap_or(-1);
+            let est = athenas_core::estimate_model_memory(size_mb, ctx, gpu_layers, &hardware);
+            if let Some((resource, needed, avail)) = est.shortfall(&hardware) {
+                return (
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    Json(serde_json::json!({
+                        "error": format!(
+                            "Not enough {}: model needs ~{}MB but only {}MB available. \
+                             Reduce context_size/gpu_layers, or retry with \"force\": true.",
+                            resource, needed, avail
+                        ),
+                        "resource": resource,
+                        "estimated_mb": needed,
+                        "available_mb": avail,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     let mut backend = match BackendFactory::create(backend_type, &hardware) {
         Ok(b) => b,

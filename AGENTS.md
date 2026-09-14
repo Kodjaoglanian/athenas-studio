@@ -101,12 +101,18 @@ Files with `mmproj` in the name are multimodal projectors (CLIP vision models), 
 `set_status()` (info) / `set_error()` (red) / `clear_status()`. Never write
 `status_message` directly and never infer errors from string prefixes.
 
-### RAM Estimate (shared heuristic)
+### RAM/VRAM Estimate (shared heuristic)
 
-`athenas_core::estimate_model_ram_mb(model_size_mb, context_size)` =
-`file_size + (ctx / 1024) * 64` MB. Used by BOTH the chat loader and the
-server panel's `estimate_selected_model_load()`. If you change the heuristic,
-keep it shared — don't duplicate the formula.
+`athenas_core::estimate_model_memory(model_size_mb, context_size, gpu_layers,
+hw)` returns a `ModelMemoryEstimate` splitting the footprint between host
+RAM and VRAM: `gpu_layers == 0` or no GPU → everything in RAM; `< 0` (all
+layers) → weights + KV cache in VRAM, ~512MB + ctx/4 in RAM; `> 0` → RAM
+upper bound + midpoint VRAM. `.fits(hw)`/`.shortfall(hw)` compare against
+`memory_available_mb` and free VRAM (APUs check system RAM instead; 0 =
+detection failed → never blocks). Used by the `/v1/models/load` pre-flight,
+the server panel's `estimate_selected_model_load()`, and the chat loader.
+`estimate_model_ram_mb` is the raw `file_size + (ctx/1024)*64` formula the
+split builds on. Keep the heuristic shared — don't duplicate it.
 
 ### Editing Fields (no placeholder leakage)
 

@@ -1,6 +1,5 @@
 use athenas_core::{
-    estimate_model_ram_mb, AppConfig, BackendType, HardwareInfo, ModelInfo as RegistryModelInfo,
-    ModelRegistry,
+    AppConfig, BackendType, HardwareInfo, ModelInfo as RegistryModelInfo, ModelRegistry,
 };
 use athenas_inference::{Backend, BackendFactory, ModelLoadConfig};
 
@@ -1169,13 +1168,21 @@ impl ServerPanelState {
     pub fn estimate_selected_model_load(&self) -> Option<LoadEstimate> {
         let model = self.models.get(self.model_selected)?;
         let model_size_mb = model.file_size_bytes / (1024 * 1024);
-        let full_ram = estimate_model_ram_mb(model_size_mb, self.context_size);
-        let ctx_overhead = full_ram - model_size_mb;
+
+        // Shared heuristic — same RAM/VRAM split the server pre-flight uses.
+        let mem = athenas_core::estimate_model_memory(
+            model_size_mb,
+            self.context_size,
+            self.gpu_layers,
+            &self.hardware,
+        );
+        let ram_mb = mem.ram_mb;
+        let vram_mb = mem.vram_mb;
+        let full_gpu_offload = mem.full_gpu_offload;
+        let partial_gpu_offload = mem.partial_gpu_offload;
 
         let ram_available_mb = self.hardware.memory_available_mb;
-        let gpu_offload = self.gpu_layers != 0 && !self.hardware.gpus.is_empty();
-        let full_gpu_offload = gpu_offload && self.gpu_layers < 0;
-        let partial_gpu_offload = gpu_offload && self.gpu_layers > 0;
+        let gpu_offload = full_gpu_offload || partial_gpu_offload;
 
         let target_gpu = if gpu_offload {
             self.hardware
@@ -1193,17 +1200,6 @@ impl ServerPanelState {
         // system RAM available, not the tiny dedicated VRAM.
         let is_apu = target_gpu.map(|g| g.is_apu).unwrap_or(false);
         let vram_free_mb = target_gpu.map(|g| g.vram_total_mb.saturating_sub(g.vram_used_mb));
-
-        let (ram_mb, vram_mb) = if full_gpu_offload {
-            // Weights + KV cache go to VRAM; host keeps runtime buffers only
-            (512 + ctx_overhead / 4, Some(model_size_mb + ctx_overhead))
-        } else if partial_gpu_offload {
-            // Unknown layer split — RAM shown is a safe upper bound,
-            // VRAM a rough midpoint.
-            (full_ram, Some(model_size_mb / 2))
-        } else {
-            (full_ram, None)
-        };
 
         // Unknown available memory (detection failed) → don't claim it won't fit
         let fits_ram = ram_available_mb == 0 || ram_mb <= ram_available_mb;

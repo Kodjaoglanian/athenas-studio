@@ -1592,21 +1592,27 @@ impl TuiApp {
         let avail_mb = self.hardware.memory_available_mb;
         let total_mb = self.hardware.memory_total_mb;
 
-        // Shared heuristic: file size (weights, mmap'd) + context/KV-cache
-        // overhead that scales with the configured context size.
-        let estimated_needed_mb = athenas_core::estimate_model_ram_mb(
+        // Shared heuristic: file size + context/KV-cache overhead, split
+        // between host RAM and VRAM according to the gpu_layers setting.
+        let est = athenas_core::estimate_model_memory(
             model_size_mb,
             self.config.inference.default_context_size,
+            self.config.inference.default_gpu_layers,
+            &self.hardware,
         );
 
-        if auto_limits && avail_mb > 0 && estimated_needed_mb > avail_mb {
+        if auto_limits && !est.fits(&self.hardware) {
+            let (resource, needed, avail) = est
+                .shortfall(&self.hardware)
+                .unwrap_or(("RAM", est.ram_mb, avail_mb));
             self.chat_state.add_message(
                 "system",
                 &format!(
-                    "⚠ Not enough RAM to load this model safely.\n\
+                    "⚠ Not enough {} to load this model safely.\n\
                      Model: {}MB, estimated need: {}MB, available: {}MB\n\
-                     Try a smaller model, smaller context size, or close other applications.",
-                    model_size_mb, estimated_needed_mb, avail_mb
+                     Try a smaller model, smaller context size, more GPU layers, \
+                     or close other applications.",
+                    resource, model_size_mb, needed, avail
                 ),
             );
             return;

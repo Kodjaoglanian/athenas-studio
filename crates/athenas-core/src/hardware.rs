@@ -94,6 +94,90 @@ pub fn estimate_model_ram_mb(model_size_mb: u64, context_size: u32) -> u64 {
     model_size_mb + (context_size as u64 / 1024) * 64
 }
 
+/// Memory footprint estimate for loading a model, split between host
+/// RAM and GPU VRAM. Shared by the TUI estimate banner, the chat loader
+/// and the `/v1/models/load` pre-flight — keep the heuristic in one place.
+#[derive(Debug, Clone)]
+pub struct ModelMemoryEstimate {
+    /// Host RAM needed (MB)
+    pub ram_mb: u64,
+    /// VRAM needed (MB) — Some when any layer is offloaded to a GPU
+    pub vram_mb: Option<u64>,
+    /// All layers offloaded to the GPU (gpu_layers < 0)
+    pub full_gpu_offload: bool,
+    /// Some layers offloaded to the GPU (gpu_layers > 0)
+    pub partial_gpu_offload: bool,
+}
+
+impl ModelMemoryEstimate {
+    /// Which resource falls short, if any: (resource name, needed MB,
+    /// available MB). None when the estimate fits. Values of 0 mean
+    /// "detection failed" and never block the load.
+    pub fn shortfall(&self, hw: &HardwareInfo) -> Option<(&'static str, u64, u64)> {
+        let avail_ram = hw.memory_available_mb;
+        if avail_ram > 0 && self.ram_mb > avail_ram {
+            return Some(("RAM", self.ram_mb, avail_ram));
+        }
+        if let Some(vram_need) = self.vram_mb {
+            let dedicated_free: u64 = hw
+                .gpus
+                .iter()
+                .filter(|g| !g.is_apu)
+                .map(|g| g.vram_total_mb.saturating_sub(g.vram_used_mb))
+                .sum();
+            if dedicated_free > 0 {
+                if vram_need > dedicated_free {
+                    return Some(("VRAM", vram_need, dedicated_free));
+                }
+            } else if hw.gpus.iter().any(|g| g.is_apu) {
+                // APUs use unified memory — the "VRAM" share comes out of
+                // system RAM, so compare against that instead.
+                if avail_ram > 0 && vram_need > avail_ram {
+                    return Some(("RAM", vram_need, avail_ram));
+                }
+            }
+        }
+        None
+    }
+
+    pub fn fits(&self, hw: &HardwareInfo) -> bool {
+        self.shortfall(hw).is_none()
+    }
+}
+
+/// Estimate where a model's memory footprint lands given the offload
+/// setting. `gpu_layers` == 0 or no GPU → everything in host RAM;
+/// < 0 (all layers) → weights + KV cache in VRAM, host keeps runtime
+/// buffers only; > 0 → unknown split, RAM is a safe upper bound.
+pub fn estimate_model_memory(
+    model_size_mb: u64,
+    context_size: u32,
+    gpu_layers: i32,
+    hw: &HardwareInfo,
+) -> ModelMemoryEstimate {
+    let full_ram = estimate_model_ram_mb(model_size_mb, context_size);
+    let ctx_overhead = full_ram - model_size_mb;
+
+    let gpu_offload = gpu_layers != 0 && !hw.gpus.is_empty();
+    let full_gpu_offload = gpu_offload && gpu_layers < 0;
+    let partial_gpu_offload = gpu_offload && gpu_layers > 0;
+
+    let (ram_mb, vram_mb) = if full_gpu_offload {
+        (512 + ctx_overhead / 4, Some(full_ram))
+    } else if partial_gpu_offload {
+        (full_ram, Some(model_size_mb / 2))
+    } else {
+        (full_ram, None)
+    };
+
+    ModelMemoryEstimate {
+        ram_mb,
+        vram_mb,
+        full_gpu_offload,
+        partial_gpu_offload,
+    }
+}
+
 /// Check if a GPU name indicates an APU (integrated GPU with unified memory).
 /// APUs share system RAM instead of having dedicated VRAM.
 pub fn is_apu_name(name: &str) -> bool {
@@ -551,5 +635,94 @@ fn detect_vulkan() -> bool {
         false
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hw(ram_avail_mb: u64, gpus: Vec<GpuInfo>) -> HardwareInfo {
+        HardwareInfo {
+            cpus: 8,
+            memory_total_mb: ram_avail_mb,
+            memory_available_mb: ram_avail_mb,
+            gpus,
+            has_cuda: false,
+            has_rocm: false,
+            has_vulkan: false,
+            has_metal: false,
+        }
+    }
+
+    fn gpu(vram_total_mb: u64, vram_used_mb: u64, is_apu: bool) -> GpuInfo {
+        GpuInfo {
+            index: 0,
+            name: "Test GPU".to_string(),
+            vendor: GpuVendor::Nvidia,
+            vram_total_mb,
+            vram_used_mb,
+            driver_version: "test".to_string(),
+            compute_capability: None,
+            is_apu,
+        }
+    }
+
+    #[test]
+    fn cpu_only_counts_full_file_against_ram() {
+        let est = estimate_model_memory(8192, 4096, 0, &hw(32 * 1024, vec![]));
+        assert_eq!(est.ram_mb, 8192 + 256);
+        assert_eq!(est.vram_mb, None);
+        assert!(!est.full_gpu_offload && !est.partial_gpu_offload);
+    }
+
+    #[test]
+    fn full_offload_moves_weights_to_vram() {
+        let h = hw(8192, vec![gpu(24 * 1024, 0, false)]);
+        let est = estimate_model_memory(8192, 4096, -1, &h);
+        assert_eq!(est.vram_mb, Some(8192 + 256));
+        assert!(est.ram_mb < 1024); // host keeps buffers only
+        assert!(est.full_gpu_offload);
+        assert!(est.fits(&h));
+    }
+
+    #[test]
+    fn full_offload_fails_when_vram_short() {
+        let h = hw(8192, vec![gpu(4096, 0, false)]);
+        let est = estimate_model_memory(8192, 4096, -1, &h);
+        let (res, _, _) = est.shortfall(&h).unwrap();
+        assert_eq!(res, "VRAM");
+    }
+
+    #[test]
+    fn full_offload_accounts_for_vram_already_used() {
+        // 24GB GPU with 20GB used by the first loaded model → second
+        // 8GB model must be rejected.
+        let h = hw(64 * 1024, vec![gpu(24 * 1024, 20 * 1024, false)]);
+        let est = estimate_model_memory(8192, 4096, -1, &h);
+        assert_eq!(est.shortfall(&h).unwrap().0, "VRAM");
+    }
+
+    #[test]
+    fn no_gpu_means_gpu_layers_ignored() {
+        // gpu_layers=-1 but no GPU detected → falls back to full RAM estimate
+        let est = estimate_model_memory(8192, 4096, -1, &hw(32 * 1024, vec![]));
+        assert_eq!(est.vram_mb, None);
+        assert_eq!(est.ram_mb, 8192 + 256);
+    }
+
+    #[test]
+    fn apu_uses_system_ram_for_vram_share() {
+        let h = hw(8192, vec![gpu(512, 0, true)]);
+        let est = estimate_model_memory(12 * 1024, 4096, -1, &h);
+        // VRAM portion (12GB+) can't fit in 8GB system RAM
+        assert_eq!(est.shortfall(&h).unwrap().0, "RAM");
+    }
+
+    #[test]
+    fn unknown_memory_never_blocks() {
+        // Detection failure (0) must not produce a false rejection
+        let est = estimate_model_memory(64 * 1024, 4096, 0, &hw(0, vec![]));
+        assert!(est.fits(&hw(0, vec![])));
     }
 }
