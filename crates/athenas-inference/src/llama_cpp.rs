@@ -371,12 +371,44 @@ impl LlamaCppBackend {
             cmd.arg("--flash-attn").arg("on");
         }
 
-        if config.use_mmap {
-            cmd.arg("--mmap");
-        }
+        // Several flags changed across llama.cpp versions: old binaries
+        // accept --mmap/--no-mmap/--mlock and --draft-*/--draft-min-ctx;
+        // newer ones replaced them with --load-mode and --spec-draft-*.
+        // Probe --help once to pick the right syntax.
+        let help_text = tokio::process::Command::new(&server_bin)
+            .arg("--help")
+            .output()
+            .await
+            .map(|o| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+        let supports_load_mode = help_text.contains("--load-mode");
+        let supports_spec_draft = help_text.contains("--spec-draft-n-max");
 
-        if config.use_mlock {
-            cmd.arg("--mlock");
+        // mmap is the default in both flag eras — only pass a flag for
+        // non-default combinations.
+        if !config.use_mmap || config.use_mlock {
+            let mode = match (config.use_mmap, config.use_mlock) {
+                (true, true) => "mmap+mlock",
+                (false, true) => "mlock",
+                (false, false) => "none",
+                (true, false) => unreachable!(),
+            };
+            if supports_load_mode {
+                cmd.arg("--load-mode").arg(mode);
+            } else {
+                if !config.use_mmap {
+                    cmd.arg("--no-mmap");
+                }
+                if config.use_mlock {
+                    cmd.arg("--mlock");
+                }
+            }
         }
 
         // Multimodal projector (mmproj) for vision models
@@ -405,10 +437,21 @@ impl LlamaCppBackend {
                     draft_path, config.draft_max_tokens, config.draft_min_ctx
                 );
                 cmd.arg("--model-draft").arg(draft_path);
-                cmd.arg("--draft-max")
-                    .arg(config.draft_max_tokens.to_string());
-                cmd.arg("--draft-min-ctx")
-                    .arg(config.draft_min_ctx.to_string());
+                if supports_spec_draft {
+                    // Newer llama.cpp: --draft-* was removed in favor of
+                    // --spec-draft-* (and draft ctx is managed internally).
+                    cmd.arg("--spec-draft-n-max")
+                        .arg(config.draft_max_tokens.to_string());
+                } else {
+                    cmd.arg("--draft-max")
+                        .arg(config.draft_max_tokens.to_string());
+                    // --draft-min-ctx never existed; the draft model's
+                    // context size flag is --ctx-size-draft.
+                    if config.draft_min_ctx > 0 {
+                        cmd.arg("--ctx-size-draft")
+                            .arg(config.draft_min_ctx.to_string());
+                    }
+                }
             } else if !draft_path.is_empty() {
                 warn!(
                     "Draft model path '{}' not found — speculative decoding disabled",
