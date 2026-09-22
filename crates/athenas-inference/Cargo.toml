@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# ONNX Runtime GPU execution providers (each selects a different ORT dist).
+# Default build is CPU-only.
+onnx-cuda = ["ort/cuda"]
+onnx-tensorrt = ["ort/tensorrt", "ort/nvrtx"]
+onnx-directml = ["ort/directml"]
+onnx-coreml = ["ort/coreml"]
+onnx-rocm = ["ort/rocm"]
+onnx-openvino = ["ort/openvino"]
+
 [dependencies]
 athenas-core = { workspace = true }
 serde = { workspace = true }
@@ -21,3 +31,11 @@ dirs = { workspace = true }
 flate2 = "1.0"
 tar = "0.4"
 zip = "2.2"
+ort = { workspace = true }
+tokenizers = { workspace = true }
+minijinja = { workspace = true }
+rand = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"

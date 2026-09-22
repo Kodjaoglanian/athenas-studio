@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod backend_setup;
 pub mod llama_cpp;
+pub mod onnx;
 pub mod remote;
 pub mod types;
 pub mod vllm;

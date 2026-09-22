@@ -79,9 +79,93 @@ impl BackendFactory {
             athenas_core::BackendType::Vllm => {
                 Ok(Box::new(crate::vllm::VllmBackend::new(hardware)))
             }
+            athenas_core::BackendType::Onnx => {
+                Ok(Box::new(crate::onnx::OnnxBackend::new(hardware)))
+            }
             athenas_core::BackendType::Auto => {
                 Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new(hardware)))
             }
         }
+    }
+
+    /// Like `create`, but resolves `BackendType::Auto` from the model path:
+    /// `.onnx` files and ONNX model directories get the ONNX backend,
+    /// everything else falls back to llama.cpp. An explicit backend type
+    /// is honored as-is.
+    pub fn create_for_model(
+        backend_type: athenas_core::BackendType,
+        hardware: &athenas_core::HardwareInfo,
+        model_path: &str,
+    ) -> Result<Box<dyn Backend>> {
+        let resolved = match backend_type {
+            athenas_core::BackendType::Auto
+                if athenas_core::is_onnx_model_path(std::path::Path::new(model_path)) =>
+            {
+                athenas_core::BackendType::Onnx
+            }
+            other => other,
+        };
+        Self::create(resolved, hardware)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use athenas_core::{BackendType, HardwareInfo};
+
+    fn hw() -> HardwareInfo {
+        HardwareInfo {
+            cpus: 4,
+            memory_total_mb: 16 * 1024,
+            memory_available_mb: 16 * 1024,
+            gpus: Vec::new(),
+            has_cuda: false,
+            has_rocm: false,
+            has_vulkan: false,
+            has_metal: false,
+        }
+    }
+
+    #[test]
+    fn auto_resolves_onnx_file_to_onnx() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("model.onnx");
+        std::fs::write(&f, b"x").unwrap();
+        let b = BackendFactory::create_for_model(BackendType::Auto, &hw(), f.to_str().unwrap())
+            .unwrap();
+        assert_eq!(b.name(), "onnx");
+    }
+
+    #[test]
+    fn auto_resolves_onnx_dir_to_onnx() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("genai_config.json"), b"{}").unwrap();
+        let b = BackendFactory::create_for_model(
+            BackendType::Auto,
+            &hw(),
+            dir.path().to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(b.name(), "onnx");
+    }
+
+    #[test]
+    fn auto_falls_back_to_llamacpp() {
+        let b =
+            BackendFactory::create_for_model(BackendType::Auto, &hw(), "/nonexistent/model.gguf")
+                .unwrap();
+        assert_eq!(b.name(), "llama.cpp");
+    }
+
+    #[test]
+    fn explicit_backend_is_honored() {
+        let b = BackendFactory::create_for_model(
+            BackendType::LlamaCpp,
+            &hw(),
+            "/nonexistent/model.onnx",
+        )
+        .unwrap();
+        assert_eq!(b.name(), "llama.cpp");
     }
 }

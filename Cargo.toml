@@ -51,6 +51,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
+# ONNX Runtime (backend `onnx`) — ort downloads the native lib itself
+# (download-binaries). GPU execution providers are opt-in cargo features on
+# athenas-inference (onnx-cuda / onnx-directml / onnx-coreml / onnx-rocm /
+# onnx-tensorrt) because each changes which ORT binary dist is downloaded —
+# e.g. the CUDA dist requires CUDA runtime libs present at load.
+ort = { version = "2.0.0-rc.13", features = ["half"] }
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+minijinja = "2"
+rand = "0.9"
+half = "2.4"
+
 # Utils
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.10", features = ["v4", "serde"] }
