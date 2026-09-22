@@ -1910,6 +1910,7 @@ async fn load_model_endpoint(
     let backend_type = match req.backend.as_deref() {
         Some("llama.cpp") | Some("llamacpp") | Some("llama") => athenas_core::BackendType::LlamaCpp,
         Some("vllm") => athenas_core::BackendType::Vllm,
+        Some("onnx") => athenas_core::BackendType::Onnx,
         _ => athenas_core::BackendType::Auto,
     };
 
@@ -1939,17 +1940,30 @@ async fn load_model_endpoint(
     // this, OOM is one request away.
     if state.load_ram_check && !req.force {
         let model_path = req.model_path.clone();
-        let size_mb = tokio::task::spawn_blocking(move || {
-            std::fs::metadata(&model_path)
-                .map(|m| m.len() / (1024 * 1024))
-                .unwrap_or(0)
+        let (size_mb, is_onnx) = tokio::task::spawn_blocking(move || {
+            let p = std::path::PathBuf::from(&model_path);
+            // ONNX models are directories — count them recursively.
+            let size = if p.is_dir() {
+                athenas_core::dir_size(&p) / (1024 * 1024)
+            } else {
+                std::fs::metadata(&p)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0)
+            };
+            (size, athenas_core::is_onnx_model_path(&p))
         })
         .await
-        .unwrap_or(0);
+        .unwrap_or((0, false));
 
         if size_mb > 0 {
             let ctx = req.context_size.unwrap_or(4096);
-            let gpu_layers = req.gpu_layers.unwrap_or(-1);
+            // ONNX ignores gpu_layers without a GPU execution provider —
+            // count it fully against RAM.
+            let gpu_layers = if is_onnx && !athenas_inference::onnx::GPU_OFFLOAD_CAPABLE {
+                0
+            } else {
+                req.gpu_layers.unwrap_or(-1)
+            };
             let est = athenas_core::estimate_model_memory(size_mb, ctx, gpu_layers, &hardware);
             if let Some((resource, needed, avail)) = est.shortfall(&hardware) {
                 return (
@@ -1970,16 +1984,17 @@ async fn load_model_endpoint(
         }
     }
 
-    let mut backend = match BackendFactory::create(backend_type, &hardware) {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to create backend: {}", e)})),
-            )
-                .into_response();
-        }
-    };
+    let mut backend =
+        match BackendFactory::create_for_model(backend_type, &hardware, &req.model_path) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create backend: {}", e)})),
+                )
+                    .into_response();
+            }
+        };
 
     let load_config = ModelLoadConfig {
         model_path: req.model_path.clone(),
