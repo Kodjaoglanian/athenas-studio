@@ -148,7 +148,26 @@ impl HuggingFaceClient {
 
     pub async fn get_model_files(&self, repo_id: &str, revision: &str) -> Result<Vec<HfModelFile>> {
         let url = format!("{}/models/{}/tree/{}", self.base_url, repo_id, revision);
-        let req = self.client.get(&url);
+        self.get_tree(&url).await
+    }
+
+    /// List ALL files in the repo recursively (nested dirs flattened into
+    /// `path`). Needed for ONNX models whose weights/tokenizer/configs live
+    /// in variant subdirectories (e.g. `onnx/`, `cpu-int4-rtn-block-32/`).
+    pub async fn get_model_files_recursive(
+        &self,
+        repo_id: &str,
+        revision: &str,
+    ) -> Result<Vec<HfModelFile>> {
+        let url = format!(
+            "{}/models/{}/tree/{}?recursive=true&expand=false",
+            self.base_url, repo_id, revision
+        );
+        self.get_tree(&url).await
+    }
+
+    async fn get_tree(&self, url: &str) -> Result<Vec<HfModelFile>> {
+        let req = self.client.get(url);
         let req = self.add_auth(req);
 
         let resp = req

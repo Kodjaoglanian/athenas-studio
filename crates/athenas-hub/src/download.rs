@@ -9,6 +9,22 @@ use athenas_core::{AthenasError, Result};
 use crate::client::HuggingFaceClient;
 
 const WRITE_BUFFER_SIZE: usize = 1024 * 1024; // 1 MB write buffer
+
+/// Join a repo-relative remote path onto a local dir, rejecting anything
+/// that would escape it (`..`, absolute paths, Windows separators/drives).
+fn safe_join(base: &std::path::Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\\') {
+        return Err(AthenasError::Download(format!("unsafe path: {rel}")));
+    }
+    let mut out = base.to_path_buf();
+    for comp in std::path::Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => return Err(AthenasError::Download(format!("unsafe path: {rel}"))),
+        }
+    }
+    Ok(out)
+}
 const PARALLEL_CHUNKS: u64 = 8; // Number of parallel download connections
 const MIN_CHUNK_SIZE: u64 = 2 * 1024 * 1024; // 2 MB minimum chunk size
 const MAX_RETRIES: usize = 3; // Max retries per chunk on stream error
@@ -58,7 +74,34 @@ impl ModelDownloader {
         let model_dir = self.models_dir.join(&safe_repo);
         std::fs::create_dir_all(&model_dir)?;
 
-        let file_path = model_dir.join(filename);
+        // Filenames may carry a subdir (e.g. `onnx/model.onnx`) — keep the
+        // structure but never allow escaping the model dir.
+        let file_path = safe_join(&model_dir, filename)?;
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.download_to_path(
+            repo_id,
+            filename,
+            revision,
+            &file_path,
+            progress_tx,
+            expected_sha256,
+        )
+        .await
+    }
+
+    /// Download a single remote file to an absolute destination path,
+    /// verifying SHA256 when provided.
+    async fn download_to_path(
+        &self,
+        repo_id: &str,
+        filename: &str,
+        revision: &str,
+        file_path: &PathBuf,
+        progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+        expected_sha256: Option<String>,
+    ) -> Result<PathBuf> {
         let download_url = self.client.download_url(repo_id, filename, revision);
 
         info!("Downloading {} from {}", filename, download_url);
@@ -66,9 +109,9 @@ impl ModelDownloader {
         // Check if file already exists
         if file_path.exists() {
             info!("File already exists: {}", file_path.display());
-            self.verify_sha256(&file_path, expected_sha256.as_deref())
+            self.verify_sha256(file_path, expected_sha256.as_deref())
                 .await?;
-            return Ok(file_path);
+            return Ok(file_path.clone());
         }
 
         // HEAD request to check if server supports range requests
@@ -80,7 +123,7 @@ impl ModelDownloader {
                 PARALLEL_CHUNKS
             );
             match self
-                .parallel_download(&download_url, &file_path, progress_tx.clone())
+                .parallel_download(&download_url, file_path, progress_tx.clone())
                 .await
             {
                 Ok(path) => {
@@ -102,11 +145,183 @@ impl ModelDownloader {
 
         info!("Using single-stream download");
         let path = self
-            .single_stream_download(&download_url, &file_path, progress_tx)
+            .single_stream_download(&download_url, file_path, progress_tx)
             .await?;
         self.verify_sha256(&path, expected_sha256.as_deref())
             .await?;
         Ok(path)
+    }
+
+    /// Download all files of an ONNX model *variant* — a model may be a
+    /// directory with the `.onnx` + external `.onnx_data` weights +
+    /// tokenizer + configs. `variant_dir` is the repo-relative subdir holding
+    /// the variant ("" when the files are at the repo root).
+    ///
+    /// Files land in `models/<repo>/<variant-name>/` (variant name = last
+    /// path component) or directly in `models/<repo>/` when `variant_dir` is
+    /// empty. Root-level shared files (tokenizer, configs) are copied into
+    /// the variant dir too so it's self-contained for ORT.
+    ///
+    /// Returns the local model directory.
+    pub async fn download_model_dir(
+        &self,
+        repo_id: &str,
+        revision: &str,
+        variant_dir: &str,
+        progress_tx: Option<tokio::sync::mpsc::Sender<DownloadProgress>>,
+    ) -> Result<PathBuf> {
+        let files = self
+            .client
+            .get_model_files_recursive(repo_id, revision)
+            .await?;
+
+        let variant_dir = variant_dir.trim_matches('/');
+        let prefix = if variant_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", variant_dir)
+        };
+
+        // Files belonging to the variant: everything under its subdir, or
+        // root-level files when the variant is the repo root.
+        let variant_files: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                if f.r#type != "file" {
+                    return false;
+                }
+                if prefix.is_empty() {
+                    !f.path.contains('/')
+                } else {
+                    f.path.starts_with(&prefix)
+                }
+            })
+            .collect();
+        if variant_files.is_empty() {
+            return Err(AthenasError::Download(format!(
+                "no files found for variant '{}' in {}",
+                if variant_dir.is_empty() {
+                    "<root>"
+                } else {
+                    variant_dir
+                },
+                repo_id
+            )));
+        }
+
+        // Root-level shared files every variant needs (tokenizer, configs).
+        const SUPPORT: &[&str] = &[
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "config.json",
+            "genai_config.json",
+            "special_tokens_map.json",
+            "added_tokens.json",
+            "chat_template.jinja",
+            "vocab.json",
+            "merges.txt",
+            "tokenizer.model",
+            "preprocessor_config.json",
+            "processor_config.json",
+            "vocab.txt",
+        ];
+        let root_support: Vec<_> = files
+            .iter()
+            .filter(|f| {
+                f.r#type == "file" && !f.path.contains('/') && SUPPORT.contains(&f.path.as_str())
+            })
+            .filter(|f| prefix.is_empty() || !variant_files.iter().any(|v| v.path == f.path))
+            .collect();
+
+        let safe_repo = repo_id.replace('/', "__");
+        let dest_dir = if variant_dir.is_empty() {
+            self.models_dir.join(&safe_repo)
+        } else {
+            let variant_name = variant_dir.rsplit('/').next().unwrap_or(variant_dir);
+            self.models_dir.join(&safe_repo).join(variant_name)
+        };
+        std::fs::create_dir_all(&dest_dir)?;
+
+        // (remote_path, local_relative_path, sha256, size)
+        let mut plan: Vec<(String, String, Option<String>, u64)> = Vec::new();
+        for f in &variant_files {
+            let rel = f.path.strip_prefix(&prefix).unwrap_or(&f.path).to_string();
+            let size = f.lfs.as_ref().and_then(|l| l.size).or(f.size).unwrap_or(0);
+            let sha = f.lfs.as_ref().and_then(|l| l.sha256.clone());
+            plan.push((f.path.clone(), rel, sha, size));
+        }
+        for f in &root_support {
+            let size = f.lfs.as_ref().and_then(|l| l.size).or(f.size).unwrap_or(0);
+            let sha = f.lfs.as_ref().and_then(|l| l.sha256.clone());
+            plan.push((f.path.clone(), f.path.clone(), sha, size));
+        }
+
+        let total_bytes: u64 = plan.iter().map(|(_, _, _, s)| *s).sum();
+        info!(
+            "Downloading ONNX model dir {} ({}) — {} files, {:.1} MB total",
+            repo_id,
+            if variant_dir.is_empty() {
+                "<root>"
+            } else {
+                variant_dir
+            },
+            plan.len(),
+            total_bytes as f64 / (1024.0 * 1024.0)
+        );
+
+        let mut completed_bytes: u64 = 0;
+        for (remote_path, rel, sha, size) in &plan {
+            let dest = safe_join(&dest_dir, rel)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            // Forward per-file progress translated into cumulative progress.
+            let offset = completed_bytes;
+            let (inner_tx, mut inner_rx) = tokio::sync::mpsc::channel::<DownloadProgress>(32);
+            let fwd = progress_tx.clone().map(|tx| {
+                tokio::spawn(async move {
+                    while let Some(mut p) = inner_rx.recv().await {
+                        p.downloaded_bytes += offset;
+                        p.total_bytes = Some(total_bytes);
+                        p.percent =
+                            Some((p.downloaded_bytes as f64 / total_bytes.max(1) as f64) * 100.0);
+                        if tx.send(p).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
+
+            let r = self
+                .download_to_path(
+                    repo_id,
+                    remote_path,
+                    revision,
+                    &dest,
+                    Some(inner_tx),
+                    sha.clone(),
+                )
+                .await;
+            if let Some(h) = fwd {
+                h.abort();
+            }
+            r?;
+            completed_bytes += size;
+        }
+
+        if let Some(ref tx) = progress_tx {
+            let _ = tx
+                .send(DownloadProgress {
+                    downloaded_bytes: total_bytes,
+                    total_bytes: Some(total_bytes),
+                    speed_mbps: 0.0,
+                    percent: Some(100.0),
+                })
+                .await;
+        }
+
+        Ok(dest_dir)
     }
 
     /// Verify a downloaded file against an expected SHA256 hex digest.
@@ -872,4 +1087,36 @@ async fn download_chunk_with_retry(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_join_rejects_traversal_and_weird_paths() {
+        let base = PathBuf::from("/tmp/models");
+        assert!(safe_join(&base, "").is_err());
+        assert!(safe_join(&base, "../evil").is_err());
+        assert!(safe_join(&base, "a/../../b").is_err());
+        assert!(safe_join(&base, "/abs/path").is_err());
+        assert!(safe_join(&base, "\\abs").is_err());
+        assert!(safe_join(&base, "a\\b").is_err());
+        assert!(safe_join(&base, "./x").is_err());
+        // Interior `.` is normalized away by components() — safe to accept.
+        assert_eq!(safe_join(&base, "a/./b").unwrap(), base.join("a/b"));
+    }
+
+    #[test]
+    fn safe_join_accepts_normal_relative_paths() {
+        let base = PathBuf::from("/tmp/models");
+        assert_eq!(
+            safe_join(&base, "model.onnx").unwrap(),
+            base.join("model.onnx")
+        );
+        assert_eq!(
+            safe_join(&base, "onnx/model.onnx_data").unwrap(),
+            base.join("onnx").join("model.onnx_data")
+        );
+    }
 }
