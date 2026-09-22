@@ -312,6 +312,8 @@ impl Default for OtelConfig {
 pub enum BackendType {
     LlamaCpp,
     Vllm,
+    /// ONNX Runtime backend (`.onnx` files or ONNX model directories)
+    Onnx,
     Auto,
 }
 
@@ -320,6 +322,7 @@ impl std::fmt::Display for BackendType {
         match self {
             BackendType::LlamaCpp => write!(f, "llama.cpp"),
             BackendType::Vllm => write!(f, "vllm"),
+            BackendType::Onnx => write!(f, "onnx"),
             BackendType::Auto => write!(f, "auto"),
         }
     }
@@ -481,5 +484,36 @@ impl AppConfig {
         std::fs::create_dir_all(&self.paths.cache_dir)?;
         std::fs::create_dir_all(&self.paths.data_dir)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_type_serde_roundtrip() {
+        for b in [
+            BackendType::LlamaCpp,
+            BackendType::Vllm,
+            BackendType::Onnx,
+            BackendType::Auto,
+        ] {
+            let s = serde_json::to_string(&b).unwrap();
+            let back: BackendType = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, b);
+        }
+        // ONNX must deserialize from the wire name used by the API.
+        assert_eq!(
+            serde_json::from_str::<BackendType>("\"onnx\"").unwrap(),
+            BackendType::Onnx
+        );
+    }
+
+    #[test]
+    fn backend_type_display() {
+        assert_eq!(BackendType::LlamaCpp.to_string(), "llama.cpp");
+        assert_eq!(BackendType::Onnx.to_string(), "onnx");
+        assert_eq!(BackendType::Auto.to_string(), "auto");
     }
 }

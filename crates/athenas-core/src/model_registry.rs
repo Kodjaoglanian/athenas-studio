@@ -145,6 +145,12 @@ impl ModelRegistry {
 
     pub fn remove_model(&self, id_or_name: &str) -> Result<()> {
         let model = self.find_model(id_or_name)?;
+        if model.file_path.is_dir() {
+            // ONNX model dir — remove the dir itself (a variant subdir must
+            // not take sibling variants with it).
+            std::fs::remove_dir_all(&model.file_path)?;
+            return Ok(());
+        }
         let dir = model.file_path.parent().unwrap_or(&self.models_dir);
         if dir != self.models_dir {
             std::fs::remove_dir_all(dir)?;
@@ -171,7 +177,20 @@ fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()>
         let path = entry.path();
 
         if path.is_dir() {
-            scan_dir_for_models(&path, models)?;
+            // An ONNX model is a *directory*: model.onnx + .onnx_data weights
+            // + tokenizer.json + genai_config.json. Register the dir itself
+            // and don't descend (variant subdirs of a repo still get scanned
+            // because the parent dir has no .onnx of its own).
+            if is_onnx_model_dir(&path) {
+                match create_model_info_from_dir(&path) {
+                    Ok(model) => models.push(model),
+                    Err(e) => {
+                        tracing::warn!("skipping ONNX dir {}: {e}", path.display());
+                    }
+                }
+            } else {
+                scan_dir_for_models(&path, models)?;
+            }
         } else if let Some(ext) = path.extension() {
             let filename_lower = path
                 .file_name()
@@ -207,11 +226,132 @@ fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()>
             } else if ext == "safetensors" && !is_mmproj {
                 let model = create_model_info_from_file(&path, ModelFormat::Safetensors)?;
                 models.push(model);
+            } else if ext == "onnx" && !is_mmproj {
+                // Standalone .onnx file (no sibling model dir claim — dirs are
+                // handled above and never reached here).
+                let model = create_model_info_from_file(&path, ModelFormat::Onnx)?;
+                models.push(model);
             }
         }
     }
 
     Ok(())
+}
+
+/// True if `dir` looks like an ONNX model directory: a `genai_config.json`
+/// or at least one `.onnx` file directly inside it.
+fn is_onnx_model_dir(dir: &PathBuf) -> bool {
+    if dir.join("genai_config.json").is_file() {
+        return true;
+    }
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("onnx"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// True when `path` points to an ONNX model: either a standalone `.onnx`
+/// file or a model directory (has `genai_config.json` or at least one
+/// `.onnx` file). Used to resolve `BackendType::Auto` by model format.
+pub fn is_onnx_model_path(path: &std::path::Path) -> bool {
+    if path.is_file() {
+        return path
+            .extension()
+            .is_some_and(|x| x.eq_ignore_ascii_case("onnx"));
+    }
+    path.is_dir() && is_onnx_model_dir(&path.to_path_buf())
+}
+
+/// Register an ONNX model directory as a single model. `file_path` points at
+/// the directory; `file_size_bytes` is the recursive size (model + external
+/// weights + tokenizer).
+fn create_model_info_from_dir(dir: &PathBuf) -> Result<ModelInfo> {
+    let dir_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    // Two shapes: the repo dir itself is the model dir (`user__repo/` —
+    // variant downloaded flat inside), or a variant subdir
+    // (`user__repo/cpu-int4-rtn-block-32/`).
+    let (repo_id, name) = if dir_name.contains("__") {
+        (
+            dir_name.replace("__", "/"),
+            dir_name.split("__").nth(1).unwrap_or(&dir_name).to_string(),
+        )
+    } else {
+        let repo = dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.replace("__", "/"))
+            .unwrap_or_default();
+        (repo, dir_name.clone())
+    };
+
+    let cfg = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let genai = std::fs::read_to_string(dir.join("genai_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let architecture = cfg
+        .as_ref()
+        .and_then(|v| {
+            v["architectures"]
+                .as_array()?
+                .first()?
+                .as_str()
+                .map(String::from)
+        })
+        .or_else(|| {
+            genai
+                .as_ref()
+                .and_then(|v| v["model"]["type"].as_str().map(String::from))
+        });
+    let context_length = cfg
+        .as_ref()
+        .and_then(|v| {
+            v["max_position_embeddings"]
+                .as_u64()
+                .or_else(|| v["model"]["context_length"].as_u64())
+        })
+        .map(|n| n as u32);
+
+    let id = if repo_id.is_empty() {
+        name.clone()
+    } else {
+        format!("{}/{}", repo_id, name)
+    };
+    let hf_url = if repo_id.is_empty() {
+        None
+    } else {
+        Some(format!("https://huggingface.co/{}", repo_id))
+    };
+
+    Ok(ModelInfo {
+        id,
+        repo_id,
+        name: name.clone(),
+        format: ModelFormat::Onnx,
+        file_path: dir.clone(),
+        file_size_bytes: dir_size(dir),
+        quantization: detect_quantization(&name),
+        context_length,
+        architecture: architecture.clone(),
+        huggingface_url: hf_url,
+        license: None,
+        tags: Vec::new(),
+        downloaded_at: chrono::Utc::now(),
+        last_used_at: None,
+        category: architecture.as_deref().map(categorize_model),
+    })
 }
 
 /// Categorize a model based on its architecture string.
@@ -471,10 +611,14 @@ fn create_model_info_from_file(path: &PathBuf, format: ModelFormat) -> Result<Mo
 
 fn detect_quantization(filename: &str) -> Option<String> {
     let lower = filename.to_lowercase();
+    // Ordered most-specific first: "uint4"/"uint8" before "int4"/"int8" and
+    // "bf16"/"fp16"/"fp32" before "f16"/"f32" — the shorts are substrings of
+    // the longs.
     let quants = [
-        "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0", "q4_k_m", "q4_k_s", "q3_k_m",
-        "q3_k_s", "q3_k_l", "q2_k", "q1_0", "f16", "f32", "iq4_xs", "iq3_xs", "q8_0_k", "q6_k",
-        "q5_k_m", "q5_k_s",
+        "q4f16", "q4f32", "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0", "q4_k_m",
+        "q4_k_s", "q3_k_m", "q3_k_s", "q3_k_l", "q2_k", "q1_0", "uint4", "uint8", "int4", "int8",
+        "iq4_xs", "iq3_xs", "q8_0_k", "q6_k", "q5_k_m", "q5_k_s", "rtn", "awq", "gptq", "fp16",
+        "bf16", "fp32", "f16", "f32",
     ];
 
     for q in &quants {
@@ -485,7 +629,8 @@ fn detect_quantization(filename: &str) -> Option<String> {
     None
 }
 
-fn dir_size(path: &PathBuf) -> u64 {
+/// Recursive size in bytes of a file or directory (ONNX models are dirs).
+pub fn dir_size(path: &PathBuf) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -582,6 +727,98 @@ mod tests {
         assert_eq!(meta.license.as_deref(), Some("apache-2.0"));
         assert_eq!(meta.name.as_deref(), Some("Test Model"));
         assert_eq!(meta.context_length, Some(8192));
+    }
+
+    #[test]
+    fn onnx_dir_detection() {
+        let root = std::env::temp_dir().join(format!("athenas-onnx-test-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("onnx-community__TinyLlama-ONNX");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("model.onnx"), b"onnx").unwrap();
+        std::fs::write(repo.join("model.onnx_data"), b"weights").unwrap();
+        std::fs::write(repo.join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(
+            repo.join("genai_config.json"),
+            r#"{"model":{"type":"llama"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"],"max_position_embeddings":2048}"#,
+        )
+        .unwrap();
+
+        let reg = ModelRegistry::new(root.clone());
+        let models = reg.list_local_models().unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.format, ModelFormat::Onnx);
+        assert!(m.file_path.is_dir());
+        assert_eq!(m.repo_id, "onnx-community/TinyLlama-ONNX");
+        assert_eq!(m.name, "TinyLlama-ONNX");
+        assert_eq!(m.architecture.as_deref(), Some("LlamaForCausalLM"));
+        assert_eq!(m.context_length, Some(2048));
+        assert!(m.file_size_bytes >= 11); // model.onnx + onnx_data + jsons
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn onnx_variant_subdir_detection() {
+        let root = std::env::temp_dir().join(format!("athenas-onnx-test-{}", uuid::Uuid::new_v4()));
+        let variant = root
+            .join("onnx-community__M-ONNX")
+            .join("cpu-int4-rtn-block-32");
+        std::fs::create_dir_all(&variant).unwrap();
+        std::fs::write(variant.join("model.onnx"), b"onnx").unwrap();
+        std::fs::write(variant.join("tokenizer.json"), b"{}").unwrap();
+
+        let reg = ModelRegistry::new(root.clone());
+        let models = reg.list_local_models().unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        assert_eq!(m.format, ModelFormat::Onnx);
+        assert_eq!(m.name, "cpu-int4-rtn-block-32");
+        assert_eq!(m.repo_id, "onnx-community/M-ONNX");
+        assert_eq!(m.quantization.as_deref(), Some("INT4"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn onnx_standalone_file_and_data_skip() {
+        let root = std::env::temp_dir().join(format!("athenas-onnx-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("embedder.onnx"), b"onnx").unwrap();
+        // external weights file — must not become a model entry
+        std::fs::write(root.join("embedder.onnx_data"), b"weights").unwrap();
+
+        let reg = ModelRegistry::new(root.clone());
+        let models = reg.list_local_models().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].format, ModelFormat::Onnx);
+        assert!(models[0].file_path.is_file());
+        assert_eq!(models[0].name, "embedder.onnx");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn onnx_quant_detection() {
+        assert_eq!(
+            detect_quantization("cpu-int4-rtn-block-32"),
+            Some("INT4".to_string())
+        );
+        assert_eq!(
+            detect_quantization("model-fp16.onnx"),
+            Some("FP16".to_string())
+        );
+        assert_eq!(
+            detect_quantization("model-bf16.onnx"),
+            Some("BF16".to_string())
+        );
+        assert_eq!(
+            detect_quantization("q4f16 variant"),
+            Some("Q4F16".to_string())
+        );
+        assert_eq!(detect_quantization("cuda-uint8"), Some("UINT8".to_string()));
     }
 
     #[test]
