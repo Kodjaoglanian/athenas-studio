@@ -41,7 +41,8 @@ Cargo workspace with 6 crates:
 |------|---------|
 | `crates/athenas-core/src/config.rs` | AppConfig struct, load/save to `~/.athenas/config.toml` |
 | `crates/athenas-core/src/hardware.rs` | HardwareDetector — detects CPU, GPU (CUDA/ROCm/Vulkan/Metal), RAM |
-| `crates/athenas-core/src/model_registry.rs` | ModelRegistry — scans `~/.athenas/models/` for .gguf/.safetensors files (filters out mmproj) |
+| `crates/athenas-core/src/model_registry.rs` | ModelRegistry — scans `~/.athenas/models/` for .gguf/.safetensors files and ONNX model dirs (filters out mmproj) |
+| `crates/athenas-inference/src/onnx.rs` | OnnxBackend — ONNX Runtime via `ort`, manual generation loop, KV cache, embeddings |
 | `crates/athenas-inference/src/llama_cpp.rs` | LlamaCppBackend — starts llama-server subprocess, GPU runtime selection, health polling |
 | `crates/athenas-inference/src/backend_setup.rs` | Auto-download of llama-server binary from GitHub releases (platform + GPU aware) |
 | `crates/athenas-tui/src/app.rs` | TuiApp — main event loop, key handling, server start/stop, model loading |
@@ -147,6 +148,32 @@ Assistant messages are rendered with markdown (`markdown.rs`). User and
 system messages stay as plain text. During streaming, text renders as
 plain text (avoids flickering from incomplete markdown) and markdown is
 applied when the message finalizes via `finalize_streaming()`.
+
+### ONNX Backend
+
+`OnnxBackend` (`onnx.rs`) runs `.onnx` models in-process via the `ort` crate —
+no subprocess. Models are **directories**, not single files: `model.onnx` +
+external `model.onnx_data` weights + `tokenizer.json` + `genai_config.json`.
+
+- **Backend selection**: `BackendType::Auto` resolves by path via
+  `BackendFactory::create_for_model()` → `athenas_core::is_onnx_model_path()`
+  (`.onnx` file or dir with `genai_config.json`/`.onnx` inside). Explicit
+  `"onnx"` works in config, settings, server panel and `"backend": "onnx"`
+  in `POST /v1/models/load`.
+- **GPU execution providers are cargo features** — the default build is
+  CPU-only because each EP picks a different ORT binary dist:
+  `cargo build --features onnx-cuda` (also `onnx-tensorrt`, `onnx-directml`,
+  `onnx-coreml`, `onnx-rocm`, `onnx-openvino`). `onnx::GPU_OFFLOAD_CAPABLE`
+  tells pre-flight/estimate code whether `gpu_layers` means anything; when
+  false, ONNX loads count fully against RAM.
+- **Generation**: manual autoregressive loop — `tokenizers` (HF),
+  minijinja chat template, KV cache fed back as `past_key_values.*` →
+  `present.*`, temperature/top-p/top-k sampling, seeded RNG.
+- **Downloads**: `ModelDownloader::download_model_dir(repo, rev, variant_dir)`
+  fetches a whole variant subdirectory plus root-level support files,
+  preserving layout, verifying `lfs.sha256` per file, with `safe_join`
+  path-traversal protection. Registry registers ONNX dirs as one model and
+  skips `*.onnx_data` files as standalone entries.
 
 ### Semantic Cache
 
