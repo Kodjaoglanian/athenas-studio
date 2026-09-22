@@ -8,10 +8,11 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
             config.inference.default_backend = match value {
                 "llama.cpp" | "llamacpp" => athenas_core::BackendType::LlamaCpp,
                 "vllm" => athenas_core::BackendType::Vllm,
+                "onnx" => athenas_core::BackendType::Onnx,
                 "auto" => athenas_core::BackendType::Auto,
                 _ => {
                     return Err(athenas_core::AthenasError::InvalidInput(format!(
-                        "Invalid backend: {}. Use llama.cpp, vllm, or auto",
+                        "Invalid backend: {}. Use llama.cpp, vllm, onnx, or auto",
                         value
                     )))
                 }

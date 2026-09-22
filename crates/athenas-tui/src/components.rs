@@ -1053,8 +1053,19 @@ pub fn render_model_browser(f: &mut Frame, area: Rect, state: &ModelBrowserState
                     .map(|s| format!("{:.2} GB", s as f64 / 1e9))
                     .unwrap_or("?".to_string());
 
+                let label = name
+                    .strip_prefix("onnx-dir:")
+                    .map(|d| {
+                        if d.is_empty() {
+                            "[onnx] (root)".to_string()
+                        } else {
+                            format!("[onnx] {}", d)
+                        }
+                    })
+                    .unwrap_or_else(|| name.clone());
+
                 lines.push(Line::styled(
-                    format!("{}{} ({})", prefix, name, size_str),
+                    format!("{}{} ({})", prefix, label, size_str),
                     style,
                 ));
             }

@@ -43,7 +43,7 @@ pub async fn run(
 
     let model_path = resolve_model(&config, &model)?;
 
-    let mut backend = BackendFactory::create(backend_type, &hardware)?;
+    let mut backend = BackendFactory::create_for_model(backend_type, &hardware, &model_path)?;
 
     println!("Loading model: {}", model_path);
     // Fall back to config values when CLI args are at defaults
@@ -309,7 +309,8 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
         return Ok(model.file_path.to_string_lossy().to_string());
     }
     let path = std::path::Path::new(model_id);
-    if path.exists() && path.is_file() {
+    // ONNX models are directories; GGUF files are regular files.
+    if path.exists() {
         return Ok(model_id.to_string());
     }
     Err(athenas_core::AthenasError::ModelNotFound(

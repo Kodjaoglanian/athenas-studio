@@ -950,7 +950,8 @@ impl ServerPanelState {
                     "auto" => BackendType::Auto,
                     "llama.cpp" | "llamacpp" | "llama" => BackendType::LlamaCpp,
                     "vllm" => BackendType::Vllm,
-                    _ => return Err("Must be: auto, llama.cpp, or vllm".to_string()),
+                    "onnx" => BackendType::Onnx,
+                    _ => return Err("Must be: auto, llama.cpp, vllm, or onnx".to_string()),
                 };
             }
             ConfigField::GpuRuntime => {
@@ -1169,11 +1170,21 @@ impl ServerPanelState {
         let model = self.models.get(self.model_selected)?;
         let model_size_mb = model.file_size_bytes / (1024 * 1024);
 
+        // ONNX ignores gpu_layers unless this build has a GPU execution
+        // provider — without one the model lands fully in host RAM.
+        let gpu_layers = if model.format == athenas_core::ModelFormat::Onnx
+            && !athenas_inference::onnx::GPU_OFFLOAD_CAPABLE
+        {
+            0
+        } else {
+            self.gpu_layers
+        };
+
         // Shared heuristic — same RAM/VRAM split the server pre-flight uses.
         let mem = athenas_core::estimate_model_memory(
             model_size_mb,
             self.context_size,
-            self.gpu_layers,
+            gpu_layers,
             &self.hardware,
         );
         let ram_mb = mem.ram_mb;
@@ -1226,7 +1237,7 @@ impl ServerPanelState {
             vram_free_mb,
             full_gpu_offload,
             partial_gpu_offload,
-            gpu_layers: self.gpu_layers,
+            gpu_layers,
             fits,
             tight,
         })

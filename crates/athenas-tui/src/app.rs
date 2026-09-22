@@ -987,9 +987,9 @@ impl TuiApp {
         let token = self.config.huggingface.token.clone();
         let client = athenas_hub::HuggingFaceClient::new(token);
 
-        match client.get_model_files(repo_id, "main").await {
+        match client.get_model_files_recursive(repo_id, "main").await {
             Ok(files) => {
-                let gguf_files: Vec<(String, Option<u64>, Option<String>)> = files
+                let mut options: Vec<(String, Option<u64>, Option<String>)> = files
                     .iter()
                     .filter(|f| f.path.ends_with(".gguf"))
                     .map(|f| {
@@ -1001,15 +1001,43 @@ impl TuiApp {
                     })
                     .collect();
 
-                if gguf_files.is_empty() {
+                // ONNX variants: group .onnx files by parent dir. The option
+                // name is `onnx-dir:<variant>` handled by start_download.
+                let mut onnx_groups: Vec<(String, u64)> = Vec::new();
+                for f in files.iter().filter(|f| f.path.ends_with(".onnx")) {
+                    let dir = f
+                        .path
+                        .rsplit_once('/')
+                        .map(|(d, _)| d.to_string())
+                        .unwrap_or_default();
+                    let size: u64 = files
+                        .iter()
+                        .filter(|g| {
+                            g.path
+                                .rsplit_once('/')
+                                .map(|(d, _)| d.to_string())
+                                .unwrap_or_default()
+                                == dir
+                        })
+                        .map(|g| g.size.or(g.lfs.as_ref().and_then(|l| l.size)).unwrap_or(0))
+                        .sum();
+                    if !onnx_groups.iter().any(|(d, _)| d == &dir) {
+                        onnx_groups.push((dir, size));
+                    }
+                }
+                for (dir, size) in onnx_groups {
+                    options.push((format!("onnx-dir:{}", dir), Some(size), None));
+                }
+
+                if options.is_empty() {
                     self.browser_state.status_message = Some(
-                        "No GGUF files found in this repo. llama-server requires GGUF format. \
-                         Try searching for GGUF-quantized versions."
+                        "No GGUF or ONNX files found in this repo. \
+                         Try searching for a quantized version."
                             .to_string(),
                     );
                     self.browser_state.status_is_error = true;
                 } else {
-                    self.browser_state.file_options = gguf_files;
+                    self.browser_state.file_options = options;
                     self.browser_state.file_selected = 0;
                     self.browser_state.phase = BrowserPhase::SelectFile;
                     self.browser_state.status_message = None;
@@ -1043,15 +1071,21 @@ impl TuiApp {
         let tx_clone = tx.clone();
 
         let download_task = tokio::spawn(async move {
-            let result = downloader
-                .download_model_verify(
-                    &repo_id_owned,
-                    &filename_owned,
-                    "main",
-                    Some(tx),
-                    expected_sha256,
-                )
-                .await;
+            let result = if let Some(variant) = filename_owned.strip_prefix("onnx-dir:") {
+                downloader
+                    .download_model_dir(&repo_id_owned, "main", variant, Some(tx))
+                    .await
+            } else {
+                downloader
+                    .download_model_verify(
+                        &repo_id_owned,
+                        &filename_owned,
+                        "main",
+                        Some(tx),
+                        expected_sha256,
+                    )
+                    .await
+            };
 
             if result.is_ok() {
                 // Auto-download mmproj files if present
@@ -1690,7 +1724,8 @@ impl TuiApp {
         };
 
         let task = tokio::spawn(async move {
-            let mut backend = BackendFactory::create(backend_type, &hardware)?;
+            let mut backend =
+                BackendFactory::create_for_model(backend_type, &hardware, &load_config.model_path)?;
             backend.load_model(load_config).await?;
             Ok::<Box<dyn Backend>, athenas_core::AthenasError>(backend)
         });
@@ -2053,6 +2088,7 @@ impl TuiApp {
             athenas_core::BackendType::Auto => "auto",
             athenas_core::BackendType::LlamaCpp => "llama.cpp",
             athenas_core::BackendType::Vllm => "vllm",
+            athenas_core::BackendType::Onnx => "onnx",
         };
         let gpu_layers = self.server_panel_state.gpu_layers;
         let gpu_runtime = self.server_panel_state.gpu_runtime.to_string();
@@ -2450,17 +2486,19 @@ impl TuiApp {
         let load_config = self.server_panel_state.build_load_config(&model_path);
 
         let task = tokio::spawn(async move {
-            let mut backend = BackendFactory::create(backend_type, &hardware).map_err(|e| {
-                (
-                    e,
-                    std::path::Path::new(&load_config.model_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("model")
-                        .to_string(),
-                    "unknown".to_string(),
-                )
-            })?;
+            let mut backend =
+                BackendFactory::create_for_model(backend_type, &hardware, &load_config.model_path)
+                    .map_err(|e| {
+                        (
+                            e,
+                            std::path::Path::new(&load_config.model_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("model")
+                                .to_string(),
+                            "unknown".to_string(),
+                        )
+                    })?;
             backend.load_model(load_config).await.map_err(|e| {
                 let name = backend
                     .model_info()

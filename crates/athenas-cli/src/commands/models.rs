@@ -92,6 +92,111 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
     let client = HuggingFaceClient::new(config.huggingface.token.clone());
     let downloader = ModelDownloader::new(client.clone(), config.paths.models_dir.clone());
 
+    // Recursive listing — ONNX models live in variant subdirectories.
+    let all_files = client.get_model_files_recursive(repo_id, revision).await?;
+    let onnx_variant_dirs: Vec<String> = {
+        let mut dirs: Vec<String> = all_files
+            .iter()
+            .filter(|f| f.r#type == "file" && f.path.ends_with(".onnx"))
+            .map(|f| {
+                f.path
+                    .rsplit_once('/')
+                    .map(|(d, _)| d.to_string())
+                    .unwrap_or_default()
+            })
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    };
+    let has_gguf = all_files
+        .iter()
+        .any(|f| f.r#type == "file" && f.path.ends_with(".gguf"));
+
+    // Resolve whether this pull is an ONNX directory download: --file naming
+    // a variant dir, or a repo with ONNX files and no GGUF to pick.
+    let onnx_variant: Option<String> = match file.as_deref().map(|f| f.trim_matches('/')) {
+        Some(f)
+            if !f.ends_with(".onnx")
+                && !f.ends_with(".gguf")
+                && !f.ends_with(".safetensors")
+                && !f.ends_with(".bin") =>
+        {
+            if onnx_variant_dirs.iter().any(|d| d == f) {
+                Some(f.to_string())
+            } else {
+                return Err(athenas_core::AthenasError::InvalidInput(format!(
+                    "'{}' is not a model file or ONNX variant dir in {}",
+                    f, repo_id
+                )));
+            }
+        }
+        Some(_) => None,
+        None if onnx_variant_dirs.is_empty() || has_gguf => None,
+        None if onnx_variant_dirs.len() == 1 => Some(onnx_variant_dirs[0].clone()),
+        None => {
+            println!("Multiple ONNX variants found in {}:", repo_id);
+            for (i, d) in onnx_variant_dirs.iter().enumerate() {
+                let label = if d.is_empty() { "(root)" } else { d.as_str() };
+                let size: u64 = all_files
+                    .iter()
+                    .filter(|f| {
+                        f.r#type == "file"
+                            && f.path
+                                .rsplit_once('/')
+                                .map(|(dir, _)| dir == d)
+                                .unwrap_or_else(|| d.is_empty())
+                    })
+                    .map(|f| f.size.or(f.lfs.as_ref().and_then(|l| l.size)).unwrap_or(0))
+                    .sum();
+                println!("  [{}] {} ({:.2} GB)", i, label, size as f64 / 1e9);
+            }
+            print!("\nSelect variant number: ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| athenas_core::AthenasError::InvalidInput(e.to_string()))?;
+            let idx: usize = input.trim().parse().map_err(|_| {
+                athenas_core::AthenasError::InvalidInput("Invalid number".to_string())
+            })?;
+            Some(onnx_variant_dirs.get(idx).cloned().ok_or_else(|| {
+                athenas_core::AthenasError::InvalidInput("Invalid selection".to_string())
+            })?)
+        }
+    };
+
+    if let Some(variant) = onnx_variant {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec}) {msg}",
+            )
+            .unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<athenas_hub::DownloadProgress>(10);
+        let pb_clone = pb.clone();
+        let progress_task = tokio::spawn(async move {
+            while let Some(progress) = rx.recv().await {
+                pb_clone.set_position(progress.downloaded_bytes);
+                pb_clone.set_message(format!("{:.1} MB/s", progress.speed_mbps));
+            }
+            pb_clone.finish_with_message("Download complete");
+        });
+
+        println!(
+            "Downloading ONNX variant '{}' from {}/{}",
+            variant, repo_id, revision
+        );
+        let path = downloader
+            .download_model_dir(repo_id, revision, &variant, Some(tx))
+            .await?;
+        progress_task.await.ok();
+        println!("\nModel saved to: {}", path.display());
+        println!("You can now use it with: athenas chat {}", repo_id);
+        return Ok(());
+    }
+
     // Determine which file to download
     let filename = if let Some(f) = file {
         f
@@ -144,8 +249,7 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
     };
 
     // Get file size for progress bar and sha256 for integrity check
-    let files = client.get_model_files(repo_id, revision).await?;
-    let file_info = files.iter().find(|f| f.path == filename);
+    let file_info = all_files.iter().find(|f| f.path == filename);
     let total_size = file_info.and_then(|f| f.size.or(f.lfs.as_ref().and_then(|l| l.size)));
     let expected_sha = file_info.and_then(|f| f.lfs.as_ref().and_then(|l| l.sha256.clone()));
 
@@ -186,7 +290,7 @@ pub async fn pull(repo_id: &str, file: Option<String>, revision: &str) -> Result
     println!("\nModel saved to: {}", path.display());
 
     // Auto-download mmproj file if present in the repo (for multimodal models)
-    let mmproj_files: Vec<_> = files
+    let mmproj_files: Vec<_> = all_files
         .iter()
         .filter(|f| {
             f.r#type == "file"

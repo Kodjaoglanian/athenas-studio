@@ -19,7 +19,7 @@ pub async fn run(
         print_model_selector(&config)?
     };
 
-    let mut backend = BackendFactory::create(backend, &hardware)?;
+    let mut backend = BackendFactory::create_for_model(backend, &hardware, &model_path)?;
 
     println!("Loading model: {}", model_path);
     // 0 = use config default (allows CLI to omit --context-size and still respect config.toml)
@@ -148,7 +148,7 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
 
     // Check if it's a direct file path
     let path = std::path::Path::new(model_id);
-    if path.exists() && path.is_file() {
+    if path.exists() {
         return Ok(model_id.to_string());
     }
 

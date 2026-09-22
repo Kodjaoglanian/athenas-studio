@@ -186,8 +186,9 @@ impl SettingsState {
                 self.config.inference.default_backend = match value.as_str() {
                     "llama.cpp" | "llamacpp" => athenas_core::BackendType::LlamaCpp,
                     "vllm" => athenas_core::BackendType::Vllm,
+                    "onnx" => athenas_core::BackendType::Onnx,
                     "auto" => athenas_core::BackendType::Auto,
-                    _ => return Err("Use: llama.cpp, vllm, or auto".to_string()),
+                    _ => return Err("Use: llama.cpp, vllm, onnx, or auto".to_string()),
                 };
             }
             SettingsField::Device => {

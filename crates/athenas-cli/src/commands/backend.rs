@@ -115,9 +115,9 @@ pub async fn benchmark(model: Option<String>) -> Result<()> {
     let config = AppConfig::load()?;
 
     println!("\n  Model: {}", model_path);
-    println!("  Backend: auto (resolves to llama.cpp)\n");
+    println!("  Backend: auto (resolved from model format)\n");
 
-    let mut backend = BackendFactory::create(BackendType::Auto, &hw)?;
+    let mut backend = BackendFactory::create_for_model(BackendType::Auto, &hw, &model_path)?;
 
     let load_start = Instant::now();
     backend
