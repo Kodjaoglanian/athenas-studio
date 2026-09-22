@@ -80,7 +80,20 @@ impl BackendFactory {
                 Ok(Box::new(crate::vllm::VllmBackend::new(hardware)))
             }
             athenas_core::BackendType::Onnx => {
-                Ok(Box::new(crate::onnx::OnnxBackend::new(hardware)))
+                #[cfg(not(any(
+                    all(target_os = "macos", target_arch = "x86_64"),
+                    target_env = "musl"
+                )))]
+                {
+                    Ok(Box::new(crate::onnx::OnnxBackend::new(hardware)))
+                }
+                #[cfg(any(all(target_os = "macos", target_arch = "x86_64"), target_env = "musl"))]
+                {
+                    let _ = hardware;
+                    Err(athenas_core::AthenasError::Backend(
+                        "onnx backend unavailable on this platform (no ORT binaries)".to_string(),
+                    ))
+                }
             }
             athenas_core::BackendType::Auto => {
                 Ok(Box::new(crate::llama_cpp::LlamaCppBackend::new(hardware)))

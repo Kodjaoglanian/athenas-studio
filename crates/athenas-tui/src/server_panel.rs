@@ -1173,7 +1173,7 @@ impl ServerPanelState {
         // ONNX ignores gpu_layers unless this build has a GPU execution
         // provider — without one the model lands fully in host RAM.
         let gpu_layers = if model.format == athenas_core::ModelFormat::Onnx
-            && !athenas_inference::onnx::GPU_OFFLOAD_CAPABLE
+            && !athenas_inference::GPU_OFFLOAD_CAPABLE
         {
             0
         } else {

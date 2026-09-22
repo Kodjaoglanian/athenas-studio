@@ -31,7 +31,6 @@ dirs = { workspace = true }
 flate2 = "1.0"
 tar = "0.4"
 zip = "2.2"
-ort = { workspace = true }
 tokenizers = { workspace = true }
 minijinja = { workspace = true }
 rand = { workspace = true }
@@ -39,3 +38,8 @@ half = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+# ORT only ships prebuilt binaries for some targets — no x86_64 macOS and
+# no musl dists exist, so the onnx module is cfg'd out there too.
+[target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_env = "musl")))'.dependencies]
+ort = { workspace = true }

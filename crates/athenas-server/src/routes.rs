@@ -1959,7 +1959,7 @@ async fn load_model_endpoint(
             let ctx = req.context_size.unwrap_or(4096);
             // ONNX ignores gpu_layers without a GPU execution provider —
             // count it fully against RAM.
-            let gpu_layers = if is_onnx && !athenas_inference::onnx::GPU_OFFLOAD_CAPABLE {
+            let gpu_layers = if is_onnx && !athenas_inference::GPU_OFFLOAD_CAPABLE {
                 0
             } else {
                 req.gpu_layers.unwrap_or(-1)
