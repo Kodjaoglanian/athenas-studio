@@ -913,6 +913,18 @@ impl Backend for LlamaCppBackend {
         self.context_size = config.context_size;
         self.gpu_layers = config.gpu_layers;
 
+        // Fail fast on truncated/corrupt GGUFs — otherwise llama-server
+        // crash-loops with cryptic check_tensor_dims errors.
+        if config.model_path.ends_with(".gguf") {
+            let p = config.model_path.clone();
+            tokio::task::spawn_blocking(move || {
+                athenas_core::validate_gguf(std::path::Path::new(&p))
+            })
+            .await
+            .map_err(|e| AthenasError::Backend(format!("validation task failed: {e}")))?
+            .map_err(AthenasError::Backend)?;
+        }
+
         self.start_server(&config).await?;
         self.loaded = true;
         Ok(())

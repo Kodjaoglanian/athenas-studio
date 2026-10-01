@@ -571,6 +571,241 @@ fn skip_gguf_value(cursor: &mut std::io::Cursor<&Vec<u8>>, value_type: u32) -> O
     Some(())
 }
 
+/// Structural validation of a GGUF file before handing it to llama.cpp.
+///
+/// Stream-reads the header (metadata KV + tensor info section) and checks:
+/// - the tensor info section is fully readable (truncated header)
+/// - every decoder layer `0..block_count` has at least one `blk.{i}.*` tensor
+/// - `blk.{i}.attn_norm.weight` uniformity when present in layer 0
+/// - file size covers the largest declared tensor extent (truncated weights)
+///
+/// Returns Ok when the file is fine or when there's not enough info to judge
+/// (unknown arch, no block_count) — llama.cpp stays the final arbiter.
+pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> {
+    use std::io::Read;
+
+    fn r_u32(r: &mut impl Read) -> Option<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).ok()?;
+        Some(u32::from_le_bytes(b))
+    }
+    fn r_u64(r: &mut impl Read) -> Option<u64> {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b).ok()?;
+        Some(u64::from_le_bytes(b))
+    }
+    fn r_string(r: &mut impl Read, big: bool) -> Option<String> {
+        let len = if big { r_u64(r)? } else { r_u32(r)? as u64 };
+        if len > 16_000_000 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        r.read_exact(&mut buf).ok()?;
+        String::from_utf8(buf).ok()
+    }
+    fn skip_value(r: &mut impl Read, vtype: u32, big: bool) -> Option<()> {
+        match vtype {
+            0 | 1 | 7 => r.read_exact(&mut [0u8; 1]).ok()?,
+            2 | 3 => r.read_exact(&mut [0u8; 2]).ok()?,
+            4..=6 => r.read_exact(&mut [0u8; 4]).ok()?,
+            8 => {
+                r_string(r, big)?;
+            }
+            9 => {
+                let elem = r_u32(r)?;
+                let len = if big { r_u64(r)? } else { r_u32(r)? as u64 };
+                if len > 100_000_000 {
+                    return None;
+                }
+                for _ in 0..len {
+                    skip_value(r, elem, big)?;
+                }
+            }
+            10..=12 => r.read_exact(&mut [0u8; 8]).ok()?,
+            _ => return None,
+        }
+        Some(())
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open: {e}"))?;
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let mut r = std::io::BufReader::new(file);
+
+    let corrupt = |what: &str| {
+        format!(
+            "GGUF file is truncated or corrupt ({what}); re-download it: {}",
+            path.display()
+        )
+    };
+
+    if r_u32(&mut r).ok_or_else(|| corrupt("no magic"))? != 0x46554747 {
+        return Err(format!("not a GGUF file: {}", path.display()));
+    }
+    let version = r_u32(&mut r).ok_or_else(|| corrupt("no version"))?;
+    // v2+ uses u64 counts/string lengths; v1 is ancient — skip validation.
+    if version < 2 {
+        return Ok(());
+    }
+    let tensor_count = r_u64(&mut r).ok_or_else(|| corrupt("no tensor count"))?;
+    let kv_count = r_u64(&mut r).ok_or_else(|| corrupt("no metadata count"))?;
+    if kv_count > 100_000 {
+        return Err(corrupt("absurd metadata count"));
+    }
+
+    let mut arch = String::new();
+    let mut alignment = 32u64;
+    let mut block_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for _ in 0..kv_count {
+        let key = r_string(&mut r, true).ok_or_else(|| corrupt("bad metadata key"))?;
+        let vtype = r_u32(&mut r).ok_or_else(|| corrupt("bad metadata value type"))?;
+        if key == "general.architecture" && vtype == 8 {
+            arch = r_string(&mut r, true).ok_or_else(|| corrupt("bad architecture"))?;
+        } else if key == "general.alignment" && vtype == 4 {
+            alignment = r_u32(&mut r).unwrap_or(32).max(1) as u64;
+        } else if key.ends_with(".block_count") && vtype == 4 {
+            block_counts.insert(key, r_u32(&mut r).unwrap_or(0));
+        } else {
+            skip_value(&mut r, vtype, true).ok_or_else(|| corrupt("bad metadata value"))?;
+        }
+    }
+    let block_count = block_counts
+        .get(&format!("{}.block_count", arch))
+        .copied()
+        .or_else(|| block_counts.values().next().copied())
+        .unwrap_or(0) as usize;
+
+    // Tensor infos: name, n_dims, dims[n_dims], dtype, offset.
+    let mut layer_found = vec![false; block_count];
+    let mut layer_attn_norm = vec![false; block_count];
+    let mut max_end = 0u64;
+    for t in 0..tensor_count {
+        let name = r_string(&mut r, true)
+            .ok_or_else(|| corrupt(&format!("tensor info cut at {t}/{tensor_count}")))?;
+        let n_dims = r_u32(&mut r).ok_or_else(|| corrupt("tensor dims cut"))?;
+        if n_dims == 0 || n_dims > 8 {
+            return Err(corrupt("absurd tensor dims"));
+        }
+        let mut elements = 1u64;
+        for _ in 0..n_dims {
+            elements = elements.saturating_mul(r_u64(&mut r).ok_or_else(|| corrupt("dims cut"))?);
+        }
+        let dtype = r_u32(&mut r).ok_or_else(|| corrupt("dtype cut"))?;
+        let offset = r_u64(&mut r).ok_or_else(|| corrupt("offset cut"))?;
+
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some(idx) = rest.split('.').next().and_then(|s| s.parse::<usize>().ok()) {
+                if idx < block_count {
+                    layer_found[idx] = true;
+                    if name == format!("blk.{idx}.attn_norm.weight") {
+                        layer_attn_norm[idx] = true;
+                    }
+                }
+            }
+        }
+        if let Some(nbytes) = ggml_type_nbytes(dtype, elements) {
+            max_end = max_end.max(offset.saturating_add(nbytes));
+        }
+    }
+
+    // Tensor data begins at the alignment boundary after the tensor infos.
+    let header_end = {
+        use std::io::Seek;
+        r.stream_position()
+            .map_err(|_| corrupt("cannot compute header size"))?
+    };
+    let data_start = header_end.div_ceil(alignment) * alignment;
+
+    if block_count > 0 {
+        let missing: Vec<usize> = (0..block_count).filter(|i| !layer_found[*i]).collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "GGUF declares {} layers but has no tensors for layer blk.{} — \
+                 the file is truncated or corrupt; re-download it: {}",
+                block_count,
+                missing[0],
+                path.display()
+            ));
+        }
+        // attn_norm uniformity: if layer 0 has it, llama.cpp requires it on
+        // every layer (this is exactly its check_tensor_dims failure mode).
+        if layer_attn_norm[0] {
+            let missing: Vec<usize> = (0..block_count).filter(|i| !layer_attn_norm[*i]).collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "GGUF is missing 'blk.{}.attn_norm.weight'{} — \
+                     the file is truncated or corrupt; re-download it: {}",
+                    missing[0],
+                    if missing.len() > 1 {
+                        format!(" and {} more layers", missing.len() - 1)
+                    } else {
+                        String::new()
+                    },
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if max_end > 0 {
+        let expected = data_start.saturating_add(max_end);
+        if file_size < expected {
+            return Err(format!(
+                "GGUF weights are truncated: tensors require {} bytes but file has {} — \
+                 re-download it: {}",
+                expected,
+                file_size,
+                path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Byte size of `elements` values in a GGML tensor type. None for unknown
+/// types (newer quants) — callers must not fail on None.
+fn ggml_type_nbytes(dtype: u32, elements: u64) -> Option<u64> {
+    // (block_size, type_bytes): nbytes = ceil(elements / bs) * es.
+    let (bs, es): (u64, u64) = match dtype {
+        0 => (1, 4),               // F32
+        1 => (1, 2),               // F16
+        2 => (32, 18),             // Q4_0
+        3 => (32, 20),             // Q4_1
+        6 => (32, 22),             // Q5_0
+        7 => (32, 24),             // Q5_1
+        8 => (32, 34),             // Q8_0
+        9 => (32, 40),             // Q8_1
+        10 => (256, 84),           // Q2_K
+        11 => (256, 110),          // Q3_K
+        12 => (256, 144),          // Q4_K
+        13 => (256, 176),          // Q5_K
+        14 => (256, 210),          // Q6_K
+        15 => (256, 292),          // Q8_K
+        16 => (256, 66),           // IQ2_XXS
+        17 => (256, 74),           // IQ2_XS
+        18 => (256, 98),           // IQ3_XXS
+        19 => (256, 50),           // IQ1_S
+        20 => (32, 18),            // IQ4_NL
+        21 => (256, 110),          // IQ3_S
+        22 => (256, 82),           // IQ2_S
+        23 => (256, 136),          // IQ4_XS
+        24 => (1, 1),              // I8
+        25 => (1, 2),              // I16
+        26 => (1, 4),              // I32
+        27 => (1, 8),              // I64
+        28 => (1, 8),              // F64
+        29 => (256, 56),           // IQ1_M
+        30 => (1, 2),              // BF16
+        31 | 32 | 33 => (32, 18),  // Q4_0_4_4 / Q4_0_4_8 / Q4_0_8_8
+        34 => (256, 54),           // TQ1_0
+        35 => (256, 66),           // TQ2_0
+        36 | 37 | 38 => (256, 82), // IQ4_NL_4_4/4_8/8_8 (approx IQ2_S-size)
+        39 => (32, 17),            // MXFP4
+        _ => return None,
+    };
+    Some(elements.div_ceil(bs) * es)
+}
+
 fn create_model_info_from_file(path: &PathBuf, format: ModelFormat) -> Result<ModelInfo> {
     let metadata = std::fs::metadata(path)?;
     let filename = path
@@ -851,5 +1086,135 @@ mod tests {
         let meta = read_gguf_metadata(&path).unwrap();
         // Falls back to any *.context_length when arch-specific key missing
         assert_eq!(meta.context_length, Some(32768));
+    }
+
+    /// Build a GGUF v3 file with real tensor info entries + payload.
+    /// `tensors` = (name, offset, dtype); each declares a single 32-elem dim.
+    fn write_full_gguf(
+        dir: &std::path::Path,
+        name: &str,
+        n_layers: u32,
+        tensors: &[(&str, u64, u32)],
+        payload_len: usize,
+    ) -> PathBuf {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&2u64.to_le_bytes()); // kv_count
+        buf.extend_from_slice(&gguf_string("general.architecture"));
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&gguf_string("llama"));
+        buf.extend_from_slice(&gguf_string("llama.block_count"));
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&n_layers.to_le_bytes());
+        for (tname, offset, dtype) in tensors {
+            buf.extend_from_slice(&gguf_string(tname));
+            buf.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            buf.extend_from_slice(&32u64.to_le_bytes()); // dim = 32 elems
+            buf.extend_from_slice(&dtype.to_le_bytes());
+            buf.extend_from_slice(&offset.to_le_bytes());
+        }
+        while buf.len() % 32 != 0 {
+            buf.push(0); // align data section to 32
+        }
+        buf.extend(std::iter::repeat(0u8).take(payload_len));
+        let path = dir.join(name);
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn validate_gguf_ok() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 2 layers, F32 tensors of 32 elems = 128 bytes each
+        let path = write_full_gguf(
+            &dir,
+            "ok.gguf",
+            2,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            256,
+        );
+        assert!(validate_gguf(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gguf_missing_layer() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // declares 3 layers but only blk.0/blk.1 exist
+        let path = write_full_gguf(
+            &dir,
+            "missing.gguf",
+            3,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            256,
+        );
+        let err = validate_gguf(&path).unwrap_err();
+        assert!(err.contains("blk.2"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gguf_missing_attn_norm() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // blk.1 exists but lacks attn_norm (the exact check_tensor_dims failure)
+        let path = write_full_gguf(
+            &dir,
+            "nonorm.gguf",
+            2,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.ffn_norm.weight", 128, 0),
+            ],
+            256,
+        );
+        let err = validate_gguf(&path).unwrap_err();
+        assert!(err.contains("blk.1.attn_norm.weight"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gguf_truncated_weights() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // tensors declare 256 bytes of weights but payload is only 128
+        let path = write_full_gguf(
+            &dir,
+            "trunc.gguf",
+            2,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            128,
+        );
+        let err = validate_gguf(&path).unwrap_err();
+        assert!(err.contains("truncated"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gguf_rejects_non_gguf() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.gguf");
+        std::fs::write(&path, b"definitely not a gguf file").unwrap();
+        let err = validate_gguf(&path).unwrap_err();
+        assert!(err.contains("not a GGUF") || err.contains("corrupt"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
