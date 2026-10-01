@@ -271,7 +271,16 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
   (the `check_tensor_dims: tensor 'blk.N.attn_norm.weight' not found` crash),
   non-uniform `attn_norm` coverage, and file size below the largest declared
   tensor extent. Errors tell the user to re-download — without it
-  llama-server crash-loops with cryptic errors.
+  llama-server crash-loops with cryptic errors. MTP/nextn tail layers
+  (`{arch}.nextn_predict_layers`) are excluded — converters legitimately
+  omit them (qwen35 writes block_count=33 with only blk.0..31 tensors).
+- **Stale llama-server auto-heal**: if a GGUF passes validation but
+  llama-server exits early with `check_tensor_dims`, the managed
+  `~/.athenas/bin` binary is re-downloaded once and retried — that error
+  on a valid file means the build predates the architecture. `--no-mtp`
+  is passed when the binary supports it (probed via `--help`) since
+  Athenas doesn't use MTP decoding and missing MTP tensors otherwise
+  fail the load.
 - **Download integrity**: use `ModelDownloader::download_model_verify`
   with `lfs.sha256` when available — it hashes in `spawn_blocking` and
   deletes the file on mismatch. `mirror_url` applies to downloads too
