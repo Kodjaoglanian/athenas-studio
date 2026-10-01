@@ -971,6 +971,24 @@ impl Backend for LlamaCppBackend {
             .await
             .map_err(|e| AthenasError::Backend(format!("validation task failed: {e}")))?
             .map_err(AthenasError::Backend)?;
+
+            // Repair converters that declared MTP/nextn layers in
+            // block_count without writing their tensors (qwen35,
+            // llama.cpp #26916) — otherwise llama-server demands
+            // blk.{n_layer}.* that doesn't exist.
+            let p = config.model_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                athenas_core::fix_gguf_phantom_mtp(std::path::Path::new(&p))
+            })
+            .await
+            {
+                Ok(Ok(true)) => {
+                    info!("patched GGUF metadata: removed phantom MTP/nextn layer declaration")
+                }
+                Ok(Err(e)) => warn!("GGUF phantom-MTP patch skipped: {}", e),
+                Err(e) => warn!("GGUF phantom-MTP patch failed: {}", e),
+                _ => {}
+            }
         }
 
         self.start_server(&config).await?;

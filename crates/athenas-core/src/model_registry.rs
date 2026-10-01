@@ -771,6 +771,211 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
     Ok(())
 }
 
+/// Repair a GGUF whose converter declared MTP/nextn layers in
+/// `block_count` but never wrote their tensors (qwen35/qwen3next:
+/// `block_count=33`, `nextn_predict_layers=1`, tensors only for
+/// `blk.0..31` — llama.cpp #26916/#24737).
+///
+/// When detected, patches the file in place:
+/// - `{arch}.block_count` → `block_count - nextn`
+/// - `{arch}.nextn_predict_layers` → 0
+/// - any `{arch}.*` array KV whose length equals the old block_count
+///   (per-layer arrays like `attention.recurrent_layers`) has its key
+///   renamed so the loader ignores it and uses its computed fallback.
+///
+/// Returns Ok(true) when the file was patched. No-ops (Ok(false)) when
+/// MTP tensors exist, nextn is 0, or the layout doesn't match.
+pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    // Read wrapper that tracks the logical stream position so we can
+    // record byte offsets of values to patch in place.
+    struct Pos<R: Read> {
+        inner: R,
+        pos: u64,
+    }
+    impl<R: Read> Read for Pos<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+    impl<R: Read> Pos<R> {
+        fn r_u32(&mut self) -> Option<u32> {
+            let mut b = [0u8; 4];
+            self.read_exact(&mut b).ok()?;
+            Some(u32::from_le_bytes(b))
+        }
+        fn r_u64(&mut self) -> Option<u64> {
+            let mut b = [0u8; 8];
+            self.read_exact(&mut b).ok()?;
+            Some(u64::from_le_bytes(b))
+        }
+        /// Returns (offset of the string's first byte, string)
+        fn r_string(&mut self) -> Option<(u64, String)> {
+            let len = self.r_u64()?;
+            if len > 16_000_000 {
+                return None;
+            }
+            let off = self.pos;
+            let mut buf = vec![0u8; len as usize];
+            self.read_exact(&mut buf).ok()?;
+            String::from_utf8(buf).ok().map(|s| (off, s))
+        }
+        fn skip_value(&mut self, vt: u32) -> Option<()> {
+            match vt {
+                0 | 1 | 7 => self.read_exact(&mut [0u8; 1]).ok()?,
+                2 | 3 => self.read_exact(&mut [0u8; 2]).ok()?,
+                4..=6 => self.read_exact(&mut [0u8; 4]).ok()?,
+                8 => {
+                    self.r_string()?;
+                }
+                9 => {
+                    let elem = self.r_u32()?;
+                    let len = self.r_u64()?;
+                    if len > 100_000_000 {
+                        return None;
+                    }
+                    for _ in 0..len {
+                        self.skip_value(elem)?;
+                    }
+                }
+                10..=12 => self.read_exact(&mut [0u8; 8]).ok()?,
+                _ => return None,
+            }
+            Some(())
+        }
+    }
+
+    let file = std::fs::File::open(path).map_err(|e| format!("cannot open: {e}"))?;
+    let mut r = Pos {
+        inner: std::io::BufReader::new(file),
+        pos: 0,
+    };
+
+    let bad = |w: &str| format!("cannot inspect GGUF ({w}): {}", path.display());
+
+    if r.r_u32().ok_or_else(|| bad("no magic"))? != 0x46554747 {
+        return Ok(false);
+    }
+    if r.r_u32().ok_or_else(|| bad("no version"))? < 2 {
+        return Ok(false);
+    }
+    let tensor_count = r.r_u64().ok_or_else(|| bad("no tensor count"))?;
+    let kv_count = r.r_u64().ok_or_else(|| bad("no kv count"))?;
+    if kv_count > 100_000 {
+        return Ok(false);
+    }
+
+    let mut arch = String::new();
+    let mut block_count = 0u32;
+    let mut block_count_off = None;
+    let mut nextn = 0u32;
+    let mut nextn_off = None;
+    // (key_byte_off, key, array_len) for every arch-scoped array —
+    // resolved after the loop once block_count is known.
+    let mut arrays: Vec<(u64, String, u64)> = Vec::new();
+
+    for _ in 0..kv_count {
+        let (key_off, key) = r.r_string().ok_or_else(|| bad("bad key"))?;
+        let vtype = r.r_u32().ok_or_else(|| bad("bad vtype"))?;
+        let val_off = r.pos;
+        match key.as_str() {
+            "general.architecture" if vtype == 8 => {
+                arch = r.r_string().ok_or_else(|| bad("bad arch"))?.1;
+            }
+            _ if key.ends_with(".block_count") && vtype == 4 => {
+                block_count_off = Some(val_off);
+                block_count = r.r_u32().ok_or_else(|| bad("bad block_count"))?;
+            }
+            _ if key.ends_with(".nextn_predict_layers") && vtype == 4 => {
+                nextn_off = Some(val_off);
+                nextn = r.r_u32().ok_or_else(|| bad("bad nextn"))?;
+            }
+            _ if vtype == 9 => {
+                let elem = r.r_u32().ok_or_else(|| bad("bad array type"))?;
+                let len = r.r_u64().ok_or_else(|| bad("bad array len"))?;
+                if len > 100_000_000 {
+                    return Ok(false);
+                }
+                arrays.push((key_off, key, len));
+                for _ in 0..len {
+                    r.skip_value(elem).ok_or_else(|| bad("bad array elem"))?;
+                }
+            }
+            _ => {
+                r.skip_value(vtype).ok_or_else(|| bad("bad value"))?;
+            }
+        }
+    }
+
+    if nextn == 0 || nextn > block_count {
+        return Ok(false);
+    }
+    let required = block_count - nextn;
+
+    // Scan tensor infos: collect which blk.{i} layers have tensors.
+    let mut layers = std::collections::HashSet::new();
+    for _ in 0..tensor_count {
+        let (_off, name) = match r.r_string() {
+            Some(v) => v,
+            None => return Ok(false), // truncated header — validate_gguf reports it
+        };
+        let n_dims = r.r_u32().ok_or_else(|| bad("bad dims"))?;
+        for _ in 0..n_dims {
+            r.r_u64().ok_or_else(|| bad("dims cut"))?;
+        }
+        r.r_u32().ok_or_else(|| bad("dtype cut"))?;
+        r.r_u64().ok_or_else(|| bad("offset cut"))?;
+        if let Some(rest) = name.strip_prefix("blk.") {
+            if let Some(idx) = rest.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+                layers.insert(idx);
+            }
+        }
+    }
+
+    // Patch only when the trunk is complete and *no* MTP-layer tensors
+    // exist — the classic converter quirk. Present MTP tensors mean the
+    // file is legit and llama.cpp can load it as-is.
+    let trunk_ok = (0..required).all(|i| layers.contains(&i));
+    let mtp_present = (required..block_count).any(|i| layers.contains(&i));
+    if !trunk_ok || mtp_present {
+        return Ok(false);
+    }
+
+    // Rename arch-scoped arrays whose length still counts the MTP layers.
+    let prefix = format!("{}.", arch);
+    let renames: Vec<u64> = arrays
+        .iter()
+        .filter(|(_, k, len)| {
+            !arch.is_empty() && k.starts_with(&prefix) && *len == block_count as u64
+        })
+        .map(|(off, _, _)| *off)
+        .collect();
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("cannot open for writing: {e}"))?;
+    if let Some(off) = block_count_off {
+        f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        f.write_all(&required.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    if let Some(off) = nextn_off {
+        f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        f.write_all(&0u32.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    for off in renames {
+        f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        f.write_all(b"x").map_err(|e| e.to_string())?;
+    }
+    f.flush().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 /// Byte size of `elements` values in a GGML tensor type. None for unknown
 /// types (newer quants) — callers must not fail on None.
 fn ggml_type_nbytes(dtype: u32, elements: u64) -> Option<u64> {
@@ -1100,6 +1305,9 @@ mod tests {
     /// Build a GGUF v3 file with real tensor info entries + payload.
     /// `tensors` = (name, offset, dtype); each declares a single 32-elem dim.
     /// `nextn` adds `{arch}.nextn_predict_layers` to the metadata.
+    /// `with_recurrent_array` adds `{arch}.attention.recurrent_layers`
+    /// (bool array of `n_layers` elements) — the layout real qwen35 files
+    /// carry when block_count includes the MTP layer.
     fn write_full_gguf(
         dir: &std::path::Path,
         name: &str,
@@ -1107,14 +1315,15 @@ mod tests {
         nextn: u32,
         tensors: &[(&str, u64, u32)],
         payload_len: usize,
+        with_recurrent_array: bool,
     ) -> PathBuf {
         use std::io::Write;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        let kv_count = if nextn > 0 { 3 } else { 2 };
-        buf.extend_from_slice(&(kv_count as u64).to_le_bytes());
+        let kv_count = 2 + (nextn > 0) as u64 + with_recurrent_array as u64;
+        buf.extend_from_slice(&kv_count.to_le_bytes());
         buf.extend_from_slice(&gguf_string("general.architecture"));
         buf.extend_from_slice(&8u32.to_le_bytes());
         buf.extend_from_slice(&gguf_string("llama"));
@@ -1125,6 +1334,13 @@ mod tests {
             buf.extend_from_slice(&gguf_string("llama.nextn_predict_layers"));
             buf.extend_from_slice(&4u32.to_le_bytes());
             buf.extend_from_slice(&nextn.to_le_bytes());
+        }
+        if with_recurrent_array {
+            buf.extend_from_slice(&gguf_string("llama.attention.recurrent_layers"));
+            buf.extend_from_slice(&9u32.to_le_bytes()); // ARRAY
+            buf.extend_from_slice(&7u32.to_le_bytes()); // elem BOOL
+            buf.extend_from_slice(&(n_layers as u64).to_le_bytes());
+            buf.extend(std::iter::repeat_n(1u8, n_layers as usize));
         }
         for (tname, offset, dtype) in tensors {
             buf.extend_from_slice(&gguf_string(tname));
@@ -1160,6 +1376,7 @@ mod tests {
                 ("blk.1.attn_norm.weight", 128, 0),
             ],
             256,
+            false,
         );
         assert!(validate_gguf(&path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
@@ -1180,6 +1397,7 @@ mod tests {
                 ("blk.1.attn_norm.weight", 128, 0),
             ],
             256,
+            false,
         );
         let err = validate_gguf(&path).unwrap_err();
         assert!(err.contains("blk.2"), "unexpected: {err}");
@@ -1201,6 +1419,7 @@ mod tests {
                 ("blk.1.ffn_norm.weight", 128, 0),
             ],
             256,
+            false,
         );
         let err = validate_gguf(&path).unwrap_err();
         assert!(err.contains("blk.1.attn_norm.weight"), "unexpected: {err}");
@@ -1222,6 +1441,7 @@ mod tests {
                 ("blk.1.attn_norm.weight", 128, 0),
             ],
             128,
+            false,
         );
         let err = validate_gguf(&path).unwrap_err();
         assert!(err.contains("truncated"), "unexpected: {err}");
@@ -1244,8 +1464,85 @@ mod tests {
                 ("blk.1.attn_norm.weight", 128, 0),
             ],
             256,
+            false,
         );
         assert!(validate_gguf(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fix_gguf_phantom_mtp_patches() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // qwen35 layout: block_count=3 (2 trunk + 1 MTP), nextn=1,
+        // recurrent_layers[3], tensors only for blk.0/1
+        let path = write_full_gguf(
+            &dir,
+            "phantom.gguf",
+            3,
+            1,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            256,
+            true,
+        );
+        assert!(fix_gguf_phantom_mtp(&path).unwrap());
+        // idempotent
+        assert!(!fix_gguf_phantom_mtp(&path).unwrap());
+        // still structurally valid and trunk-complete
+        assert!(validate_gguf(&path).is_ok());
+        // the stale per-layer array key was renamed away
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw
+            .windows(b"llama.attention.recurrent_layers".len())
+            .any(|w| w == b"llama.attention.recurrent_layers"));
+        assert!(raw
+            .windows(b"xlama.attention.recurrent_layers".len())
+            .any(|w| w == b"xlama.attention.recurrent_layers"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fix_gguf_phantom_mtp_noop_when_mtp_present() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // MTP tensors actually exist at blk.2 — leave the file alone
+        let path = write_full_gguf(
+            &dir,
+            "real-mtp.gguf",
+            3,
+            1,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+                ("blk.2.attn_norm.weight", 256, 0),
+            ],
+            384,
+            true,
+        );
+        assert!(!fix_gguf_phantom_mtp(&path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fix_gguf_phantom_mtp_noop_normal() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_full_gguf(
+            &dir,
+            "normal.gguf",
+            2,
+            0,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            256,
+            false,
+        );
+        assert!(!fix_gguf_phantom_mtp(&path).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 
