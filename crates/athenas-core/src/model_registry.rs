@@ -654,6 +654,7 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
 
     let mut arch = String::new();
     let mut alignment = 32u64;
+    let mut nextn_layers = 0u32;
     let mut block_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     for _ in 0..kv_count {
         let key = r_string(&mut r, true).ok_or_else(|| corrupt("bad metadata key"))?;
@@ -664,6 +665,8 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
             alignment = r_u32(&mut r).unwrap_or(32).max(1) as u64;
         } else if key.ends_with(".block_count") && vtype == 4 {
             block_counts.insert(key, r_u32(&mut r).unwrap_or(0));
+        } else if key.ends_with(".nextn_predict_layers") && vtype == 4 {
+            nextn_layers = r_u32(&mut r).unwrap_or(0);
         } else {
             skip_value(&mut r, vtype, true).ok_or_else(|| corrupt("bad metadata value"))?;
         }
@@ -673,10 +676,14 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
         .copied()
         .or_else(|| block_counts.values().next().copied())
         .unwrap_or(0) as usize;
+    // MTP/nextn layers are counted in block_count but converters may omit
+    // their tensors (e.g. qwen35: block_count=33 with only blk.0..31
+    // written — llama.cpp #26916/#24737). Only the trunk is required.
+    let required_layers = block_count.saturating_sub(nextn_layers as usize);
 
     // Tensor infos: name, n_dims, dims[n_dims], dtype, offset.
-    let mut layer_found = vec![false; block_count];
-    let mut layer_attn_norm = vec![false; block_count];
+    let mut layer_found = vec![false; required_layers];
+    let mut layer_attn_norm = vec![false; required_layers];
     let mut max_end = 0u64;
     for t in 0..tensor_count {
         let name = r_string(&mut r, true)
@@ -694,7 +701,7 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
 
         if let Some(rest) = name.strip_prefix("blk.") {
             if let Some(idx) = rest.split('.').next().and_then(|s| s.parse::<usize>().ok()) {
-                if idx < block_count {
+                if idx < required_layers {
                     layer_found[idx] = true;
                     if name == format!("blk.{idx}.attn_norm.weight") {
                         layer_attn_norm[idx] = true;
@@ -715,8 +722,8 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
     };
     let data_start = header_end.div_ceil(alignment) * alignment;
 
-    if block_count > 0 {
-        let missing: Vec<usize> = (0..block_count).filter(|i| !layer_found[*i]).collect();
+    if required_layers > 0 {
+        let missing: Vec<usize> = (0..required_layers).filter(|i| !layer_found[*i]).collect();
         if !missing.is_empty() {
             return Err(format!(
                 "GGUF declares {} layers but has no tensors for layer blk.{} — \
@@ -729,7 +736,9 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
         // attn_norm uniformity: if layer 0 has it, llama.cpp requires it on
         // every layer (this is exactly its check_tensor_dims failure mode).
         if layer_attn_norm[0] {
-            let missing: Vec<usize> = (0..block_count).filter(|i| !layer_attn_norm[*i]).collect();
+            let missing: Vec<usize> = (0..required_layers)
+                .filter(|i| !layer_attn_norm[*i])
+                .collect();
             if !missing.is_empty() {
                 return Err(format!(
                     "GGUF is missing 'blk.{}.attn_norm.weight'{} — \
@@ -1090,10 +1099,12 @@ mod tests {
 
     /// Build a GGUF v3 file with real tensor info entries + payload.
     /// `tensors` = (name, offset, dtype); each declares a single 32-elem dim.
+    /// `nextn` adds `{arch}.nextn_predict_layers` to the metadata.
     fn write_full_gguf(
         dir: &std::path::Path,
         name: &str,
         n_layers: u32,
+        nextn: u32,
         tensors: &[(&str, u64, u32)],
         payload_len: usize,
     ) -> PathBuf {
@@ -1102,13 +1113,19 @@ mod tests {
         buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&2u64.to_le_bytes()); // kv_count
+        let kv_count = if nextn > 0 { 3 } else { 2 };
+        buf.extend_from_slice(&(kv_count as u64).to_le_bytes());
         buf.extend_from_slice(&gguf_string("general.architecture"));
         buf.extend_from_slice(&8u32.to_le_bytes());
         buf.extend_from_slice(&gguf_string("llama"));
         buf.extend_from_slice(&gguf_string("llama.block_count"));
         buf.extend_from_slice(&4u32.to_le_bytes());
         buf.extend_from_slice(&n_layers.to_le_bytes());
+        if nextn > 0 {
+            buf.extend_from_slice(&gguf_string("llama.nextn_predict_layers"));
+            buf.extend_from_slice(&4u32.to_le_bytes());
+            buf.extend_from_slice(&nextn.to_le_bytes());
+        }
         for (tname, offset, dtype) in tensors {
             buf.extend_from_slice(&gguf_string(tname));
             buf.extend_from_slice(&1u32.to_le_bytes()); // n_dims
@@ -1137,6 +1154,7 @@ mod tests {
             &dir,
             "ok.gguf",
             2,
+            0,
             &[
                 ("blk.0.attn_norm.weight", 0, 0),
                 ("blk.1.attn_norm.weight", 128, 0),
@@ -1156,6 +1174,7 @@ mod tests {
             &dir,
             "missing.gguf",
             3,
+            0,
             &[
                 ("blk.0.attn_norm.weight", 0, 0),
                 ("blk.1.attn_norm.weight", 128, 0),
@@ -1176,6 +1195,7 @@ mod tests {
             &dir,
             "nonorm.gguf",
             2,
+            0,
             &[
                 ("blk.0.attn_norm.weight", 0, 0),
                 ("blk.1.ffn_norm.weight", 128, 0),
@@ -1196,6 +1216,7 @@ mod tests {
             &dir,
             "trunc.gguf",
             2,
+            0,
             &[
                 ("blk.0.attn_norm.weight", 0, 0),
                 ("blk.1.attn_norm.weight", 128, 0),
@@ -1204,6 +1225,27 @@ mod tests {
         );
         let err = validate_gguf(&path).unwrap_err();
         assert!(err.contains("truncated"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn validate_gguf_nextn_layers_optional() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // qwen35 layout: block_count=3 = 2 trunk + 1 MTP whose tensors
+        // converters legitimately omit (llama.cpp #26916/#24737)
+        let path = write_full_gguf(
+            &dir,
+            "mtp.gguf",
+            3,
+            1,
+            &[
+                ("blk.0.attn_norm.weight", 0, 0),
+                ("blk.1.attn_norm.weight", 128, 0),
+            ],
+            256,
+        );
+        assert!(validate_gguf(&path).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 

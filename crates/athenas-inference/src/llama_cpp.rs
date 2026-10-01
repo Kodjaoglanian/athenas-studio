@@ -25,6 +25,9 @@ pub struct LlamaCppBackend {
     client: reqwest::Client,
     /// Set to true if --reasoning flag caused server to fail, so we skip it on retry
     skip_reasoning_flag: bool,
+    /// Set after one llama-server re-download attempt during this load —
+    /// prevents retry loops when a stale binary rejects a valid model.
+    refreshed_server_bin: bool,
     /// Whether reasoning/thinking mode is enabled (from config)
     reasoning_enabled: bool,
     /// Watchdog task that periodically checks if llama-server is alive
@@ -58,6 +61,7 @@ impl LlamaCppBackend {
                 .build()
                 .unwrap(),
             skip_reasoning_flag: false,
+            refreshed_server_bin: false,
             reasoning_enabled: true,
             watchdog_handle: None,
             watchdog_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -389,6 +393,13 @@ impl LlamaCppBackend {
             .unwrap_or_default();
         let supports_load_mode = help_text.contains("--load-mode");
         let supports_spec_draft = help_text.contains("--spec-draft-n-max");
+        // MTP/nextn: qwen3next/qwen35 GGUFs declare nextn_predict_layers
+        // without writing the MTP tensors (llama.cpp #26916/#24737), and
+        // builds that auto-load MTP reject them in check_tensor_dims.
+        // Athenas doesn't use MTP — disable it when the flag exists.
+        if help_text.contains("--no-mtp") {
+            cmd.arg("--no-mtp");
+        }
 
         // mmap is the default in both flag eras — only pass a flag for
         // non-default combinations.
@@ -551,6 +562,42 @@ impl LlamaCppBackend {
                                 arch, stderr_msg
                             );
                             return Err(AthenasError::Backend(msg));
+                        }
+
+                        // A model that passed our GGUF integrity check but is
+                        // rejected by llama-server's check_tensor_dims means the
+                        // binary is likely too old for the architecture (e.g.
+                        // qwen35 MTP/nextn, llama.cpp #26916). Re-download the
+                        // managed build once. (Deliberately narrow: generic
+                        // "failed to load" also fires on OOM.)
+                        if full_log.contains("check_tensor_dims") {
+                            if server_bin.contains(".athenas") && !self.refreshed_server_bin {
+                                info!(
+                                    "llama-server rejected a valid model — binary may be \
+                                     outdated; re-downloading latest build..."
+                                );
+                                self.refreshed_server_bin = true;
+                                if let Some(ref mut child) = self.server_handle {
+                                    let _ = child.kill().await;
+                                }
+                                self.server_handle = None;
+                                match crate::backend_setup::force_redownload_llama_server(
+                                    config.auto_install_deps,
+                                )
+                                .await
+                                {
+                                    Ok(_) => return self.retry_start_server(config).await,
+                                    Err(e) => {
+                                        warn!("llama-server re-download failed: {}", e)
+                                    }
+                                }
+                            }
+                            msg.push_str(
+                                "\n\nHint: the model file passed integrity checks — this \
+                                 llama-server build is likely too old for the model's \
+                                 architecture. Update llama.cpp (for Athenas-managed installs, \
+                                 delete ~/.athenas/bin/llama-server* to force a fresh download).",
+                            );
                         }
 
                         // Check if --reasoning flags are unsupported by this version
@@ -912,6 +959,7 @@ impl Backend for LlamaCppBackend {
             .to_string();
         self.context_size = config.context_size;
         self.gpu_layers = config.gpu_layers;
+        self.refreshed_server_bin = false;
 
         // Fail fast on truncated/corrupt GGUFs — otherwise llama-server
         // crash-loops with cryptic check_tensor_dims errors.
@@ -1776,6 +1824,7 @@ impl Backend for LlamaCppBackend {
             server_port: self.server_port,
             client: self.client.clone(),
             skip_reasoning_flag: self.skip_reasoning_flag,
+            refreshed_server_bin: self.refreshed_server_bin,
             reasoning_enabled: self.reasoning_enabled,
             watchdog_handle: None, // Watchdog is not cloned
             watchdog_stop: self.watchdog_stop.clone(),
