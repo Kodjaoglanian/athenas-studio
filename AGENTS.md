@@ -274,6 +274,16 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
   llama-server crash-loops with cryptic errors. MTP/nextn tail layers
   (`{arch}.nextn_predict_layers`) are excluded — converters legitimately
   omit them (qwen35 writes block_count=33 with only blk.0..31 tensors).
+- **Phantom MTP repair**: `athenas_core::fix_gguf_phantom_mtp(path)` runs
+  after validation in `load_model`. qwen35/qwen3next converters declare
+  `nextn_predict_layers` inside `block_count` without writing the MTP
+  tensors; llama.cpp then demands `blk.{n_layer}.attn_norm.weight` and
+  dies. When trunk layers are complete and tail MTP tensors are absent,
+  the file is patched in place: `block_count -= nextn`,
+  `nextn_predict_layers = 0`, and any `{arch}.*` array KV still sized to
+  the old block_count (e.g. `attention.recurrent_layers`) gets its key
+  renamed so the loader's interval fallback kicks in. Idempotent;
+  files that actually carry MTP tensors are left untouched.
 - **Stale llama-server auto-heal**: if a GGUF passes validation but
   llama-server exits early with `check_tensor_dims`, the managed
   `~/.athenas/bin` binary is re-downloaded once and retried — that error
