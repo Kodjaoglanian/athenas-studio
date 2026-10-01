@@ -264,6 +264,14 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
   rejects with 507 when the count limit is hit or
   `estimate_model_ram_mb` exceeds available RAM. `"force": true` in
   the request body bypasses both checks.
+- **GGUF integrity pre-flight**: `athenas_core::validate_gguf(path)` runs in
+  `LlamaCppBackend::load_model` before spawning llama-server. It stream-reads
+  the header and rejects truncated/corrupt files: unreadable tensor infos,
+  layers declared by `{arch}.block_count` missing from the tensor list
+  (the `check_tensor_dims: tensor 'blk.N.attn_norm.weight' not found` crash),
+  non-uniform `attn_norm` coverage, and file size below the largest declared
+  tensor extent. Errors tell the user to re-download — without it
+  llama-server crash-loops with cryptic errors.
 - **Download integrity**: use `ModelDownloader::download_model_verify`
   with `lfs.sha256` when available — it hashes in `spawn_blocking` and
   deletes the file on mismatch. `mirror_url` applies to downloads too
