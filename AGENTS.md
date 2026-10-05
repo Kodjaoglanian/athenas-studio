@@ -190,6 +190,11 @@ them with `--embeddings` and caps the effective context and batch size to the
 model's declared training context. Keep this detection in the backend so every
 entry point (CLI, TUI and `/v1/models/load`) behaves consistently.
 
+For dedicated embeddings, pass the configured batch through both
+`--batch-size` and `--ubatch-size`. llama.cpp requires the complete embedding
+batch to fit in one physical microbatch; omitting `--ubatch-size` silently caps
+the effective batch at its default of 512.
+
 Each llama-server launch writes to an isolated `llama-server-<port>-<id>.log`.
 Startup diagnostics must only inspect that launch's log; never parse the shared
 historical log, because stale errors can misclassify the current model.
