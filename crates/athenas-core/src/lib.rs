@@ -13,6 +13,6 @@ pub use hardware::{
     HardwareDetector, HardwareInfo, ModelMemoryEstimate,
 };
 pub use model_registry::{
-    dir_size, fix_gguf_phantom_mtp, is_onnx_model_path, validate_gguf, ModelFormat, ModelInfo,
-    ModelRegistry,
+    dir_size, fix_gguf_phantom_mtp, is_embedding_architecture, is_onnx_model_path,
+    read_gguf_metadata, validate_gguf, GgufMetadata, ModelFormat, ModelInfo, ModelRegistry,
 };

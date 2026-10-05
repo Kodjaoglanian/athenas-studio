@@ -12,6 +12,47 @@ use crate::types::{
     ModelLoadConfig, Role, StreamChunk, TokenizeRequest, TokenizeResponse,
 };
 
+fn configure_embedding_model(
+    metadata: &athenas_core::GgufMetadata,
+    config: &mut ModelLoadConfig,
+) -> bool {
+    let is_embedding = metadata
+        .architecture
+        .as_deref()
+        .is_some_and(athenas_core::is_embedding_architecture);
+    if !is_embedding {
+        return false;
+    }
+
+    if let Some(model_context) = metadata.context_length.filter(|ctx| *ctx > 0) {
+        if config.context_size == 0 || config.context_size > model_context {
+            info!(
+                "Embedding model context capped from {} to {} tokens",
+                config.context_size, model_context
+            );
+            config.context_size = model_context;
+        }
+        config.batch_size = config.batch_size.min(config.context_size);
+    }
+
+    true
+}
+
+fn unknown_architecture_from_log(log: &str) -> Option<String> {
+    log.lines()
+        .rev()
+        .find(|line| line.contains("unknown model architecture"))
+        .and_then(|line| line.split('\'').nth(1))
+        .map(str::to_string)
+}
+
+fn is_known_non_text_architecture(architecture: &str) -> bool {
+    matches!(
+        architecture.to_ascii_lowercase().as_str(),
+        "whisper" | "speech-t5" | "tts" | "vits" | "bark" | "clvp" | "diffusion"
+    )
+}
+
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
 pub struct LlamaCppBackend {
     hardware: HardwareInfo,
@@ -20,6 +61,7 @@ pub struct LlamaCppBackend {
     model_name: String,
     context_size: u32,
     gpu_layers: i32,
+    embedding_mode: bool,
     server_handle: Option<tokio::process::Child>,
     server_port: u16,
     client: reqwest::Client,
@@ -48,6 +90,7 @@ impl LlamaCppBackend {
             model_name: String::new(),
             context_size: 4096,
             gpu_layers: -1,
+            embedding_mode: false,
             server_handle: None,
             server_port: 0,
             // Timeout for requests to llama-server. Prompt processing can
@@ -342,6 +385,10 @@ impl LlamaCppBackend {
             .arg("--jinja")
             .arg("--metrics");
 
+        if self.embedding_mode {
+            cmd.arg("--embeddings");
+        }
+
         // Reasoning/thinking mode — configurable per model.
         // Models like Qwen3.5 can hang or produce extremely long thinking
         // traces. Use --reasoning off and --reasoning-budget 0 when disabled.
@@ -482,11 +529,19 @@ impl LlamaCppBackend {
                 .unwrap_or_else(|| ".".to_string());
             let dir = format!("{}/.athenas", home);
             let _ = std::fs::create_dir_all(&dir);
-            format!("{}/llama-server.log", dir)
+            let launch_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            format!(
+                "{}/llama-server-{}-{}.log",
+                dir, self.server_port, launch_id
+            )
         };
         let llama_log = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&llama_log_path)
             .map_err(|e| {
                 AthenasError::Backend(format!("Failed to open llama-server log: {}", e))
@@ -545,22 +600,23 @@ impl LlamaCppBackend {
 
                         // Check for unsupported model architecture (whisper, tts, etc.)
                         let full_log = std::fs::read_to_string(&llama_log_path).unwrap_or_default();
-                        if full_log.contains("unknown model architecture") {
-                            // Extract the architecture name from the log
-                            let arch = full_log
-                                .lines()
-                                .find(|l| l.contains("unknown model architecture"))
-                                .and_then(|l| l.split('\'').nth(1))
-                                .unwrap_or("unknown");
-                            msg = format!(
-                                "This model uses the '{}' architecture, which is not a text LLM.\n\
-                                 llama-server only supports text generation models (llama, mistral, \
-                                 qwen, deepseek, gemma, phi, etc.).\n\
-                                 Models like Whisper (audio transcription), TTS, VITS, and Stable \
-                                 Diffusion cannot be loaded.\n\n\
-                                 Last log line: {}",
-                                arch, stderr_msg
-                            );
+                        if let Some(arch) = unknown_architecture_from_log(&full_log) {
+                            msg = if is_known_non_text_architecture(&arch) {
+                                format!(
+                                    "This model uses the '{}' architecture, which is not a text LLM.\n\
+                                     Use the dedicated Athenas command/backend for this model type.\n\n\
+                                     Last log line: {}",
+                                    arch, stderr_msg
+                                )
+                            } else {
+                                format!(
+                                    "The installed llama-server does not support the '{}' architecture.\n\
+                                     Update llama.cpp (for Athenas-managed installs, delete \
+                                     ~/.athenas/bin/llama-server* to force a fresh download).\n\n\
+                                     Last log line: {}",
+                                    arch, stderr_msg
+                                )
+                            };
                             return Err(AthenasError::Backend(msg));
                         }
 
@@ -601,7 +657,9 @@ impl LlamaCppBackend {
                         }
 
                         // Check if --reasoning flags are unsupported by this version
-                        if (full_log.contains("reasoning") || full_log.contains("unrecognized"))
+                        if full_log.contains("reasoning")
+                            && (full_log.contains("unrecognized")
+                                || full_log.contains("unknown argument"))
                             && !self.skip_reasoning_flag
                         {
                             info!("--reasoning flag not supported, retrying without it...");
@@ -950,16 +1008,16 @@ impl Backend for LlamaCppBackend {
         self.loaded
     }
 
-    async fn load_model(&mut self, config: ModelLoadConfig) -> Result<()> {
+    async fn load_model(&mut self, mut config: ModelLoadConfig) -> Result<()> {
         self.model_path = config.model_path.clone();
         self.model_name = std::path::Path::new(&config.model_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("model")
             .to_string();
-        self.context_size = config.context_size;
         self.gpu_layers = config.gpu_layers;
         self.refreshed_server_bin = false;
+        self.embedding_mode = false;
 
         // Fail fast on truncated/corrupt GGUFs — otherwise llama-server
         // crash-loops with cryptic check_tensor_dims errors.
@@ -989,8 +1047,25 @@ impl Backend for LlamaCppBackend {
                 Err(e) => warn!("GGUF phantom-MTP patch failed: {}", e),
                 _ => {}
             }
+
+            let p = config.model_path.clone();
+            if let Ok(Some(metadata)) = tokio::task::spawn_blocking(move || {
+                athenas_core::read_gguf_metadata(std::path::Path::new(&p))
+            })
+            .await
+            {
+                self.embedding_mode = configure_embedding_model(&metadata, &mut config);
+
+                if self.embedding_mode {
+                    info!(
+                        "Embedding model detected (architecture={}); enabling llama-server embedding mode",
+                        metadata.architecture.as_deref().unwrap_or("unknown")
+                    );
+                }
+            }
         }
 
+        self.context_size = config.context_size;
         self.start_server(&config).await?;
         self.loaded = true;
         Ok(())
@@ -1838,6 +1913,7 @@ impl Backend for LlamaCppBackend {
             model_name: self.model_name.clone(),
             context_size: self.context_size,
             gpu_layers: self.gpu_layers,
+            embedding_mode: self.embedding_mode,
             server_handle: None, // Child is not Clone; not needed for streaming
             server_port: self.server_port,
             client: self.client.clone(),
@@ -1937,4 +2013,95 @@ fn find_free_port() -> u16 {
             Ok(addr.port())
         })
         .unwrap_or(9090)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_profile_caps_context_and_batch() {
+        let metadata = athenas_core::GgufMetadata {
+            architecture: Some("gemma-embedding".to_string()),
+            context_length: Some(2048),
+            ..Default::default()
+        };
+        let mut config = ModelLoadConfig {
+            context_size: 64_000,
+            batch_size: 4096,
+            ..Default::default()
+        };
+
+        assert!(configure_embedding_model(&metadata, &mut config));
+        assert_eq!(config.context_size, 2048);
+        assert_eq!(config.batch_size, 2048);
+    }
+
+    #[test]
+    fn embedding_profile_preserves_smaller_requested_context() {
+        let metadata = athenas_core::GgufMetadata {
+            architecture: Some("gemma-embedding".to_string()),
+            context_length: Some(2048),
+            ..Default::default()
+        };
+        let mut config = ModelLoadConfig {
+            context_size: 1024,
+            ..Default::default()
+        };
+
+        assert!(configure_embedding_model(&metadata, &mut config));
+        assert_eq!(config.context_size, 1024);
+    }
+
+    #[test]
+    fn embedding_profile_resolves_auto_context() {
+        let metadata = athenas_core::GgufMetadata {
+            architecture: Some("gemma-embedding".to_string()),
+            context_length: Some(2048),
+            ..Default::default()
+        };
+        let mut config = ModelLoadConfig {
+            context_size: 0,
+            batch_size: 512,
+            ..Default::default()
+        };
+
+        assert!(configure_embedding_model(&metadata, &mut config));
+        assert_eq!(config.context_size, 2048);
+        assert_eq!(config.batch_size, 512);
+    }
+
+    #[test]
+    fn text_model_profile_is_unchanged() {
+        let metadata = athenas_core::GgufMetadata {
+            architecture: Some("gemma".to_string()),
+            context_length: Some(8192),
+            ..Default::default()
+        };
+        let mut config = ModelLoadConfig {
+            context_size: 64_000,
+            ..Default::default()
+        };
+
+        assert!(!configure_embedding_model(&metadata, &mut config));
+        assert_eq!(config.context_size, 64_000);
+    }
+
+    #[test]
+    fn current_unknown_architecture_wins_over_older_log_lines() {
+        let log =
+            "unknown model architecture: 'whisper'\nunknown model architecture: 'gemma-embedding'";
+        assert_eq!(
+            unknown_architecture_from_log(log).as_deref(),
+            Some("gemma-embedding")
+        );
+    }
+
+    #[test]
+    fn only_known_non_text_architectures_get_non_text_diagnosis() {
+        assert!(is_known_non_text_architecture("whisper"));
+        assert!(is_known_non_text_architecture("VITS"));
+        assert!(!is_known_non_text_architecture("gemma-embedding"));
+        assert!(!is_known_non_text_architecture("qwen35"));
+    }
 }

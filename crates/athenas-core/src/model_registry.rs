@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::errors::{AthenasError, Result};
 
@@ -354,12 +354,23 @@ fn create_model_info_from_dir(dir: &PathBuf) -> Result<ModelInfo> {
     })
 }
 
+/// Return whether a GGUF architecture is intended for embedding generation.
+pub fn is_embedding_architecture(arch: &str) -> bool {
+    let arch = arch.to_ascii_lowercase();
+    matches!(arch.as_str(), "bert" | "gemma-embedding")
+        || arch.starts_with("nomic-bert")
+        || arch.starts_with("jina-bert")
+        || arch.starts_with("modernbert")
+        || arch.starts_with("modern-bert")
+}
+
 /// Categorize a model based on its architecture string.
-/// Returns "llm" for text generation models, "whisper" for audio transcription,
-/// "clip" for vision models, etc.
+/// Returns "llm" for text generation models, "embedding" for embedding models,
+/// "whisper" for audio transcription, etc.
 fn categorize_model(arch: &str) -> String {
     let arch_lower = arch.to_lowercase();
     match arch_lower.as_str() {
+        arch if is_embedding_architecture(arch) => "embedding".to_string(),
         "whisper" => "whisper".to_string(),
         "t5" | "speech-t5" => "tts".to_string(),
         "tts" | "vits" | "bark" | "clvp" => "tts".to_string(),
@@ -371,49 +382,42 @@ fn categorize_model(arch: &str) -> String {
 
 /// Metadata extracted from a GGUF file header.
 #[derive(Debug, Default)]
-struct GgufMetadata {
-    architecture: Option<String>,
-    context_length: Option<u32>,
-    license: Option<String>,
-    name: Option<String>,
+pub struct GgufMetadata {
+    pub architecture: Option<String>,
+    pub context_length: Option<u32>,
+    pub license: Option<String>,
+    pub name: Option<String>,
 }
 
 /// Read metadata fields from a GGUF file header.
 /// Returns None if the file can't be parsed.
-fn read_gguf_metadata(path: &PathBuf) -> Option<GgufMetadata> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = Vec::new();
-    // Read first 64KB — metadata is at the start of the file
-    // and 64KB is more than enough for the KV pairs.
-    file.by_ref().take(65536).read_to_end(&mut buf).ok()?;
-
-    let mut cursor = std::io::Cursor::new(&buf);
+pub fn read_gguf_metadata(path: &Path) -> Option<GgufMetadata> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
 
     // GGUF magic: "GGUF" = 0x46554747 (little-endian)
-    let magic: u32 = read_u32(&mut cursor)?;
+    let magic: u32 = read_u32(&mut reader)?;
     if magic != 0x46554747 {
         return None;
     }
 
-    let version: u32 = read_u32(&mut cursor)?;
+    let version: u32 = read_u32(&mut reader)?;
 
-    // In v1/v2, tensor_count and metadata_kv_count are u32.
-    // In v3+, they are u64.
-    let kv_count = if version >= 3 {
-        let _tensor_count: u64 = read_u64(&mut cursor)?;
-        read_u64(&mut cursor)? as usize
+    // GGUF v2+ uses u64 counts; v1 used u32.
+    let kv_count = if version >= 2 {
+        let _tensor_count: u64 = read_u64(&mut reader)?;
+        read_u64(&mut reader)? as usize
     } else {
-        let _tensor_count: u32 = read_u32(&mut cursor)?;
-        read_u32(&mut cursor)? as usize
+        let _tensor_count: u32 = read_u32(&mut reader)?;
+        read_u32(&mut reader)? as usize
     };
-    parse_gguf_metadata(&mut cursor, kv_count)
+    parse_gguf_metadata(&mut reader, kv_count, version)
 }
 
-fn parse_gguf_metadata(
-    cursor: &mut std::io::Cursor<&Vec<u8>>,
+fn parse_gguf_metadata<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
     kv_count: usize,
+    version: u32,
 ) -> Option<GgufMetadata> {
     let mut meta = GgufMetadata::default();
     // Context length keys are per-architecture (e.g. "llama.context_length")
@@ -422,30 +426,30 @@ fn parse_gguf_metadata(
 
     for _ in 0..kv_count {
         // Read key (gguf string: u64 length + bytes)
-        let key = read_gguf_string(cursor)?;
+        let key = read_gguf_string(reader, version)?;
 
         // Read value type (u32)
-        let value_type: u32 = read_u32(cursor)?;
+        let value_type: u32 = read_u32(reader)?;
 
         match key.as_str() {
             "general.architecture" if value_type == 8 => {
-                meta.architecture = read_gguf_string(cursor);
+                meta.architecture = read_gguf_string(reader, version);
             }
             "general.license" if value_type == 8 => {
-                meta.license = read_gguf_string(cursor);
+                meta.license = read_gguf_string(reader, version);
             }
             "general.name" if value_type == 8 => {
-                meta.name = read_gguf_string(cursor);
+                meta.name = read_gguf_string(reader, version);
             }
             "general.context_length" if value_type == 4 => {
-                meta.context_length = Some(read_u32(cursor)?);
+                meta.context_length = Some(read_u32(reader)?);
             }
             _ if key.ends_with(".context_length") && value_type == 4 => {
-                ctx_lengths.insert(key, read_u32(cursor)?);
+                ctx_lengths.insert(key, read_u32(reader)?);
             }
             _ => {
                 // Skip the value based on its type
-                skip_gguf_value(cursor, value_type)?;
+                skip_gguf_value(reader, value_type, version)?;
             }
         }
     }
@@ -465,103 +469,89 @@ fn parse_gguf_metadata(
     Some(meta)
 }
 
-fn read_u32(cursor: &mut std::io::Cursor<&Vec<u8>>) -> Option<u32> {
-    use std::io::Read;
+fn read_u32(reader: &mut impl std::io::Read) -> Option<u32> {
     let mut buf = [0u8; 4];
-    cursor.read_exact(&mut buf).ok()?;
+    reader.read_exact(&mut buf).ok()?;
     Some(u32::from_le_bytes(buf))
 }
 
-fn read_u64(cursor: &mut std::io::Cursor<&Vec<u8>>) -> Option<u64> {
-    use std::io::Read;
+fn read_u64(reader: &mut impl std::io::Read) -> Option<u64> {
     let mut buf = [0u8; 8];
-    cursor.read_exact(&mut buf).ok()?;
+    reader.read_exact(&mut buf).ok()?;
     Some(u64::from_le_bytes(buf))
 }
 
-fn read_gguf_string(cursor: &mut std::io::Cursor<&Vec<u8>>) -> Option<String> {
-    // GGUF string: u64 length (in v3+, u32 in v1/v2) + UTF-8 bytes
-    // We'll try u64 first (v3+), which is the common case
-    let len: u64 = read_u64(cursor)?;
+fn read_gguf_string(reader: &mut impl std::io::Read, version: u32) -> Option<String> {
+    let len = if version >= 2 {
+        read_u64(reader)?
+    } else {
+        read_u32(reader)? as u64
+    };
     if len > 1_000_000 {
-        // Probably a v1/v2 file — retry with u32
-        cursor.set_position(cursor.position() - 4);
-        let len32: u32 = read_u32(cursor)?;
-        if len32 > 1_000_000 {
-            return None;
-        }
-        let mut buf = vec![0u8; len32 as usize];
-        use std::io::Read;
-        cursor.read_exact(&mut buf).ok()?;
-        return String::from_utf8(buf).ok();
+        return None;
     }
     let mut buf = vec![0u8; len as usize];
-    use std::io::Read;
-    cursor.read_exact(&mut buf).ok()?;
+    reader.read_exact(&mut buf).ok()?;
     String::from_utf8(buf).ok()
 }
 
-fn skip_gguf_value(cursor: &mut std::io::Cursor<&Vec<u8>>, value_type: u32) -> Option<()> {
-    use std::io::Read;
-
+fn skip_gguf_value<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    value_type: u32,
+    version: u32,
+) -> Option<()> {
     match value_type {
         0 => {
-            cursor.read_exact(&mut [0u8; 1]).ok()?;
+            reader.read_exact(&mut [0u8; 1]).ok()?;
         } // UINT8
         1 => {
-            cursor.read_exact(&mut [0u8; 1]).ok()?;
+            reader.read_exact(&mut [0u8; 1]).ok()?;
         } // INT8
         2 => {
-            cursor.read_exact(&mut [0u8; 2]).ok()?;
+            reader.read_exact(&mut [0u8; 2]).ok()?;
         } // UINT16
         3 => {
-            cursor.read_exact(&mut [0u8; 2]).ok()?;
+            reader.read_exact(&mut [0u8; 2]).ok()?;
         } // INT16
         4 => {
-            cursor.read_exact(&mut [0u8; 4]).ok()?;
+            reader.read_exact(&mut [0u8; 4]).ok()?;
         } // UINT32
         5 => {
-            cursor.read_exact(&mut [0u8; 4]).ok()?;
+            reader.read_exact(&mut [0u8; 4]).ok()?;
         } // INT32
         6 => {
-            cursor.read_exact(&mut [0u8; 4]).ok()?;
+            reader.read_exact(&mut [0u8; 4]).ok()?;
         } // FLOAT32
         7 => {
-            cursor.read_exact(&mut [0u8; 1]).ok()?;
+            reader.read_exact(&mut [0u8; 1]).ok()?;
         } // BOOL
         8 => {
             // STRING
-            let _ = read_gguf_string(cursor)?;
+            let _ = read_gguf_string(reader, version)?;
         }
         9 => {
             // ARRAY
-            let elem_type: u32 = read_u32(cursor)?;
-            // In v3+, array length is u64; in v1/v2 it's u32
-            // We'll try u64 and fall back
-            let len: u64 = read_u64(cursor)?;
-            if len > 10_000_000 {
-                cursor.set_position(cursor.position() - 4);
-                let len32: u32 = read_u32(cursor)?;
-                if len32 > 10_000_000 {
-                    return None;
-                }
-                for _ in 0..len32 {
-                    skip_gguf_value(cursor, elem_type)?;
-                }
+            let elem_type: u32 = read_u32(reader)?;
+            let len = if version >= 2 {
+                read_u64(reader)?
             } else {
-                for _ in 0..len {
-                    skip_gguf_value(cursor, elem_type)?;
-                }
+                read_u32(reader)? as u64
+            };
+            if len > 10_000_000 {
+                return None;
+            }
+            for _ in 0..len {
+                skip_gguf_value(reader, elem_type, version)?;
             }
         }
         10 => {
-            cursor.read_exact(&mut [0u8; 8]).ok()?;
+            reader.read_exact(&mut [0u8; 8]).ok()?;
         } // UINT64
         11 => {
-            cursor.read_exact(&mut [0u8; 8]).ok()?;
+            reader.read_exact(&mut [0u8; 8]).ok()?;
         } // INT64
         12 => {
-            cursor.read_exact(&mut [0u8; 8]).ok()?;
+            reader.read_exact(&mut [0u8; 8]).ok()?;
         } // FLOAT64
         _ => {
             // Unknown type — can't skip reliably
@@ -1121,6 +1111,11 @@ mod tests {
         assert_eq!(categorize_model("llama"), "llm");
         assert_eq!(categorize_model("qwen2"), "llm");
         assert_eq!(categorize_model("t5"), "tts");
+        assert_eq!(categorize_model("gemma-embedding"), "embedding");
+        assert_eq!(categorize_model("BERT"), "embedding");
+        assert_eq!(categorize_model("jina-bert-v2"), "embedding");
+        assert_eq!(categorize_model("modern-bert"), "embedding");
+        assert_eq!(categorize_model("nomic-bert-moe"), "embedding");
     }
 
     /// Build a minimal GGUF v3 header with metadata KV pairs for testing.
@@ -1176,6 +1171,70 @@ mod tests {
         assert_eq!(meta.license.as_deref(), Some("apache-2.0"));
         assert_eq!(meta.name.as_deref(), Some("Test Model"));
         assert_eq!(meta.context_length, Some(8192));
+    }
+
+    #[test]
+    fn embedding_gemma_metadata_parsing() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kvs: Vec<(String, u32, Vec<u8>)> = vec![
+            (
+                "general.architecture".into(),
+                8,
+                gguf_string("gemma-embedding"),
+            ),
+            (
+                "gemma-embedding.context_length".into(),
+                4,
+                2048u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let kv_refs: Vec<(&str, u32, &[u8])> = kvs
+            .iter()
+            .map(|(k, t, v)| (k.as_str(), *t, v.as_slice()))
+            .collect();
+
+        let path = write_test_gguf(&dir, "embeddinggemma.gguf", &kv_refs);
+        let meta = read_gguf_metadata(&path).unwrap();
+        assert_eq!(meta.architecture.as_deref(), Some("gemma-embedding"));
+        assert_eq!(meta.context_length, Some(2048));
+        assert!(is_embedding_architecture(
+            meta.architecture.as_deref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn gguf_metadata_parsing_streams_past_large_values() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut large_array = Vec::with_capacity(70_012);
+        large_array.extend_from_slice(&0u32.to_le_bytes());
+        large_array.extend_from_slice(&70_000u64.to_le_bytes());
+        large_array.resize(70_012, 0);
+        let kvs: Vec<(String, u32, Vec<u8>)> = vec![
+            (
+                "general.architecture".into(),
+                8,
+                gguf_string("gemma-embedding"),
+            ),
+            ("tokenizer.ggml.tokens".into(), 9, large_array),
+            (
+                "gemma-embedding.context_length".into(),
+                4,
+                2048u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let kv_refs: Vec<(&str, u32, &[u8])> = kvs
+            .iter()
+            .map(|(k, t, v)| (k.as_str(), *t, v.as_slice()))
+            .collect();
+
+        let path = write_test_gguf(&dir, "large-metadata.gguf", &kv_refs);
+        let meta = read_gguf_metadata(&path).unwrap();
+        assert_eq!(meta.architecture.as_deref(), Some("gemma-embedding"));
+        assert_eq!(meta.context_length, Some(2048));
     }
 
     #[test]

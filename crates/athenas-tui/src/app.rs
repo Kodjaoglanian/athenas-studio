@@ -234,9 +234,9 @@ impl TuiApp {
             Some(h) => h.join(".athenas").join("server.log"),
             None => return,
         };
-        // Also tail the llama-server log (subprocess output)
-        let llama_log_path = match dirs::home_dir() {
-            Some(h) => h.join(".athenas").join("llama-server.log"),
+        // Also tail the isolated llama-server logs (subprocess output).
+        let llama_log_dir = match dirs::home_dir() {
+            Some(h) => h.join(".athenas"),
             None => return,
         };
 
@@ -245,10 +245,9 @@ impl TuiApp {
         // Track the file size we've already read. 0 means we haven't read
         // anything yet (or the file was truncated/recreated).
         let mut last_size: u64 = 0;
-        let mut llama_last_size: u64 = 0;
+        let mut llama_last_sizes = std::collections::HashMap::new();
         // Track whether we've done the initial read of the file
         let mut initialized = false;
-        let mut llama_initialized = false;
 
         loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -300,51 +299,54 @@ impl TuiApp {
                 }
             }
 
-            // --- Tail llama-server.log (subprocess output) ---
-            let llama_size = match std::fs::metadata(&llama_log_path) {
-                Ok(m) => m.len(),
-                Err(_) => {
-                    llama_initialized = false;
-                    llama_last_size = 0;
+            // --- Tail llama-server-<port>.log files (subprocess output) ---
+            let Ok(entries) = std::fs::read_dir(&llama_log_dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !(name == "llama-server.log"
+                    || (name.starts_with("llama-server-") && name.ends_with(".log")))
+                {
                     continue;
                 }
-            };
 
-            if !llama_initialized {
-                llama_initialized = true;
-                if llama_size > 50_000 {
-                    llama_last_size = llama_size - 50_000;
-                } else {
-                    llama_last_size = 0;
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                let size = metadata.len();
+                let last_size = llama_last_sizes
+                    .entry(path.clone())
+                    .or_insert_with(|| size.saturating_sub(50_000));
+                if size < *last_size {
+                    *last_size = 0;
                 }
-            }
+                if size == *last_size {
+                    continue;
+                }
 
-            if llama_size < llama_last_size {
-                llama_last_size = 0;
-            }
-
-            if llama_size == llama_last_size {
-                continue;
-            }
-
-            if let Ok(mut f) = std::fs::File::open(&llama_log_path) {
-                let _ = f.seek(SeekFrom::Start(llama_last_size));
-                let mut reader = BufReader::new(f);
-                let mut buf = String::new();
-                loop {
-                    buf.clear();
-                    match reader.read_line(&mut buf) {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let line = buf.trim_end();
-                            if !line.is_empty() {
-                                buffer.push_raw_line(line);
+                if let Ok(mut f) = std::fs::File::open(&path) {
+                    let _ = f.seek(SeekFrom::Start(*last_size));
+                    let mut reader = BufReader::new(f);
+                    let mut buf = String::new();
+                    loop {
+                        buf.clear();
+                        match reader.read_line(&mut buf) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                let line = buf.trim_end();
+                                if !line.is_empty() {
+                                    buffer.push_raw_line(line);
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
                     }
+                    *last_size = size;
                 }
-                llama_last_size = llama_size;
             }
         }
     }
