@@ -745,6 +745,8 @@ impl TuiApp {
                         // Sync settings_state.config back to self.config
                         // so that load_model uses the updated values
                         self.config = self.settings_state.config.clone();
+                        self.server_panel_state.batch_size =
+                            self.config.inference.default_batch_size;
                     }
                 }
                 KeyCode::Backspace => {
@@ -1815,6 +1817,7 @@ impl TuiApp {
                                 .set_error(format!("Failed to save config: {}", e));
                         } else {
                             self.config = config;
+                            self.settings_state.config = self.config.clone();
                             if self.server_panel_state.phase == ServerPhase::Running {
                                 self.server_panel_state
                                     .set_status("Saved — applies on next server start");
@@ -2429,6 +2432,7 @@ impl TuiApp {
             let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
             let gpu_layers = self.server_panel_state.gpu_layers;
             let context_size = self.server_panel_state.context_size;
+            let batch_size = self.server_panel_state.batch_size;
 
             let task = tokio::spawn(async move {
                 let client = reqwest::Client::new();
@@ -2438,6 +2442,7 @@ impl TuiApp {
                     "model_path": model_path,
                     "gpu_layers": gpu_layers,
                     "context_size": context_size,
+                    "batch_size": batch_size,
                     "set_default": false,
                 });
 

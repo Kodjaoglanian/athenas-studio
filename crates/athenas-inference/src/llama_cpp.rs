@@ -53,6 +53,15 @@ fn is_known_non_text_architecture(architecture: &str) -> bool {
     )
 }
 
+fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, embedding_mode: bool) {
+    cmd.arg("--batch-size").arg(batch_size.to_string());
+    if embedding_mode {
+        // llama.cpp requires an embedding batch to fit in one physical
+        // microbatch; otherwise it silently reduces n_batch to n_ubatch (512).
+        cmd.arg("--ubatch-size").arg(batch_size.to_string());
+    }
+}
+
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
 pub struct LlamaCppBackend {
     hardware: HardwareInfo,
@@ -363,8 +372,6 @@ impl LlamaCppBackend {
             .arg(&config.model_path)
             .arg("--ctx-size")
             .arg(config.context_size.to_string())
-            .arg("--batch-size")
-            .arg(config.batch_size.to_string())
             .arg("--threads")
             .arg(config.threads.to_string())
             .arg("--port")
@@ -384,6 +391,8 @@ impl LlamaCppBackend {
             .arg("--warmup")
             .arg("--jinja")
             .arg("--metrics");
+
+        add_batch_args(&mut cmd, config.batch_size, self.embedding_mode);
 
         if self.embedding_mode {
             cmd.arg("--embeddings");
@@ -2103,5 +2112,31 @@ mod tests {
         assert!(is_known_non_text_architecture("VITS"));
         assert!(!is_known_non_text_architecture("gemma-embedding"));
         assert!(!is_known_non_text_architecture("qwen35"));
+    }
+
+    #[test]
+    fn embedding_mode_sets_logical_and_physical_batch_size() {
+        let mut command = tokio::process::Command::new("llama-server");
+        add_batch_args(&mut command, 2048, true);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, ["--batch-size", "2048", "--ubatch-size", "2048"]);
+    }
+
+    #[test]
+    fn text_mode_does_not_override_physical_batch_size() {
+        let mut command = tokio::process::Command::new("llama-server");
+        add_batch_args(&mut command, 2048, false);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, ["--batch-size", "2048"]);
     }
 }

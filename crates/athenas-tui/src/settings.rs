@@ -1,5 +1,15 @@
 use athenas_core::AppConfig;
 
+fn parse_batch_size(value: &str) -> Result<u32, String> {
+    let batch_size = value
+        .parse::<u32>()
+        .map_err(|_| "Must be a positive number".to_string())?;
+    if batch_size == 0 {
+        return Err("Must be a positive number".to_string());
+    }
+    Ok(batch_size)
+}
+
 #[derive(Clone, PartialEq)]
 pub enum SettingsField {
     HfToken,
@@ -236,8 +246,7 @@ impl SettingsState {
                     value.parse().map_err(|_| "Must be a number".to_string())?;
             }
             SettingsField::BatchSize => {
-                self.config.inference.default_batch_size =
-                    value.parse().map_err(|_| "Must be a number".to_string())?;
+                self.config.inference.default_batch_size = parse_batch_size(&value)?;
             }
             SettingsField::Threads => {
                 self.config.inference.default_threads = value
@@ -396,5 +405,17 @@ impl SettingsState {
             SettingsField::ServerHost => "e.g. 127.0.0.1",
             SettingsField::ServerPort => "e.g. 8080",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_size_must_be_positive() {
+        assert_eq!(parse_batch_size("2048"), Ok(2048));
+        assert!(parse_batch_size("0").is_err());
+        assert!(parse_batch_size("invalid").is_err());
     }
 }
