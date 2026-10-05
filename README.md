@@ -34,6 +34,7 @@
 - **GPU Auto-Download** — Automatically downloads the correct GPU-accelerated llama-server binary (Vulkan for Linux, CUDA for Windows, Metal for macOS) based on detected hardware
 - **HuggingFace Integration** — Search, download, and manage models from HuggingFace Hub with automatic mmproj download
 - **OpenAI-Compatible API Server** — Drop-in replacement for OpenAI API endpoints with multi-model support
+- **Dedicated GGUF Embeddings** — Automatically detects embedding architectures, uses the model's trained context, and starts llama-server in embedding mode
 - **Reasoning/Thinking Mode** — Support for reasoning models (Qwen3.5, DeepSeek R1, etc.) with configurable thinking budget
 - **Audio Transcription (Whisper)** — Transcribe audio files with Whisper models via CLI (`athenas transcribe`) or API (`/v1/audio/transcriptions`). Auto-downloads whisper-cli binary, supports text/JSON/SRT/VTT output formats, and language hints
 - **Hardware Auto-Detection** — Automatically detects CUDA, ROCm, Vulkan, and Metal
@@ -437,6 +438,26 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Embeddings API
+
+Dedicated GGUF embedding models such as EmbeddingGemma are detected from their
+GGUF metadata. Athenas automatically enables llama-server's embedding mode and
+caps the context to the model's trained context length.
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H "Authorization: Bearer sk-ath-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "embeddinggemma-300M-BF16",
+    "input": "Text to embed"
+  }'
+```
+
+The bearer token must be an Athenas key created in **F4 → Manage API Keys**.
+Provider credentials such as OpenAI or OpenRouter keys are only used for their
+respective remote backends.
 
 ### Audio transcription via API
 
