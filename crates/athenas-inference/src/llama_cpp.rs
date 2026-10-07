@@ -53,6 +53,22 @@ fn is_known_non_text_architecture(architecture: &str) -> bool {
     )
 }
 
+fn is_managed_server_bin(server_bin: &str) -> bool {
+    dirs::home_dir()
+        .map(|home| std::path::Path::new(server_bin).starts_with(home.join(".athenas").join("bin")))
+        .unwrap_or(false)
+}
+
+fn should_refresh_unknown_architecture(
+    architecture: &str,
+    server_bin: &str,
+    already_refreshed: bool,
+) -> bool {
+    athenas_core::is_embedding_architecture(architecture)
+        && is_managed_server_bin(server_bin)
+        && !already_refreshed
+}
+
 fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, embedding_mode: bool) {
     cmd.arg("--batch-size").arg(batch_size.to_string());
     if embedding_mode {
@@ -213,7 +229,7 @@ impl LlamaCppBackend {
                         || current_variant.contains("bin-ubuntu-x64")
                         || current_variant.contains("bin-win-cpu");
                     let needs_redownload_for_gpu =
-                        needs_gpu && variant_is_cpu && path.contains(".athenas");
+                        needs_gpu && variant_is_cpu && is_managed_server_bin(&path);
 
                     if needs_redownload_for_gpu {
                         info!(
@@ -610,6 +626,28 @@ impl LlamaCppBackend {
                         // Check for unsupported model architecture (whisper, tts, etc.)
                         let full_log = std::fs::read_to_string(&llama_log_path).unwrap_or_default();
                         if let Some(arch) = unknown_architecture_from_log(&full_log) {
+                            if should_refresh_unknown_architecture(
+                                &arch,
+                                &server_bin,
+                                self.refreshed_server_bin,
+                            ) {
+                                info!(
+                                    "llama-server does not recognize architecture '{}' — \
+                                     re-downloading the latest managed build...",
+                                    arch
+                                );
+                                self.refreshed_server_bin = true;
+                                self.server_handle = None;
+                                match crate::backend_setup::force_redownload_llama_server(
+                                    config.auto_install_deps,
+                                )
+                                .await
+                                {
+                                    Ok(_) => return self.retry_start_server(config).await,
+                                    Err(e) => warn!("llama-server re-download failed: {}", e),
+                                }
+                            }
+
                             msg = if is_known_non_text_architecture(&arch) {
                                 format!(
                                     "This model uses the '{}' architecture, which is not a text LLM.\n\
@@ -636,7 +674,7 @@ impl LlamaCppBackend {
                         // managed build once. (Deliberately narrow: generic
                         // "failed to load" also fires on OOM.)
                         if full_log.contains("check_tensor_dims") {
-                            if server_bin.contains(".athenas") && !self.refreshed_server_bin {
+                            if is_managed_server_bin(&server_bin) && !self.refreshed_server_bin {
                                 info!(
                                     "llama-server rejected a valid model — binary may be \
                                      outdated; re-downloading latest build..."
@@ -2081,6 +2119,24 @@ mod tests {
     }
 
     #[test]
+    fn embedding_gemma2_uses_embedding_profile() {
+        let metadata = athenas_core::GgufMetadata {
+            architecture: Some("gemma-embedding2".to_string()),
+            context_length: Some(262_144),
+            ..Default::default()
+        };
+        let mut config = ModelLoadConfig {
+            context_size: 4096,
+            batch_size: 2048,
+            ..Default::default()
+        };
+
+        assert!(configure_embedding_model(&metadata, &mut config));
+        assert_eq!(config.context_size, 4096);
+        assert_eq!(config.batch_size, 2048);
+    }
+
+    #[test]
     fn text_model_profile_is_unchanged() {
         let metadata = athenas_core::GgufMetadata {
             architecture: Some("gemma".to_string()),
@@ -2112,6 +2168,36 @@ mod tests {
         assert!(is_known_non_text_architecture("VITS"));
         assert!(!is_known_non_text_architecture("gemma-embedding"));
         assert!(!is_known_non_text_architecture("qwen35"));
+    }
+
+    #[test]
+    fn unknown_architecture_refresh_is_managed_and_one_shot() {
+        let managed = dirs::home_dir()
+            .unwrap()
+            .join(".athenas/bin/llama-server")
+            .to_string_lossy()
+            .into_owned();
+        assert!(should_refresh_unknown_architecture(
+            "gemma-embedding2",
+            &managed,
+            false
+        ));
+        assert!(!should_refresh_unknown_architecture(
+            "gemma-embedding2",
+            &managed,
+            true
+        ));
+        assert!(!should_refresh_unknown_architecture(
+            "gemma-embedding2",
+            "/usr/bin/llama-server",
+            false
+        ));
+        assert!(!should_refresh_unknown_architecture(
+            "whisper", &managed, false
+        ));
+        assert!(!should_refresh_unknown_architecture(
+            "clip", &managed, false
+        ));
     }
 
     #[test]

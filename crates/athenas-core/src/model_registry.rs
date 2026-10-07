@@ -357,8 +357,10 @@ fn create_model_info_from_dir(dir: &PathBuf) -> Result<ModelInfo> {
 /// Return whether a GGUF architecture is intended for embedding generation.
 pub fn is_embedding_architecture(arch: &str) -> bool {
     let arch = arch.to_ascii_lowercase();
-    matches!(arch.as_str(), "bert" | "gemma-embedding")
-        || arch.starts_with("nomic-bert")
+    matches!(
+        arch.as_str(),
+        "bert" | "gemma-embedding" | "gemma-embedding2"
+    ) || arch.starts_with("nomic-bert")
         || arch.starts_with("jina-bert")
         || arch.starts_with("modernbert")
         || arch.starts_with("modern-bert")
@@ -1112,6 +1114,7 @@ mod tests {
         assert_eq!(categorize_model("qwen2"), "llm");
         assert_eq!(categorize_model("t5"), "tts");
         assert_eq!(categorize_model("gemma-embedding"), "embedding");
+        assert_eq!(categorize_model("gemma-embedding2"), "embedding");
         assert_eq!(categorize_model("BERT"), "embedding");
         assert_eq!(categorize_model("jina-bert-v2"), "embedding");
         assert_eq!(categorize_model("modern-bert"), "embedding");
@@ -1199,6 +1202,37 @@ mod tests {
         let meta = read_gguf_metadata(&path).unwrap();
         assert_eq!(meta.architecture.as_deref(), Some("gemma-embedding"));
         assert_eq!(meta.context_length, Some(2048));
+        assert!(is_embedding_architecture(
+            meta.architecture.as_deref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn embedding_gemma2_metadata_parsing() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let kvs: Vec<(String, u32, Vec<u8>)> = vec![
+            (
+                "general.architecture".into(),
+                8,
+                gguf_string("gemma-embedding2"),
+            ),
+            (
+                "gemma-embedding2.context_length".into(),
+                4,
+                262_144u32.to_le_bytes().to_vec(),
+            ),
+        ];
+        let kv_refs: Vec<(&str, u32, &[u8])> = kvs
+            .iter()
+            .map(|(k, t, v)| (k.as_str(), *t, v.as_slice()))
+            .collect();
+
+        let path = write_test_gguf(&dir, "embeddinggemma2.gguf", &kv_refs);
+        let meta = read_gguf_metadata(&path).unwrap();
+        assert_eq!(meta.architecture.as_deref(), Some("gemma-embedding2"));
+        assert_eq!(meta.context_length, Some(262_144));
         assert!(is_embedding_architecture(
             meta.architecture.as_deref().unwrap()
         ));
