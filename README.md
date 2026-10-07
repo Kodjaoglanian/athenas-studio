@@ -441,10 +441,12 @@ print(response.choices[0].message.content)
 
 ### Embeddings API
 
-Dedicated GGUF embedding models such as EmbeddingGemma are detected from their
-GGUF metadata. Athenas automatically enables llama-server's embedding mode and
-caps the context to the model's trained context length. The configured Batch
-Size is applied to both the logical and physical embedding batch.
+Dedicated GGUF embedding models such as EmbeddingGemma and EmbeddingGemma 2 are
+detected from their GGUF metadata. Athenas automatically enables llama-server's
+embedding mode, caps the context to the model's trained context length, and
+refreshes an outdated managed llama-server once when it lacks the architecture.
+The configured Batch Size is applied to both the logical and physical embedding
+batch.
 
 ```bash
 curl http://127.0.0.1:8080/v1/embeddings \

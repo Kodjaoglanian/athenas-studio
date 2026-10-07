@@ -184,7 +184,8 @@ by default; enable via `[server.semantic_cache]` in config.toml.
 
 ### Dedicated GGUF Embeddings
 
-GGUF embedding architectures (`gemma-embedding`, BERT variants, etc.) are
+GGUF embedding architectures (`gemma-embedding`, `gemma-embedding2`, BERT
+variants, etc.) are
 detected from GGUF metadata by `read_gguf_metadata()`. `LlamaCppBackend` starts
 them with `--embeddings` and caps the effective context and batch size to the
 model's declared training context. Keep this detection in the backend so every
@@ -198,6 +199,10 @@ the effective batch at its default of 512.
 Each llama-server launch writes to an isolated `llama-server-<port>-<id>.log`.
 Startup diagnostics must only inspect that launch's log; never parse the shared
 historical log, because stale errors can misclassify the current model.
+
+If a recognized embedding architecture is unknown to the managed llama-server,
+the backend force-downloads the latest compatible release once and retries.
+Never auto-replace external binaries or retry known non-text architectures.
 
 ### Whisper / Audio Transcription
 
