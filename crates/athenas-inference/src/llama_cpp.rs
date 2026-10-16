@@ -88,11 +88,11 @@ fn reject_generative_request(decision_mode: bool) -> Result<()> {
     }
 }
 
-fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, embedding_mode: bool) {
+fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, match_physical_ubatch: bool) {
     cmd.arg("--batch-size").arg(batch_size.to_string());
-    if embedding_mode {
-        // llama.cpp requires an embedding batch to fit in one physical
-        // microbatch; otherwise it silently reduces n_batch to n_ubatch (512).
+    if match_physical_ubatch {
+        // Embeddings and Clef decision prompts must fit in one physical
+        // microbatch; without --ubatch-size llama.cpp keeps the default 512.
         cmd.arg("--ubatch-size").arg(batch_size.to_string());
     }
 }
@@ -431,7 +431,11 @@ impl LlamaCppBackend {
             .arg("--jinja")
             .arg("--metrics");
 
-        add_batch_args(&mut cmd, config.batch_size, self.embedding_mode);
+        add_batch_args(
+            &mut cmd,
+            config.batch_size,
+            self.embedding_mode || self.decision_mode,
+        );
 
         if self.embedding_mode {
             cmd.arg("--embeddings");
@@ -2307,5 +2311,18 @@ mod tests {
             .collect();
 
         assert_eq!(args, ["--batch-size", "2048"]);
+    }
+
+    #[test]
+    fn decision_mode_sets_physical_batch_size() {
+        let mut command = tokio::process::Command::new("llama-server");
+        add_batch_args(&mut command, 1024, true);
+        let args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, ["--batch-size", "1024", "--ubatch-size", "1024"]);
     }
 }
