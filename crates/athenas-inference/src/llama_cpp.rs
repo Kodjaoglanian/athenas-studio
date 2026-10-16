@@ -53,6 +53,13 @@ fn is_known_non_text_architecture(architecture: &str) -> bool {
     )
 }
 
+/// Architectures that are never standalone text models. A newer llama-server
+/// will not make them loadable (mmproj/CLIP projectors, audio, TTS).
+fn is_never_text_architecture(architecture: &str) -> bool {
+    let arch = architecture.to_ascii_lowercase();
+    is_known_non_text_architecture(&arch) || arch == "clip"
+}
+
 fn is_managed_server_bin(server_bin: &str) -> bool {
     dirs::home_dir()
         .map(|home| std::path::Path::new(server_bin).starts_with(home.join(".athenas").join("bin")))
@@ -64,9 +71,11 @@ fn should_refresh_unknown_architecture(
     server_bin: &str,
     already_refreshed: bool,
 ) -> bool {
-    athenas_core::is_embedding_architecture(architecture)
+    // One shot for any architecture a newer llama.cpp might have added
+    // (embeddings, clef, …). Skip known non-text models and external binaries.
+    !already_refreshed
         && is_managed_server_bin(server_bin)
-        && !already_refreshed
+        && !is_never_text_architecture(architecture)
 }
 
 fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, embedding_mode: bool) {
@@ -2197,6 +2206,13 @@ mod tests {
         ));
         assert!(!should_refresh_unknown_architecture(
             "clip", &managed, false
+        ));
+        assert!(should_refresh_unknown_architecture("clef", &managed, false));
+        assert!(!should_refresh_unknown_architecture("clef", &managed, true));
+        assert!(!should_refresh_unknown_architecture(
+            "clef",
+            "/usr/bin/llama-server",
+            false
         ));
     }
 
