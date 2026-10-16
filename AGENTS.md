@@ -160,6 +160,9 @@ external `model.onnx_data` weights + `tokenizer.json` + `genai_config.json`.
   (`.onnx` file or dir with `genai_config.json`/`.onnx` inside). Explicit
   `"onnx"` works in config, settings, server panel and `"backend": "onnx"`
   in `POST /v1/models/load`.
+- **Platform exclusions** — the `onnx` module is not compiled on x86_64
+  macOS, musl, or Windows ARM64 (`aarch64-pc-windows-msvc`); `BackendFactory`
+  returns a clear error for explicit `onnx` on those targets.
 - **GPU execution providers are cargo features** — the default build is
   CPU-only because each EP picks a different ORT binary dist:
   `cargo build --features onnx-cuda` (also `onnx-tensorrt`, `onnx-directml`,
