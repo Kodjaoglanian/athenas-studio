@@ -200,9 +200,11 @@ Each llama-server launch writes to an isolated `llama-server-<port>-<id>.log`.
 Startup diagnostics must only inspect that launch's log; never parse the shared
 historical log, because stale errors can misclassify the current model.
 
-If a recognized embedding architecture is unknown to the managed llama-server,
+If the managed llama-server reports an unknown architecture that could be a
+newer text or embedding model (including decision models such as `clef`),
 the backend force-downloads the latest compatible release once and retries.
-Never auto-replace external binaries or retry known non-text architectures.
+Never auto-replace external binaries or retry known non-text architectures
+(`whisper`, TTS, `clip`).
 
 ### Whisper / Audio Transcription
 
