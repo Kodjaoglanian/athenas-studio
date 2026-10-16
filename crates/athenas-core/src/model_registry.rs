@@ -354,6 +354,13 @@ fn create_model_info_from_dir(dir: &PathBuf) -> Result<ModelInfo> {
     })
 }
 
+/// Return whether a GGUF architecture is a decision model (Clef and the
+/// same family). These models answer `/v1/systemone` and do not compute
+/// next-token logits.
+pub fn is_decision_architecture(arch: &str) -> bool {
+    matches!(arch.to_ascii_lowercase().as_str(), "clef")
+}
+
 /// Return whether a GGUF architecture is intended for embedding generation.
 pub fn is_embedding_architecture(arch: &str) -> bool {
     let arch = arch.to_ascii_lowercase();
@@ -373,6 +380,7 @@ fn categorize_model(arch: &str) -> String {
     let arch_lower = arch.to_lowercase();
     match arch_lower.as_str() {
         arch if is_embedding_architecture(arch) => "embedding".to_string(),
+        arch if is_decision_architecture(arch) => "decision".to_string(),
         "whisper" => "whisper".to_string(),
         "t5" | "speech-t5" => "tts".to_string(),
         "tts" | "vits" | "bark" | "clvp" => "tts".to_string(),
@@ -1236,6 +1244,15 @@ mod tests {
         assert!(is_embedding_architecture(
             meta.architecture.as_deref().unwrap()
         ));
+    }
+
+    #[test]
+    fn clef_is_a_decision_architecture() {
+        assert!(is_decision_architecture("clef"));
+        assert!(is_decision_architecture("CLEF"));
+        assert!(!is_decision_architecture("gemma"));
+        assert!(!is_decision_architecture("whisper"));
+        assert_eq!(categorize_model("clef"), "decision");
     }
 
     #[test]

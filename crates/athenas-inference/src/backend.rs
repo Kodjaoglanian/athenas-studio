@@ -26,6 +26,15 @@ pub trait Backend: Send + Sync {
         tx: mpsc::Sender<StreamChunk>,
     ) -> Result<()>;
 
+    /// Run a decision-model request (`state` + typed questions) against
+    /// llama-server's `/v1/systemone`. Default implementation returns an
+    /// error — only backends that host a decision model override it.
+    async fn systemone(&self, _body: &serde_json::Value) -> Result<serde_json::Value> {
+        Err(athenas_core::AthenasError::Backend(
+            "Decision requests are not supported by this backend".to_string(),
+        ))
+    }
+
     /// Generate embeddings for the given input text(s).
     /// Default implementation returns an error — backends override if supported.
     async fn embeddings(&self, _request: EmbeddingRequest) -> Result<EmbeddingResponse> {

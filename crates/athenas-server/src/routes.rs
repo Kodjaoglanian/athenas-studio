@@ -222,6 +222,7 @@ pub fn create_router(
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/systemone", post(systemone))
         .route("/v1/tokenize", post(tokenize))
         .route("/v1/responses", post(responses))
         .route("/v1/queue", get(queue_status))
@@ -2992,6 +2993,79 @@ async fn responses(
                     .into_response()
             }
         }
+    }
+}
+
+#[tracing::instrument(skip_all, fields(endpoint = "/v1/systemone"))]
+async fn systemone(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let model_for_auth = body.get("model").and_then(|v| v.as_str());
+    match check_auth_full(&headers, &state, model_for_auth).await {
+        AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
+        AuthResult::Unauthorized => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid or missing API key"})),
+            )
+                .into_response();
+        }
+        AuthResult::RateLimited => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Rate limit exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::QuotaExceeded => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
+            )
+                .into_response();
+        }
+        AuthResult::Forbidden => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
+            )
+                .into_response();
+        }
+    }
+
+    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
+        Some((permit, pos)) => (permit, pos),
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+
+    let model_id = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let backend = {
+        let mgr = state.model_manager.lock().await;
+        mgr.get(Some(model_id.as_str())).or_else(|| mgr.get(None))
+    };
+
+    let Some(backend) = backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "No model loaded"})),
+        )
+            .into_response();
+    };
+
+    match backend.systemone(&body).await {
+        Ok(resp) => with_queue_headers(&state, queue_pos, Json(resp).into_response()),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 

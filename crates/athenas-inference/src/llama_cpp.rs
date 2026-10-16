@@ -78,6 +78,16 @@ fn should_refresh_unknown_architecture(
         && !is_never_text_architecture(architecture)
 }
 
+fn reject_generative_request(decision_mode: bool) -> Result<()> {
+    if decision_mode {
+        Err(AthenasError::InvalidInput(
+            "This model is a Clef decision model. It does not compute next-token logits, so chat and completion requests cannot run it. POST /v1/systemone with a state and questions (choice, score, or noul).".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, embedding_mode: bool) {
     cmd.arg("--batch-size").arg(batch_size.to_string());
     if embedding_mode {
@@ -96,6 +106,9 @@ pub struct LlamaCppBackend {
     context_size: u32,
     gpu_layers: i32,
     embedding_mode: bool,
+    /// Clef and the same family. llama-server runs them without a logits
+    /// buffer, so chat/completions returns "does not support logits".
+    decision_mode: bool,
     server_handle: Option<tokio::process::Child>,
     server_port: u16,
     client: reqwest::Client,
@@ -125,6 +138,7 @@ impl LlamaCppBackend {
             context_size: 4096,
             gpu_layers: -1,
             embedding_mode: false,
+            decision_mode: false,
             server_handle: None,
             server_port: 0,
             // Timeout for requests to llama-server. Prompt processing can
@@ -1074,6 +1088,7 @@ impl Backend for LlamaCppBackend {
         self.gpu_layers = config.gpu_layers;
         self.refreshed_server_bin = false;
         self.embedding_mode = false;
+        self.decision_mode = false;
 
         // Fail fast on truncated/corrupt GGUFs — otherwise llama-server
         // crash-loops with cryptic check_tensor_dims errors.
@@ -1111,11 +1126,21 @@ impl Backend for LlamaCppBackend {
             .await
             {
                 self.embedding_mode = configure_embedding_model(&metadata, &mut config);
+                self.decision_mode = metadata
+                    .architecture
+                    .as_deref()
+                    .is_some_and(athenas_core::is_decision_architecture);
 
                 if self.embedding_mode {
                     info!(
                         "Embedding model detected (architecture={}); enabling llama-server embedding mode",
                         metadata.architecture.as_deref().unwrap_or("unknown")
+                    );
+                }
+                if self.decision_mode {
+                    info!(
+                        "Decision model detected (architecture={}); chat and completion are disabled, use /v1/systemone",
+                        metadata.architecture.as_deref().unwrap_or("clef")
                     );
                 }
             }
@@ -1136,6 +1161,7 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        reject_generative_request(self.decision_mode)?;
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
@@ -1329,6 +1355,7 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn chat_stream(&self, request: ChatRequest, tx: mpsc::Sender<StreamChunk>) -> Result<()> {
+        reject_generative_request(self.decision_mode)?;
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
@@ -1633,6 +1660,7 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        reject_generative_request(self.decision_mode)?;
         if !self.loaded {
             return Err(AthenasError::Backend("No model loaded".to_string()));
         }
@@ -1742,6 +1770,42 @@ impl Backend for LlamaCppBackend {
             ..Default::default()
         };
         self.chat_stream(chat_req, tx).await
+    }
+
+    async fn systemone(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        if !self.loaded {
+            return Err(AthenasError::Backend("No model loaded".to_string()));
+        }
+        if !self.check_server_alive().await {
+            return Err(AthenasError::Backend(
+                "llama-server is not responding. Please restart the server.".to_string(),
+            ));
+        }
+
+        let url = format!("{}/v1/systemone", self.server_url());
+        let resp = self
+            .client
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AthenasError::Backend(format!("Decision request failed: {e}")))?;
+
+        let status = resp.status();
+        let value: serde_json::Value = resp.json().await.map_err(|e| {
+            AthenasError::Backend(format!("Decision response was not JSON ({status}): {e}"))
+        })?;
+        if !status.is_success() {
+            let detail = value
+                .pointer("/error/message")
+                .or_else(|| value.get("error"))
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| value.to_string());
+            return Err(AthenasError::Backend(format!(
+                "llama-server rejected the decision request ({status}): {detail}"
+            )));
+        }
+        Ok(value)
     }
 
     async fn embeddings(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
@@ -1970,6 +2034,7 @@ impl Backend for LlamaCppBackend {
             context_size: self.context_size,
             gpu_layers: self.gpu_layers,
             embedding_mode: self.embedding_mode,
+            decision_mode: self.decision_mode,
             server_handle: None, // Child is not Clone; not needed for streaming
             server_port: self.server_port,
             client: self.client.clone(),
@@ -2207,6 +2272,8 @@ mod tests {
         assert!(!should_refresh_unknown_architecture(
             "clip", &managed, false
         ));
+        assert!(reject_generative_request(true).is_err());
+        assert!(reject_generative_request(false).is_ok());
         assert!(should_refresh_unknown_architecture("clef", &managed, false));
         assert!(!should_refresh_unknown_architecture("clef", &managed, true));
         assert!(!should_refresh_unknown_architecture(
