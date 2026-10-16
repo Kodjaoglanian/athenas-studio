@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.29"
+version = "0.9.30"
 edition = "2021"
 license = "MIT"
 authors = ["Athenas Studio Contributors"]
