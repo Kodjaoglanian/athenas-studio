@@ -215,6 +215,11 @@ are rejected. Decisions go to `POST /v1/systemone` (`state` + `choice` /
 server that answers slots and then logs `does not support logits computation`
 already recognized the architecture — do not treat that as a stale binary.
 
+For Clef, pass the configured batch through both `--batch-size` and
+`--ubatch-size`. llama.cpp defaults physical batch to 512; omitting
+`--ubatch-size` breaks `/v1/systemone` when the prompt exceeds 512 tokens
+even if `batch_size` in config is higher.
+
 ### Whisper / Audio Transcription
 
 Whisper models (architecture: "whisper") are categorized separately from
