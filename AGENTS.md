@@ -206,6 +206,12 @@ the backend force-downloads the latest compatible release once and retries.
 Never auto-replace external binaries or retry known non-text architectures
 (`whisper`, TTS, `clip`).
 
+Clef does not compute next-token logits. After it loads, chat and completion
+are rejected. Decisions go to `POST /v1/systemone` (`state` + `choice` /
+`score` / `noul` questions), which is proxied to llama-server. A running
+server that answers slots and then logs `does not support logits computation`
+already recognized the architecture — do not treat that as a stale binary.
+
 ### Whisper / Audio Transcription
 
 Whisper models (architecture: "whisper") are categorized separately from

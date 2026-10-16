@@ -645,6 +645,7 @@ file_logging = false
 - **Multimodal:** Automatically detects and uses mmproj files for vision models
 - **Install:** **Automatic** — the correct GPU-accelerated `llama-server` binary is downloaded on first run based on your OS and GPU. You can also build [llama.cpp](https://github.com/ggml-org/llama.cpp) manually and add `llama-server` to PATH.
 - **New architectures:** If a managed binary does not recognize a text architecture (for example `clef` decision models), Athenas downloads the latest compatible `llama-server` once and retries. External binaries and non-text architectures (Whisper, TTS, CLIP) are left unchanged.
+- **Decision models:** Clef does not generate tokens. Call `POST /v1/systemone` with a `state` and typed questions (`choice`, `score`, or `noul`). Chat and completion requests are rejected instead of failing inside llama-server.
 
 | Platform | GPU | Binary downloaded |
 |----------|-----|--------------------|
