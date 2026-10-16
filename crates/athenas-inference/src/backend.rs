@@ -91,12 +91,17 @@ impl BackendFactory {
             athenas_core::BackendType::Onnx => {
                 #[cfg(not(any(
                     all(target_os = "macos", target_arch = "x86_64"),
-                    target_env = "musl"
+                    target_env = "musl",
+                    all(target_os = "windows", target_arch = "aarch64"),
                 )))]
                 {
                     Ok(Box::new(crate::onnx::OnnxBackend::new(hardware)))
                 }
-                #[cfg(any(all(target_os = "macos", target_arch = "x86_64"), target_env = "musl"))]
+                #[cfg(any(
+                    all(target_os = "macos", target_arch = "x86_64"),
+                    target_env = "musl",
+                    all(target_os = "windows", target_arch = "aarch64"),
+                ))]
                 {
                     let _ = hardware;
                     Err(athenas_core::AthenasError::Backend(

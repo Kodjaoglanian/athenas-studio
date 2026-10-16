@@ -148,14 +148,29 @@ jobs:
         if: matrix.cross && steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
+      - name: Cache ONNX Runtime download (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/ort.pyke.io
+          key: ort-pyke-${{ matrix.target }}-v1
+
       - name: Build
         shell: bash
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }}
+            BUILD="cross build --release --target ${{ matrix.target }}"
           else
-            cargo build --release --target ${{ matrix.target }}
+            BUILD="cargo build --release --target ${{ matrix.target }}"
           fi
+          for attempt in 1 2 3; do
+            if eval "$BUILD"; then
+              exit 0
+            fi
+            echo "Build attempt $attempt failed; retrying in 60s..."
+            sleep 60
+          done
+          exit 1
 
       - name: Prepare archive (Unix)
         id: archive-unix

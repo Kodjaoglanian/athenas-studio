@@ -39,7 +39,8 @@ half = { workspace = true }
 [dev-dependencies]
 tempfile = "3.10"
 
-# ORT only ships prebuilt binaries for some targets — no x86_64 macOS and
-# no musl dists exist, so the onnx module is cfg'd out there too.
-[target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_env = "musl")))'.dependencies]
+# ORT only ships prebuilt binaries for some targets — no x86_64 macOS, no
+# musl dists, and Windows ARM64 pulls a large DirectML pack that is flaky
+# to download in CI — so the onnx module is cfg'd out there too.
+[target.'cfg(not(any(all(target_os = "macos", target_arch = "x86_64"), target_env = "musl", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 ort = { workspace = true }
