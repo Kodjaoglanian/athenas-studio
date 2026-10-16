@@ -33,6 +33,9 @@ The project is organized as a Cargo workspace with 6 crates:
 - **Multi-Model Management** — Load/unload multiple models simultaneously via TUI or API
 - **Multimodal Support** — Automatic mmproj detection and download for vision models
 - **GPU Auto-Download** — Automatically downloads the correct GPU-accelerated llama-server binary based on detected hardware (Vulkan on Linux, CUDA on Windows, Metal on macOS)
+- **Dedicated GGUF Embeddings** — Embedding architectures, context caps, and `--ubatch-size` aligned with configured batch size
+- **Clef Decision Models** — `POST /v1/systemone` proxy; chat/completions blocked for Clef loads
+- **Managed llama-server refresh** — One-shot re-download when a managed binary lacks a new GGUF architecture (e.g. `clef`)
 - **Reasoning Mode** — Configurable thinking budget for reasoning models (Qwen3.5, DeepSeek R1)
 - **Auto Resource Limits** — Hardware-aware capping of threads, context, and batch size
 - **RAM Pre-Flight Check** — Server panel shows live RAM/VRAM and blocks startup if the model doesn't fit

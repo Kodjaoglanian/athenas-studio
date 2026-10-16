@@ -6,6 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org)
 
+**Documentation:** [GitHub Wiki](https://github.com/Kodjaoglanian/athenas-studio/wiki) (API reference, Clef decision models, configuration, deployment).
+
 ---
 
 ```
@@ -35,6 +37,7 @@
 - **HuggingFace Integration** — Search, download, and manage models from HuggingFace Hub with automatic mmproj download
 - **OpenAI-Compatible API Server** — Drop-in replacement for OpenAI API endpoints with multi-model support
 - **Dedicated GGUF Embeddings** — Automatically detects embedding architectures, uses the model's trained context, and starts llama-server in embedding mode
+- **Clef Decision Models** — Load Clef GGUF models and answer typed questions via `POST /v1/systemone` (choice, score, noul); chat/completions are rejected with a clear error
 - **Reasoning/Thinking Mode** — Support for reasoning models (Qwen3.5, DeepSeek R1, etc.) with configurable thinking budget
 - **Audio Transcription (Whisper)** — Transcribe audio files with Whisper models via CLI (`athenas transcribe`) or API (`/v1/audio/transcriptions`). Auto-downloads whisper-cli binary, supports text/JSON/SRT/VTT output formats, and language hints
 - **Hardware Auto-Detection** — Automatically detects CUDA, ROCm, Vulkan, and Metal
@@ -348,6 +351,8 @@ Output formats:
 |----------|--------|-------------|
 | `/v1/chat/completions` | POST | Chat completions (with SSE streaming) |
 | `/v1/completions` | POST | Text completions (with SSE streaming) |
+| `/v1/embeddings` | POST | Text embeddings (OpenAI-compatible) |
+| `/v1/systemone` | POST | Clef / decision models (`state` + typed `questions`; proxied to llama-server) |
 | `/v1/models` | GET | List loaded models |
 | `/v1/models/load` | POST | Load an additional model at runtime |
 | `/v1/models/unload` | POST | Unload a model by ID |
@@ -445,8 +450,9 @@ Dedicated GGUF embedding models such as EmbeddingGemma and EmbeddingGemma 2 are
 detected from their GGUF metadata. Athenas automatically enables llama-server's
 embedding mode, caps the context to the model's trained context length, and
 refreshes an outdated managed llama-server once when it lacks the architecture.
-The configured Batch Size is applied to both the logical and physical embedding
-batch.
+The configured batch size is passed to llama-server as both `--batch-size` and
+`--ubatch-size` (physical microbatch). Without `--ubatch-size`, llama.cpp keeps
+the default physical limit of 512 tokens.
 
 ```bash
 curl http://127.0.0.1:8080/v1/embeddings \
@@ -461,6 +467,40 @@ curl http://127.0.0.1:8080/v1/embeddings \
 The bearer token must be an Athenas key created in **F4 → Manage API Keys**.
 Provider credentials such as OpenAI or OpenRouter keys are only used for their
 respective remote backends.
+
+### Decision models API (Clef)
+
+Clef models do not generate tokens. Use **`POST /v1/systemone`** with a `state`
+and a `questions` map (`choice`, `score`, or `noul`). Chat and completion
+requests are rejected by Athenas instead of failing inside llama-server with a
+logits error. The configured batch size is applied as both logical and physical
+batch (`--ubatch-size`), which matters when the encoded prompt exceeds 512
+tokens.
+
+```bash
+curl http://127.0.0.1:8080/v1/systemone \
+  -H "Authorization: Bearer sk-ath-your-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "state": "Checkout errors are blocking orders.",
+    "questions": {
+      "team": {
+        "type": "choice",
+        "instructions": "Which team should handle this?",
+        "criteria": {
+          "billing": "payments and refunds",
+          "technical": "bugs and outages"
+        }
+      },
+      "urgent": {
+        "type": "noul",
+        "instructions": "Is this urgent?"
+      }
+    }
+  }'
+```
+
+See the [wiki — Decision Models](https://github.com/Kodjaoglanian/athenas-studio/wiki/Decision-Models) for question types and batch tuning.
 
 ### Audio transcription via API
 
