@@ -1926,9 +1926,7 @@ async fn load_model_endpoint(
 
     let inference = inference_config_for_load(&state.inference_defaults).await;
 
-    let context_size = req
-        .context_size
-        .unwrap_or(inference.default_context_size);
+    let context_size = req.context_size.unwrap_or(inference.default_context_size);
     let mut batch_size = req.batch_size.unwrap_or(inference.default_batch_size);
     if inference.auto_resource_limits && batch_size > context_size {
         batch_size = context_size;
