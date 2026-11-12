@@ -595,10 +595,7 @@ fn detect_vulkan() -> bool {
             }
         }
         // Method 3: check if NVIDIA driver is installed (provides Vulkan)
-        if std::path::Path::new("/proc/driver/nvidia").exists() {
-            return true;
-        }
-        false
+        std::path::Path::new("/proc/driver/nvidia").exists()
     } else if cfg!(target_os = "windows") {
         // Method 1: try vulkaninfo (comes with Vulkan SDK)
         if Command::new("vulkaninfo")
