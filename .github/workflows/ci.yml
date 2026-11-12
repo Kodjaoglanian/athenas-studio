@@ -71,12 +71,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           key: native-${{ matrix.target }}
-      - name: Cache ONNX Runtime download (Windows x86_64)
+      - name: Clear ORT download cache (Windows x86_64)
         if: runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'
-        uses: actions/cache@v5
-        with:
-          path: ~/AppData/Local/ort.pyke.io
-          key: ort-pyke-${{ matrix.target }}-v2
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:LOCALAPPDATA\ort.pyke.io"
       - name: Check
         shell: bash
         run: |

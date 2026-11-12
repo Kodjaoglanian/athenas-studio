@@ -148,12 +148,12 @@ jobs:
         if: matrix.cross && steps.cross-cache.outputs.cache-hit != 'true'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Cache ONNX Runtime download (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v5
-        with:
-          path: ~/AppData/Local/ort.pyke.io
-          key: ort-pyke-${{ matrix.target }}-v2
+      # x86_64 Windows pulls a large DirectML ORT pack; caching partial
+      # downloads caused copy-dylibs to fail. Always fetch fresh there.
+      - name: Clear ORT download cache (Windows x86_64)
+        if: runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$env:LOCALAPPDATA\ort.pyke.io"
 
       - name: Build
         shell: bash
@@ -170,6 +170,7 @@ jobs:
             echo "Build attempt $attempt failed; retrying in 60s..."
             if [ "${{ runner.os }}" = "Windows" ] && [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
               rm -rf "$HOME/AppData/Local/ort.pyke.io" || true
+              cargo clean -p ort-sys -p ort 2>/dev/null || true
             fi
             sleep 60
           done
