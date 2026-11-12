@@ -359,3 +359,4 @@ Config: `[server.otel]` in `config.toml` — `enabled`, `endpoint`,
 - **Don't call `try_install_*` (apt/dnf/pacman) without checking `auto_install_deps`** — default is OFF; show the manual hint instead
 - **Don't return raw `api_key` from list/detail endpoints** — only `POST /v1/keys` may return the full secret (one-time reveal)
 - **Don't use `download_model` when a `lfs.sha256` is available** — prefer `download_model_verify` so corrupted/poisoned weights get rejected
+- **Don't hardcode `batch_size` / `context_size` in `POST /v1/models/load`** — omitted JSON fields must come from `[inference]` in `config.toml` (re-read on each load), matching `athenas serve` and the TUI server panel

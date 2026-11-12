@@ -180,6 +180,7 @@ impl ApiServer {
             self.vector_store.clone(),
             self.semantic_cache.clone(),
             &self.config.server,
+            &self.config.inference,
             self.config.inference.auto_install_deps,
         );
 

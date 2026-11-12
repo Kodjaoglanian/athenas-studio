@@ -65,6 +65,9 @@ struct AppState {
     max_loaded_models: u32,
     /// Reject /v1/models/load when estimated RAM exceeds available memory.
     load_ram_check: bool,
+    /// Fallback inference defaults (snapshot at server start); `/v1/models/load`
+    /// re-reads `~/.athenas/config.toml` on each request when possible.
+    inference_defaults: athenas_core::InferenceConfig,
 }
 
 /// Resolve the real client IP for auth checks — X-Forwarded-For (first
@@ -195,6 +198,7 @@ pub fn create_router(
     vector_store: Option<SharedVectorStore>,
     semantic_cache: Option<SharedSemanticCache>,
     config: &ServerConfig,
+    inference: &athenas_core::InferenceConfig,
     auto_install_deps: bool,
 ) -> Router {
     let state = AppState {
@@ -216,6 +220,7 @@ pub fn create_router(
         trust_proxy_headers: config.trust_proxy_headers,
         max_loaded_models: config.max_loaded_models,
         load_ram_check: config.load_ram_check,
+        inference_defaults: inference.clone(),
     };
 
     let mut router = Router::new()
@@ -1850,6 +1855,17 @@ fn format_vtt_time(secs: f64) -> String {
 
 // ── Multi-model management endpoints ──────────────────────────────────
 
+/// Re-read inference defaults from disk so reload-via-API picks up F5
+/// changes without restarting `athenas serve`.
+async fn inference_config_for_load(
+    fallback: &athenas_core::InferenceConfig,
+) -> athenas_core::InferenceConfig {
+    match tokio::task::spawn_blocking(athenas_core::AppConfig::load).await {
+        Ok(Ok(cfg)) => cfg.inference,
+        _ => fallback.clone(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct LoadModelRequest {
     model_path: String,
@@ -1908,6 +1924,16 @@ async fn load_model_endpoint(
         }
     }
 
+    let inference = inference_config_for_load(&state.inference_defaults).await;
+
+    let context_size = req
+        .context_size
+        .unwrap_or(inference.default_context_size);
+    let mut batch_size = req.batch_size.unwrap_or(inference.default_batch_size);
+    if inference.auto_resource_limits && batch_size > context_size {
+        batch_size = context_size;
+    }
+
     let backend_type = match req.backend.as_deref() {
         Some("llama.cpp") | Some("llamacpp") | Some("llama") => athenas_core::BackendType::LlamaCpp,
         Some("vllm") => athenas_core::BackendType::Vllm,
@@ -1957,13 +1983,13 @@ async fn load_model_endpoint(
         .unwrap_or((0, false));
 
         if size_mb > 0 {
-            let ctx = req.context_size.unwrap_or(4096);
+            let ctx = context_size;
             // ONNX ignores gpu_layers without a GPU execution provider —
             // count it fully against RAM.
             let gpu_layers = if is_onnx && !athenas_inference::GPU_OFFLOAD_CAPABLE {
                 0
             } else {
-                req.gpu_layers.unwrap_or(-1)
+                req.gpu_layers.unwrap_or(inference.default_gpu_layers)
             };
             let est = athenas_core::estimate_model_memory(size_mb, ctx, gpu_layers, &hardware);
             if let Some((resource, needed, avail)) = est.shortfall(&hardware) {
@@ -1999,20 +2025,20 @@ async fn load_model_endpoint(
 
     let load_config = ModelLoadConfig {
         model_path: req.model_path.clone(),
-        gpu_layers: req.gpu_layers.unwrap_or(-1),
-        gpu_runtime: athenas_core::GpuRuntime::Auto,
-        gpu_device: None,
-        context_size: req.context_size.unwrap_or(4096),
-        batch_size: req.batch_size.unwrap_or(512),
-        threads: req.threads.unwrap_or(0),
-        flash_attention: req.flash_attention.unwrap_or(true),
+        gpu_layers: req.gpu_layers.unwrap_or(inference.default_gpu_layers),
+        gpu_runtime: inference.gpu_runtime,
+        gpu_device: inference.gpu_device,
+        context_size,
+        batch_size,
+        threads: req.threads.unwrap_or(inference.default_threads),
+        flash_attention: req.flash_attention.unwrap_or(inference.flash_attention),
         use_mmap: true,
         use_mlock: false,
-        reasoning_enabled: req.reasoning_enabled.unwrap_or(false),
-        reasoning_budget: req.reasoning_budget.unwrap_or(-1),
+        reasoning_enabled: req.reasoning_enabled.unwrap_or(inference.reasoning_enabled),
+        reasoning_budget: req.reasoning_budget.unwrap_or(inference.reasoning_budget),
         mmproj_path: req.mmproj_path,
         lora_paths: req.lora_paths.clone(),
-        parallel_slots: req.parallel_slots.unwrap_or(4),
+        parallel_slots: req.parallel_slots.unwrap_or(inference.parallel_slots),
         draft_model_path: None,
         draft_max_tokens: 16,
         draft_min_ctx: 512,
@@ -4167,6 +4193,7 @@ mod tests {
             trust_proxy_headers: false,
             max_loaded_models: 0,
             load_ram_check: true,
+            inference_defaults: athenas_core::AppConfig::default().inference,
         }
     }
 }
