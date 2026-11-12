@@ -105,11 +105,11 @@ jobs:
             cross: true
           # macOS
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15-intel
             archive: tar.gz
             cross: false
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
             cross: false
           # Windows
@@ -153,7 +153,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/AppData/Local/ort.pyke.io
-          key: ort-pyke-${{ matrix.target }}-v1
+          key: ort-pyke-${{ matrix.target }}-v2
 
       - name: Build
         shell: bash
@@ -168,6 +168,9 @@ jobs:
               exit 0
             fi
             echo "Build attempt $attempt failed; retrying in 60s..."
+            if [ "${{ runner.os }}" = "Windows" ] && [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
+              rm -rf "$HOME/AppData/Local/ort.pyke.io" || true
+            fi
             sleep 60
           done
           exit 1

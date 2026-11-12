@@ -55,9 +55,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15-intel
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
@@ -71,7 +71,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           key: native-${{ matrix.target }}
-      - run: cargo check --target ${{ matrix.target }} --all
+      - name: Cache ONNX Runtime download (Windows x86_64)
+        if: runner.os == 'Windows' && matrix.target == 'x86_64-pc-windows-msvc'
+        uses: actions/cache@v5
+        with:
+          path: ~/AppData/Local/ort.pyke.io
+          key: ort-pyke-${{ matrix.target }}-v2
+      - name: Check
+        shell: bash
+        run: |
+          TARGET="${{ matrix.target }}"
+          if [ "${{ runner.os }}" = "Windows" ] && [ "$TARGET" = "x86_64-pc-windows-msvc" ]; then
+            for attempt in 1 2 3; do
+              if cargo check --target "$TARGET" --all; then
+                exit 0
+              fi
+              echo "ORT build attempt $attempt failed; clearing ort cache and retrying..."
+              rm -rf "$HOME/AppData/Local/ort.pyke.io" || true
+              sleep 45
+            done
+            exit 1
+          fi
+          cargo check --target "$TARGET" --all
 
   check-cross-linux:
     name: Check ${{ matrix.target }} (cross)
