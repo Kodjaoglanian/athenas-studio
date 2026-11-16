@@ -88,6 +88,26 @@ fn reject_generative_request(decision_mode: bool) -> Result<()> {
     }
 }
 
+/// Clef builds often keep a base architecture (`qwen2`, …) in
+/// `general.architecture` while llama.cpp still treats them as decision
+/// models. The file or GGUF name is then the only signal we have before
+/// launch — without it `--ubatch-size` is omitted and llama.cpp stays at 512.
+fn is_decision_model(path: &str, architecture: Option<&str>, name: Option<&str>) -> bool {
+    if architecture.is_some_and(athenas_core::is_decision_architecture) {
+        return true;
+    }
+    fn mentions_clef(value: &str) -> bool {
+        value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part.eq_ignore_ascii_case("clef"))
+    }
+    name.is_some_and(mentions_clef)
+        || std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(mentions_clef)
+}
+
 fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, match_physical_ubatch: bool) {
     cmd.arg("--batch-size").arg(batch_size.to_string());
     if match_physical_ubatch {
@@ -1130,10 +1150,11 @@ impl Backend for LlamaCppBackend {
             .await
             {
                 self.embedding_mode = configure_embedding_model(&metadata, &mut config);
-                self.decision_mode = metadata
-                    .architecture
-                    .as_deref()
-                    .is_some_and(athenas_core::is_decision_architecture);
+                self.decision_mode = is_decision_model(
+                    &config.model_path,
+                    metadata.architecture.as_deref(),
+                    metadata.name.as_deref(),
+                );
 
                 if self.embedding_mode {
                     info!(
@@ -1147,6 +1168,11 @@ impl Backend for LlamaCppBackend {
                         metadata.architecture.as_deref().unwrap_or("clef")
                     );
                 }
+            } else if is_decision_model(&config.model_path, None, None) {
+                self.decision_mode = true;
+                info!(
+                    "Decision model detected from file name; chat and completion are disabled, use /v1/systemone"
+                );
             }
         }
 
@@ -2314,6 +2340,24 @@ mod tests {
     }
 
     #[test]
+    fn clef_in_the_file_name_is_a_decision_model() {
+        assert!(is_decision_model(
+            "/models/athenas-guard-9b-clef-Q4_K_M.gguf",
+            Some("qwen2"),
+            None
+        ));
+        assert!(is_decision_model(
+            "/models/weights.gguf",
+            Some("qwen2"),
+            Some("Athenas Guard Clef")
+        ));
+        assert!(!is_decision_model(
+            "/models/qwen2-7b.gguf",
+            Some("qwen2"),
+            Some("Qwen2")
+        ));
+    }
+
     fn decision_mode_sets_physical_batch_size() {
         let mut command = tokio::process::Command::new("llama-server");
         add_batch_args(&mut command, 1024, true);
