@@ -596,7 +596,7 @@ Config file: `~/.athenas/config.toml`
 Models directory: `~/.athenas/models/`
 
 ```toml
-version = "0.9.32"
+version = "0.9.33"
 
 [paths]
 models_dir = "~/.athenas/models"

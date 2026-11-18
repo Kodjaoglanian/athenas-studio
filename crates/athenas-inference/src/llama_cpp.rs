@@ -108,13 +108,12 @@ fn is_decision_model(path: &str, architecture: Option<&str>, name: Option<&str>)
             .is_some_and(mentions_clef)
 }
 
-fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32, match_physical_ubatch: bool) {
+fn add_batch_args(cmd: &mut tokio::process::Command, batch_size: u32) {
+    // llama.cpp's physical microbatch defaults to 512 when --ubatch-size is
+    // omitted, even if --batch-size is larger. Clef and embeddings reject
+    // any prompt that does not fit in that microbatch.
     cmd.arg("--batch-size").arg(batch_size.to_string());
-    if match_physical_ubatch {
-        // Embeddings and Clef decision prompts must fit in one physical
-        // microbatch; without --ubatch-size llama.cpp keeps the default 512.
-        cmd.arg("--ubatch-size").arg(batch_size.to_string());
-    }
+    cmd.arg("--ubatch-size").arg(batch_size.to_string());
 }
 
 /// llama.cpp backend — uses llama.cpp server subprocess for inference
@@ -451,11 +450,7 @@ impl LlamaCppBackend {
             .arg("--jinja")
             .arg("--metrics");
 
-        add_batch_args(
-            &mut cmd,
-            config.batch_size,
-            self.embedding_mode || self.decision_mode,
-        );
+        add_batch_args(&mut cmd, config.batch_size);
 
         if self.embedding_mode {
             cmd.arg("--embeddings");
@@ -2316,7 +2311,7 @@ mod tests {
     #[test]
     fn embedding_mode_sets_logical_and_physical_batch_size() {
         let mut command = tokio::process::Command::new("llama-server");
-        add_batch_args(&mut command, 2048, true);
+        add_batch_args(&mut command, 2048);
         let args: Vec<_> = command
             .as_std()
             .get_args()
@@ -2327,16 +2322,16 @@ mod tests {
     }
 
     #[test]
-    fn text_mode_does_not_override_physical_batch_size() {
+    fn text_mode_sets_physical_batch_size() {
         let mut command = tokio::process::Command::new("llama-server");
-        add_batch_args(&mut command, 2048, false);
+        add_batch_args(&mut command, 2048);
         let args: Vec<_> = command
             .as_std()
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
 
-        assert_eq!(args, ["--batch-size", "2048"]);
+        assert_eq!(args, ["--batch-size", "2048", "--ubatch-size", "2048"]);
     }
 
     #[test]
@@ -2360,7 +2355,7 @@ mod tests {
 
     fn decision_mode_sets_physical_batch_size() {
         let mut command = tokio::process::Command::new("llama-server");
-        add_batch_args(&mut command, 1024, true);
+        add_batch_args(&mut command, 1024);
         let args: Vec<_> = command
             .as_std()
             .get_args()
