@@ -22,7 +22,7 @@ env:
 jobs:
   create-release:
     name: Create Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       upload_url: ${{ steps.create-release.outputs.upload_url }}
       version: ${{ steps.version.outputs.version }}
@@ -88,19 +88,19 @@ jobs:
         include:
           # Linux
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             archive: tar.gz
             cross: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
             archive: tar.gz
             cross: true
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             archive: tar.gz
             cross: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             archive: tar.gz
             cross: true
           # macOS
@@ -263,7 +263,7 @@ jobs:
   publish-installers:
     name: Publish Install Scripts
     needs: create-release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: softprops/action-gh-release@v3
@@ -276,7 +276,7 @@ jobs:
   publish-install-manifest:
     name: Publish Install Manifest
     needs: [create-release, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
