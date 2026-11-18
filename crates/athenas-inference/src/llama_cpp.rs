@@ -2352,16 +2352,4 @@ mod tests {
             Some("Qwen2")
         ));
     }
-
-    fn decision_mode_sets_physical_batch_size() {
-        let mut command = tokio::process::Command::new("llama-server");
-        add_batch_args(&mut command, 1024);
-        let args: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-
-        assert_eq!(args, ["--batch-size", "1024", "--ubatch-size", "1024"]);
-    }
 }
