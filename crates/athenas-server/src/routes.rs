@@ -149,6 +149,54 @@ async fn acquire_with_tracking(state: &AppState) -> Option<(PermitGuard, u32)> {
     }
 }
 
+/// Max time a decision request may wait for `max_concurrent_requests` capacity.
+/// Gateway timeouts are often ~30s; fail fast with 503 instead of hanging.
+const SYSTEMONE_QUEUE_WAIT: Duration = Duration::from_secs(25);
+
+enum QueueAcquireError {
+    TimedOut,
+    Closed,
+}
+
+async fn acquire_with_tracking_timeout(
+    state: &AppState,
+    max_wait: Duration,
+) -> Result<(PermitGuard, u32), QueueAcquireError> {
+    use std::sync::atomic::Ordering;
+
+    if let Ok(permit) = state.semaphore.clone().try_acquire_owned() {
+        state.active_requests.fetch_add(1, Ordering::Relaxed);
+        let guard = PermitGuard {
+            permit,
+            active_requests: state.active_requests.clone(),
+        };
+        return Ok((guard, 0));
+    }
+
+    let queue_position = state.waiting_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let acquire_fut = state.semaphore.clone().acquire_owned();
+
+    match tokio::time::timeout(max_wait, acquire_fut).await {
+        Ok(Ok(permit)) => {
+            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
+            state.active_requests.fetch_add(1, Ordering::Relaxed);
+            let guard = PermitGuard {
+                permit,
+                active_requests: state.active_requests.clone(),
+            };
+            Ok((guard, queue_position))
+        }
+        Ok(Err(_)) => {
+            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
+            Err(QueueAcquireError::Closed)
+        }
+        Err(_) => {
+            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
+            Err(QueueAcquireError::TimedOut)
+        }
+    }
+}
+
 /// Build response headers with queue information if visibility is enabled.
 fn queue_headers(state: &AppState, queue_position: u32) -> Vec<(String, String)> {
     use std::sync::atomic::Ordering;
@@ -919,12 +967,15 @@ async fn chat_completions(
     };
     // model_manager lock is now released — inference below runs lock-free.
 
+    let public_model = public_model_name(
+        &model_id,
+        &resolved_model_id,
+        backend.model_info().map(|i| i.name.clone()),
+    );
+
     if chat_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-        let model_name = backend
-            .model_info()
-            .map(|i| i.name.clone())
-            .unwrap_or_default();
+        let model_name = public_model.clone();
 
         // Append new messages to session at stream start
         if let Some(ref sid) = session_id {
@@ -1103,7 +1154,7 @@ async fn chat_completions(
                     "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
                     "object": "chat.completion",
                     "created": chrono::Utc::now().timestamp(),
-                    "model": resp.model,
+                    "model": public_model,
                     "choices": [{
                         "index": 0,
                         "message": message_json,
@@ -1382,7 +1433,7 @@ async fn completions(
 
     // Resolve backend Arc under a SHORT lock, then release it so inference
     // never blocks other requests on the model manager mutex.
-    let backend = {
+    let (backend, resolved_model_id) = {
         let mgr = state.model_manager.lock().await;
 
         // Try the requested model first, then fall back to the default.
@@ -1390,10 +1441,7 @@ async fn completions(
 
         match backend {
             Some(b) => {
-                let resolved = b
-                    .model_info()
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| model_id.clone());
+                let resolved = loaded_model_id_for_request(&mgr, &model_id);
                 if model_id != resolved && !model_id.is_empty() {
                     tracing::warn!(
                         "Completions: requested model '{}' not loaded; serving default '{}'",
@@ -1401,7 +1449,7 @@ async fn completions(
                         resolved
                     );
                 }
-                b
+                (b, resolved)
             }
             None => {
                 let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
@@ -1418,12 +1466,15 @@ async fn completions(
     };
     // model_manager lock is now released — inference below runs lock-free.
 
+    let public_model = public_model_name(
+        &model_id,
+        &resolved_model_id,
+        backend.model_info().map(|i| i.name.clone()),
+    );
+
     if comp_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-        let model_name = backend
-            .model_info()
-            .map(|i| i.name.clone())
-            .unwrap_or_default();
+        let model_name = public_model.clone();
 
         let metrics = state.metrics.clone();
         let api_key_mgr_clone = state.api_key_manager.clone();
@@ -1518,7 +1569,7 @@ async fn completions(
                     "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
                     "object": "text_completion",
                     "created": chrono::Utc::now().timestamp(),
-                    "model": resp.model,
+                    "model": public_model,
                     "choices": [{
                         "index": 0,
                         "text": resp.text,
@@ -1817,6 +1868,74 @@ async fn transcribe_audio(
         )
             .into_response(),
     }
+}
+
+fn looks_like_filesystem_model_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if s.starts_with('/') || s.starts_with("\\\\") {
+        return true;
+    }
+    if s.len() > 1 && s.as_bytes()[1] == b':' {
+        return true;
+    }
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    let lower = s.to_ascii_lowercase();
+    lower.ends_with(".gguf") || lower.ends_with(".safetensors") || lower.ends_with(".onnx")
+}
+
+fn model_stem_from_path(path: &str) -> Option<String> {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+}
+
+/// Identifier safe to expose in API responses (never a host filesystem path).
+fn public_model_name(
+    request_model: &str,
+    loaded_id: &str,
+    backend_info_name: Option<String>,
+) -> String {
+    for candidate in [request_model, loaded_id] {
+        if !candidate.is_empty() && !looks_like_filesystem_model_path(candidate) {
+            return candidate.to_string();
+        }
+    }
+    if let Some(ref name) = backend_info_name {
+        if !name.is_empty() && !looks_like_filesystem_model_path(name) {
+            return name.clone();
+        }
+    }
+    model_stem_from_path(request_model)
+        .or_else(|| model_stem_from_path(loaded_id))
+        .or_else(|| backend_info_name.as_deref().and_then(model_stem_from_path))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn set_json_model_field(resp: &mut serde_json::Value, public_name: &str) {
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(public_name.to_string()),
+        );
+    }
+}
+
+fn loaded_model_id_for_request(
+    mgr: &crate::model_manager::ModelManager,
+    requested: &str,
+) -> String {
+    if !requested.is_empty() && mgr.list().iter().any(|m| m.id == requested) {
+        return requested.to_string();
+    }
+    mgr.default_id()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| requested.to_string())
 }
 
 /// Resolve a model name/ID to a file path on disk.
@@ -2836,13 +2955,11 @@ async fn responses(
 
         if let Some(b) = mgr.get(Some(model_id.as_str())) {
             backend = Some(b);
-            resolved = model_id.clone();
+            resolved = loaded_model_id_for_request(&mgr, &model_id);
         }
         if backend.is_none() {
             if let Some(b) = mgr.get(None) {
-                if let Some(def_id) = mgr.default_id() {
-                    resolved = def_id.to_string();
-                }
+                resolved = loaded_model_id_for_request(&mgr, &model_id);
                 backend = Some(b);
             }
         }
@@ -2861,13 +2978,16 @@ async fn responses(
         }
     };
 
+    let public_model = public_model_name(
+        &model_id,
+        &resolved_model_id,
+        backend.model_info().map(|i| i.name.clone()),
+    );
+
     if chat_req.stream {
         // Streaming responses API format
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
-        let model_name = backend
-            .model_info()
-            .map(|i| i.name.clone())
-            .unwrap_or_default();
+        let model_name = public_model.clone();
         let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
 
         let metrics = state.metrics.clone();
@@ -2980,7 +3100,7 @@ async fn responses(
                     "id": response_id,
                     "object": "response",
                     "created_at": chrono::Utc::now().timestamp(),
-                    "model": resp.model,
+                    "model": public_model,
                     "output": [{
                         "type": "message",
                         "role": "assistant",
@@ -3059,9 +3179,23 @@ async fn systemone(
         }
     }
 
-    let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
-        Some((permit, pos)) => (permit, pos),
-        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let (_permit, queue_pos) = match acquire_with_tracking_timeout(&state, SYSTEMONE_QUEUE_WAIT)
+        .await
+    {
+        Ok((permit, pos)) => (permit, pos),
+        Err(QueueAcquireError::TimedOut) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": "Server busy: waited too long for an inference slot (try again or reduce load on chat endpoints)",
+                        "type": "server_busy",
+                    }
+                })),
+            )
+                .into_response();
+        }
+        Err(QueueAcquireError::Closed) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
 
     let model_id = body
@@ -3070,21 +3204,46 @@ async fn systemone(
         .unwrap_or("")
         .to_string();
 
-    let backend = {
+    let (backend, loaded_id) = {
         let mgr = state.model_manager.lock().await;
-        mgr.get(Some(model_id.as_str())).or_else(|| mgr.get(None))
+        let loaded_id = if model_id.is_empty() {
+            mgr.default_id().map(|s| s.to_string())
+        } else {
+            mgr.resolve_id(&model_id)
+        };
+        let Some(resolved_id) = loaded_id else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Model '{}' is not loaded", model_id),
+                        "type": "model_not_found",
+                    }
+                })),
+            )
+                .into_response();
+        };
+        let Some(backend) = mgr.get(Some(resolved_id.as_str())) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "No model loaded"})),
+            )
+                .into_response();
+        };
+        (backend, resolved_id)
     };
 
-    let Some(backend) = backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "No model loaded"})),
-        )
-            .into_response();
-    };
+    let public_model = public_model_name(
+        &model_id,
+        &loaded_id,
+        backend.model_info().map(|i| i.name.clone()),
+    );
 
     match backend.systemone(&body).await {
-        Ok(resp) => with_queue_headers(&state, queue_pos, Json(resp).into_response()),
+        Ok(mut resp) => {
+            set_json_model_field(&mut resp, &public_model);
+            with_queue_headers(&state, queue_pos, Json(resp).into_response())
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -3151,10 +3310,7 @@ async fn embeddings(
 
         match backend {
             Some(b) => {
-                let resolved = b
-                    .model_info()
-                    .map(|i| i.name.clone())
-                    .unwrap_or_else(|| model_id.clone());
+                let resolved = loaded_model_id_for_request(&mgr, &model_id);
                 if model_id != resolved && !model_id.is_empty() {
                     tracing::warn!(
                         "Embeddings: requested model '{}' not loaded; serving default '{}'",
@@ -3204,19 +3360,21 @@ async fn embeddings(
         }
     };
 
-    let model_name = backend
-        .model_info()
-        .map(|i| i.name.clone())
-        .unwrap_or_default();
+    let public_model = public_model_name(
+        &model_id,
+        &resolved_model_id,
+        backend.model_info().map(|i| i.name.clone()),
+    );
 
     let emb_req = EmbeddingRequest {
-        model: model_name,
+        model: public_model.clone(),
         input: embedding_input,
         encoding_format: req.encoding_format.unwrap_or_else(|| "float".to_string()),
     };
 
     match backend.embeddings(emb_req).await {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            resp.model = public_model;
             state
                 .metrics
                 .record_tokens(&resolved_model_id, resp.usage.prompt_tokens, 0);
@@ -4128,6 +4286,36 @@ mod tests {
     #[test]
     fn mask_api_key_standard() {
         assert_eq!(mask_api_key("sk-ath-abcdef1234567890"), "sk-ath-…7890");
+    }
+
+    #[test]
+    fn public_model_name_strips_gguf_path() {
+        let path = "/root/.athenas/models/foo/athenas-guard-9b-clef-Q4_K_M.gguf";
+        assert_eq!(
+            public_model_name(path, "", None::<String>),
+            "athenas-guard-9b-clef-Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn public_model_name_prefers_request_id() {
+        assert_eq!(
+            public_model_name("athenas-guard-9b-clef-Q4_K_M", "other", None::<String>),
+            "athenas-guard-9b-clef-Q4_K_M"
+        );
+    }
+
+    #[test]
+    fn systemone_response_replaces_model_path() {
+        let mut resp = serde_json::json!({
+            "model": "/root/.athenas/models/athenas-guard-9b-clef-Q4_K_M.gguf",
+            "choices": []
+        });
+        set_json_model_field(&mut resp, "athenas-guard-9b-clef-Q4_K_M");
+        assert_eq!(
+            resp.get("model").and_then(|v| v.as_str()),
+            Some("athenas-guard-9b-clef-Q4_K_M")
+        );
     }
 
     #[test]

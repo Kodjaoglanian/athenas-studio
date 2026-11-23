@@ -96,6 +96,50 @@ impl ModelManager {
         }
     }
 
+    /// Map a client-supplied model string to a loaded model id (exact, then
+    /// case-insensitive, then `d1-2b` → `d1-2B-Q4_K_M` style prefix match).
+    /// Empty `requested` falls back to the default model id.
+    pub fn resolve_id(&self, requested: &str) -> Option<String> {
+        if requested.is_empty() {
+            return self.default_model.clone();
+        }
+        if self.backends.contains_key(requested) {
+            return Some(requested.to_string());
+        }
+        Self::match_model_id(self.backends.keys().map(|s| s.as_str()), requested)
+    }
+
+    /// Backend for a resolved id, or the default when `requested` is empty.
+    pub fn get_resolved(&self, requested: &str) -> Option<SharedBackend> {
+        if requested.is_empty() {
+            return self.get(None);
+        }
+        self.resolve_id(requested)
+            .and_then(|id| self.backends.get(&id).cloned())
+    }
+
+    fn normalize_model_key(s: &str) -> String {
+        s.to_ascii_lowercase().replace(['_', ' '], "-")
+    }
+
+    fn match_model_id<'a>(
+        loaded_ids: impl Iterator<Item = &'a str>,
+        requested: &str,
+    ) -> Option<String> {
+        let want = Self::normalize_model_key(requested);
+        let mut prefix_hit: Option<String> = None;
+        for id in loaded_ids {
+            let normalized = Self::normalize_model_key(id);
+            if normalized == want || id.eq_ignore_ascii_case(requested) {
+                return Some(id.to_string());
+            }
+            if normalized.starts_with(&format!("{want}-")) && prefix_hit.is_none() {
+                prefix_hit = Some(id.to_string());
+            }
+        }
+        prefix_hit
+    }
+
     /// Get the default model id.
     pub fn default_id(&self) -> Option<&str> {
         self.default_model.as_deref()
@@ -144,3 +188,22 @@ impl ModelManager {
 
 /// Shared, thread-safe wrapper around ModelManager.
 pub type SharedModelManager = Arc<Mutex<ModelManager>>;
+
+#[cfg(test)]
+mod tests {
+    use super::ModelManager;
+
+    #[test]
+    fn match_model_id_alias_prefix() {
+        let ids = ["LFM3-Omni-2B-Q4_K_M", "d1-2B-Q4_K_M"];
+        assert_eq!(
+            ModelManager::match_model_id(ids.into_iter(), "d1-2b").as_deref(),
+            Some("d1-2B-Q4_K_M")
+        );
+        assert_eq!(
+            ModelManager::match_model_id(ids.into_iter(), "d1-2B-Q4_K_M").as_deref(),
+            Some("d1-2B-Q4_K_M")
+        );
+        assert!(ModelManager::match_model_id(ids.into_iter(), "nope").is_none());
+    }
+}
