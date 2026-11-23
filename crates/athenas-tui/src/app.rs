@@ -215,6 +215,46 @@ impl TuiApp {
         tracing::info!("{}", msg);
     }
 
+    /// Port encoded in `llama-server-<port>-<id>.log`.
+    fn llama_log_port(name: &str) -> Option<&str> {
+        let rest = name.strip_prefix("llama-server-")?;
+        let port = rest.split('-').next()?;
+        if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() {
+            Some(port)
+        } else {
+            None
+        }
+    }
+
+    /// Ports of llama-server processes that are running now.
+    fn live_llama_server_ports() -> std::collections::HashSet<String> {
+        let mut ports = std::collections::HashSet::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return ports;
+        };
+        for entry in entries.flatten() {
+            let pid = entry.file_name();
+            let pid = pid.to_string_lossy();
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if !text.contains("llama-server") {
+                continue;
+            }
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if let Some(i) = parts.iter().position(|arg| *arg == "--port") {
+                if let Some(port) = parts.get(i + 1) {
+                    ports.insert((*port).to_string());
+                }
+            }
+        }
+        ports
+    }
+
     /// Background thread that tails `~/.athenas/server.log` and pushes new
     /// lines into the log buffer. This makes the detached server's logs
     /// (including HTTP request logs) visible in the TUI logs page.
@@ -300,6 +340,10 @@ impl TuiApp {
             }
 
             // --- Tail llama-server-<port>.log files (subprocess output) ---
+            // Only files for processes that are running. Old sessions stay on
+            // disk and were being replayed with the current clock, so a batch
+            // error from a previous launch looked like it had just happened.
+            let live_ports = Self::live_llama_server_ports();
             let Ok(entries) = std::fs::read_dir(&llama_log_dir) else {
                 continue;
             };
@@ -313,14 +357,19 @@ impl TuiApp {
                 {
                     continue;
                 }
+                if let Some(port) = Self::llama_log_port(name) {
+                    if !live_ports.contains(port) {
+                        continue;
+                    }
+                }
 
                 let Ok(metadata) = entry.metadata() else {
                     continue;
                 };
                 let size = metadata.len();
-                let last_size = llama_last_sizes
-                    .entry(path.clone())
-                    .or_insert_with(|| size.saturating_sub(50_000));
+                // Attach at EOF — do not replay the last 50KB when the TUI
+                // starts or when a model is reloaded on a new port.
+                let last_size = llama_last_sizes.entry(path.clone()).or_insert(size);
                 if size < *last_size {
                     *last_size = 0;
                 }

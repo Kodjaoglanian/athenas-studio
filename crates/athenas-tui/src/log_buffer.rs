@@ -66,6 +66,8 @@ impl LogBuffer {
         if is_tracing_log_line(&clean) {
             let entry = parse_server_log_line(&clean);
             self.push(entry);
+        } else if is_llama_server_log_line(&clean) {
+            self.push(parse_llama_server_log_line(&clean));
         } else {
             // Not a tracing line — store as-is with a "LOG" level
             self.push(LogEntry {
@@ -122,6 +124,37 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     result
+}
+
+/// llama-server stderr lines: `1.35.178.670 E srv    send_error: ...`
+fn is_llama_server_log_line(line: &str) -> bool {
+    let Some(first) = line.split_whitespace().next() else {
+        return false;
+    };
+    if first.chars().filter(|c| *c == '.').count() < 3 {
+        return false;
+    }
+    first.chars().all(|c| c.is_ascii_digit() || c == '.') && !first.is_empty()
+}
+
+fn parse_llama_server_log_line(line: &str) -> LogEntry {
+    let mut parts = line.split_whitespace();
+    let uptime = parts.next().unwrap_or("").to_string();
+    let lev = parts.next().unwrap_or("I");
+    let level = match lev {
+        "E" => "ERROR",
+        "W" => "WARN",
+        "D" => "DEBUG",
+        _ => "INFO",
+    }
+    .to_string();
+    let message = parts.collect::<Vec<_>>().join(" ");
+    LogEntry {
+        timestamp: uptime,
+        level,
+        target: "llama-server".to_string(),
+        message,
+    }
 }
 
 /// Check if a line looks like a tracing log line. Tracing `fmt` output
