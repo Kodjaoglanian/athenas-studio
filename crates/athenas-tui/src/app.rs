@@ -168,6 +168,13 @@ pub struct TuiApp {
     api_key_modal: crate::api_key_modal::ApiKeyModalState,
     // Global Help modal
     help_open: bool,
+    // Automatic update detection & Update modal
+    update_available: Option<athenas_core::UpdateInfo>,
+    update_check_task: Option<tokio::task::JoinHandle<Option<athenas_core::UpdateInfo>>>,
+    update_modal_open: bool,
+    update_checking: bool,
+    update_status_msg: Option<String>,
+    update_pill_cols: Option<(u16, u16)>,
     // Periodic system memory refresh
     mem_refresh_task: Option<tokio::task::JoinHandle<(u64, u64)>>,
     last_mem_refresh: std::time::Instant,
@@ -209,7 +216,9 @@ impl TuiApp {
             Self::run_server_log_tailer(tailer_buffer, tailer_stop)
         });
 
-        Self {
+        let should_check_updates = config.check_updates;
+
+        let mut app = Self {
             config,
             hardware,
             chat_state: ChatState::default(),
@@ -243,12 +252,24 @@ impl TuiApp {
             chat_cancel: None,
             api_key_modal: crate::api_key_modal::ApiKeyModalState::new(),
             help_open: false,
+            update_available: None,
+            update_check_task: None,
+            update_modal_open: false,
+            update_checking: false,
+            update_status_msg: None,
+            update_pill_cols: None,
             mem_refresh_task: None,
             // Start stale so the first server-tab visit refreshes immediately
             last_mem_refresh: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
+        };
+
+        if should_check_updates {
+            app.spawn_update_check(false);
         }
+
+        app
     }
 
     /// Log a TUI event to the tracing system (appears in the logs page).
@@ -477,15 +498,117 @@ impl TuiApp {
         result
     }
 
-    fn is_modal_or_edit_active(&self) -> bool {
-        self.api_key_modal.open
-            || self.help_open
+    fn is_blocking_modal_active(&self) -> bool {
+        self.help_open
+            || self.update_modal_open
+            || self.api_key_modal.open
             || self.model_list_state.confirm_delete.is_some()
-            || (self.mode == AppMode::Settings && self.settings_state.editing)
+    }
+
+    fn is_inline_edit_active(&self) -> bool {
+        (self.mode == AppMode::Settings && self.settings_state.editing)
             || (self.mode == AppMode::Server && self.server_panel_state.editing)
+    }
+
+    fn is_text_input_active(&self) -> bool {
+        self.mode == AppMode::Chat
+            || (self.mode == AppMode::Browser && self.browser_state.phase == BrowserPhase::Search)
             || (self.mode == AppMode::ModelList && self.model_list_state.filtering)
             || (self.mode == AppMode::Logs && self.logs_state.searching)
-            || (self.mode == AppMode::Browser && self.browser_state.phase == BrowserPhase::Search)
+    }
+
+    fn spawn_update_check(&mut self, force: bool) {
+        if let Some(task) = self.update_check_task.take() {
+            task.abort();
+        }
+        self.update_checking = true;
+        if force {
+            self.update_status_msg = Some("Checking GitHub releases…".to_string());
+        }
+        self.update_check_task = Some(tokio::spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            if !force {
+                let cached = tokio::task::spawn_blocking(athenas_core::UpdateInfo::load_cache)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(info) = cached {
+                    if info.is_fresh(now) {
+                        return Some(info);
+                    }
+                }
+            }
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(6))
+                .user_agent("athenas-studio-tui")
+                .build()
+                .ok()?;
+            let url = format!(
+                "https://api.github.com/repos/{}/releases/latest",
+                athenas_core::GITHUB_REPO
+            );
+            let resp = client.get(&url).send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let json: serde_json::Value = resp.json().await.ok()?;
+            let tag = json.get("tag_name")?.as_str()?;
+            let latest_version = tag
+                .trim_start_matches('v')
+                .trim_start_matches('V')
+                .to_string();
+            let release_url = json
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    format!(
+                        "https://github.com/{}/releases/latest",
+                        athenas_core::GITHUB_REPO
+                    )
+                });
+            let release_notes = json
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty());
+            let info = athenas_core::UpdateInfo {
+                latest_version,
+                release_url,
+                release_notes,
+                checked_at: now,
+            };
+            let to_save = info.clone();
+            let _ = tokio::task::spawn_blocking(move || to_save.save_cache()).await;
+            Some(info)
+        }));
+    }
+
+    async fn poll_update_check(&mut self) {
+        let Some(task) = self.update_check_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.update_check_task = Some(task);
+            return;
+        }
+        self.update_checking = false;
+        match task.await {
+            Ok(Some(info)) => {
+                if info.is_newer_than(env!("CARGO_PKG_VERSION")) {
+                    self.update_status_msg =
+                        Some(format!("Update available: v{}", info.latest_version));
+                    self.update_available = Some(info);
+                } else {
+                    self.update_available = None;
+                    self.update_status_msg = Some("You're up to date!".to_string());
+                }
+            }
+            Ok(None) | Err(_) => {
+                self.update_status_msg =
+                    Some("Could not check for updates (offline or rate-limited)".to_string());
+            }
+        }
     }
 
     fn switch_to_mode(&mut self, mode: AppMode) {
@@ -600,6 +723,7 @@ impl TuiApp {
             self.poll_additional_model_loading().await;
             self.poll_server_start_task().await;
             self.poll_mem_refresh().await;
+            self.poll_update_check().await;
             self.poll_chat_stream().await;
 
             // Smooth 10fps spinner tick (100ms loop interval)
@@ -646,6 +770,22 @@ impl TuiApp {
                             continue;
                         }
 
+                        // Update modal intercepts keys when open
+                        if self.update_modal_open {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                                    self.update_modal_open = false;
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R')
+                                    if !self.update_checking =>
+                                {
+                                    self.spawn_update_check(true);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         // API key modal intercepts all keys when open
                         if self.api_key_modal.open {
                             self.handle_api_key_modal_key(key).await;
@@ -660,11 +800,14 @@ impl TuiApp {
                             continue;
                         }
 
-                        let modal_or_edit = self.is_modal_or_edit_active();
+                        let blocking = self.is_blocking_modal_active();
+                        let inline_edit = self.is_inline_edit_active();
+                        let text_input = self.is_text_input_active();
 
-                        // Global F1-F6 & Alt+1..Alt+6 tab switching (blocked during modals/edits)
-                        if !modal_or_edit {
-                            let target_tab = match key.code {
+                        // Global main tab navigation (works everywhere when not in a blocking modal or inline edit)
+                        if !blocking && !inline_edit {
+                            // Direct tab switches: F1–F6, Alt+1..6 (work even in Chat & Browser Search)
+                            let direct_tab = match key.code {
                                 KeyCode::F(1) => Some(0),
                                 KeyCode::F(2) => Some(1),
                                 KeyCode::F(3) => Some(2),
@@ -677,34 +820,71 @@ impl TuiApp {
                                     Some((c as u8 - b'1') as usize)
                                 }
                                 KeyCode::Char(c @ '1'..='6')
-                                    if self.mode != AppMode::Chat && key.modifiers.is_empty() =>
+                                    if !text_input && key.modifiers.is_empty() =>
                                 {
                                     Some((c as u8 - b'1') as usize)
                                 }
                                 _ => None,
                             };
 
-                            if let Some(tab) = target_tab {
+                            if let Some(tab) = direct_tab {
                                 self.switch_to_mode(AppMode::from_tab_index(tab));
                                 continue;
                             }
 
-                            // '?' opens Help modal (when not in Chat text input)
-                            if key.code == KeyCode::Char('?') && self.mode != AppMode::Chat {
-                                self.help_open = true;
-                                continue;
-                            }
-
-                            // Tab / Shift+Tab global tab cycling (skip Chat where Tab toggles thinking)
-                            if self.mode != AppMode::Chat {
-                                if key.code == KeyCode::Tab {
+                            // Alt+Left / Alt+Right: cycle main tabs from ANY screen
+                            if key.modifiers.contains(KeyModifiers::ALT) {
+                                if key.code == KeyCode::Left {
+                                    let prev = (self.mode.tab_index() + 5) % 6;
+                                    self.switch_to_mode(AppMode::from_tab_index(prev));
+                                    continue;
+                                }
+                                if key.code == KeyCode::Right {
                                     let next = (self.mode.tab_index() + 1) % 6;
                                     self.switch_to_mode(AppMode::from_tab_index(next));
                                     continue;
                                 }
-                                if key.code == KeyCode::BackTab {
-                                    let prev = (self.mode.tab_index() + 5) % 6;
-                                    self.switch_to_mode(AppMode::from_tab_index(prev));
+                            }
+
+                            // Tab / Shift+Tab main tab cycling
+                            if key.code == KeyCode::BackTab {
+                                let prev = (self.mode.tab_index() + 5) % 6;
+                                self.switch_to_mode(AppMode::from_tab_index(prev));
+                                continue;
+                            }
+                            if key.code == KeyCode::Tab {
+                                if self.mode == AppMode::Chat {
+                                    // In Chat: toggle Thinking block if any assistant message has reasoning,
+                                    // otherwise cycle to next main tab.
+                                    if let Some(msg) =
+                                        self.chat_state.messages.iter_mut().rev().find(|m| {
+                                            m.role == "assistant" && !m.reasoning.is_empty()
+                                        })
+                                    {
+                                        msg.reasoning_expanded = !msg.reasoning_expanded;
+                                    } else {
+                                        let next = (self.mode.tab_index() + 1) % 6;
+                                        self.switch_to_mode(AppMode::from_tab_index(next));
+                                    }
+                                    continue;
+                                } else {
+                                    let next = (self.mode.tab_index() + 1) % 6;
+                                    self.switch_to_mode(AppMode::from_tab_index(next));
+                                    continue;
+                                }
+                            }
+
+                            // Non-text-input single-key global shortcuts
+                            if !text_input {
+                                if key.code == KeyCode::Char('?') {
+                                    self.help_open = true;
+                                    continue;
+                                }
+                                if key.code == KeyCode::Char('U')
+                                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !key.modifiers.contains(KeyModifiers::ALT)
+                                {
+                                    self.update_modal_open = true;
                                     continue;
                                 }
                             }
@@ -728,7 +908,7 @@ impl TuiApp {
     }
 
     fn handle_paste(&mut self, text: &str) {
-        if self.help_open || self.api_key_modal.open {
+        if self.is_blocking_modal_active() {
             return;
         }
         match self.mode {
@@ -768,13 +948,19 @@ impl TuiApp {
     }
 
     fn handle_mouse(&mut self, mouse: event::MouseEvent) {
-        if self.help_open || self.api_key_modal.open {
+        if self.is_blocking_modal_active() {
             return;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                // Click on top header row (row 0) switches tabs
-                if mouse.row == 0 && !self.is_modal_or_edit_active() {
+                // Click on top header row (row 0) switches tabs or opens Update modal
+                if mouse.row == 0 && !self.is_inline_edit_active() {
+                    if let Some((start, end)) = self.update_pill_cols {
+                        if mouse.column >= start && mouse.column < end {
+                            self.update_modal_open = true;
+                            return;
+                        }
+                    }
                     if let Some(tab) = components::header_tab_at_col(mouse.column) {
                         self.switch_to_mode(AppMode::from_tab_index(tab));
                         return;
@@ -840,8 +1026,12 @@ impl TuiApp {
                 },
             ),
             active_model: self.chat_state.current_model.as_deref(),
+            update_version: self
+                .update_available
+                .as_ref()
+                .map(|u| u.latest_version.as_str()),
         };
-        components::render_header_bar(f, chunks[0], &header);
+        self.update_pill_cols = components::render_header_bar(f, chunks[0], &header);
 
         let content = chunks[1];
         match self.mode {
@@ -902,6 +1092,15 @@ impl TuiApp {
         if self.api_key_modal.open {
             crate::api_key_modal::render_api_key_modal(f, &self.api_key_modal);
         }
+        if self.update_modal_open {
+            components::render_update_modal(
+                f,
+                env!("CARGO_PKG_VERSION"),
+                self.update_available.as_ref(),
+                self.update_checking,
+                self.update_status_msg.as_deref(),
+            );
+        }
         if self.help_open {
             components::render_help_modal(f, self.mode.tab_index());
         }
@@ -935,18 +1134,6 @@ impl TuiApp {
                 if let Some(next) = self.chat_state.history_next() {
                     self.chat_input = new_chat_input();
                     self.chat_input.insert_str(&next);
-                }
-            }
-            // Tab toggles reasoning/thinking expansion on last assistant message
-            KeyCode::Tab => {
-                if let Some(msg) = self
-                    .chat_state
-                    .messages
-                    .iter_mut()
-                    .rev()
-                    .find(|m| m.role == "assistant" && !m.reasoning.is_empty())
-                {
-                    msg.reasoning_expanded = !msg.reasoning_expanded;
                 }
             }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1160,8 +1347,34 @@ impl TuiApp {
                     self.settings_state.previous();
                     self.settings_state.clear_status();
                 }
+                KeyCode::PageDown => {
+                    self.settings_state.jump_forward(5);
+                    self.settings_state.clear_status();
+                }
+                KeyCode::PageUp => {
+                    self.settings_state.jump_back(5);
+                    self.settings_state.clear_status();
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    let forward = key.code == KeyCode::Right;
+                    if let Some(summary) = self.settings_state.toggle_or_cycle_current_dir(forward)
+                    {
+                        self.sync_config_from_settings();
+                        match self.save_config_async(self.config.clone()).await {
+                            Ok(()) => {
+                                self.settings_state
+                                    .set_status(format!("{} — saved", summary));
+                                self.log(&summary);
+                            }
+                            Err(e) => {
+                                self.settings_state
+                                    .set_error(format!("Failed to save: {}", e));
+                            }
+                        }
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if let Some(summary) = self.settings_state.toggle_or_cycle_current() {
+                    if let Some(summary) = self.settings_state.toggle_or_cycle_current_dir(true) {
                         self.sync_config_from_settings();
                         match self.save_config_async(self.config.clone()).await {
                             Ok(()) => {
@@ -1286,12 +1499,19 @@ impl TuiApp {
                     }
                     self.browser_state.is_busy = false;
                     self.browser_state.busy_label = None;
-                    self.mode = AppMode::Chat;
+                    if !self.browser_state.search_input.is_empty() {
+                        self.browser_state.search_input.clear();
+                    } else {
+                        self.mode = AppMode::Chat;
+                    }
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.browser_state.search_input.clear();
                 }
-                KeyCode::Char(c) => {
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
                     self.browser_state.search_input.push(c);
                 }
                 _ => {}
@@ -1303,7 +1523,7 @@ impl TuiApp {
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.browser_state.prev_result();
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Right => {
                     if !self.browser_state.is_busy {
                         if let Some(result) = self.browser_state.selected_result() {
                             let repo_id = result.id.clone();
@@ -1354,7 +1574,7 @@ impl TuiApp {
                         self.start_download(&repo_id, &filename, sha256);
                     }
                 }
-                KeyCode::Esc => {
+                KeyCode::Left | KeyCode::Esc => {
                     self.browser_state.phase = BrowserPhase::Results;
                 }
                 _ => {}
@@ -2008,17 +2228,26 @@ impl TuiApp {
             "/logs" => {
                 self.mode = AppMode::Logs;
             }
+            "/update" => {
+                self.update_modal_open = true;
+                if self.update_available.is_none()
+                    && self.update_status_msg.is_none()
+                    && !self.update_checking
+                {
+                    self.spawn_update_check(false);
+                }
+            }
             "/help" => {
                 self.chat_state.add_message(
                     "system",
-                    "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /logs, /help, /quit\n\
+                    "Commands: /clear, /unload, /model, /models, /browser, /server, /settings, /logs, /update, /help, /quit\n\
                      /system <prompt> — set system prompt for the model\n\
                      /system — show current system prompt\n\
                      /system clear — remove system prompt\n\
                      Alt+Enter / Ctrl+J / Shift+Enter — insert newline\n\
                      Alt+↑ / Alt+↓ — recall prompt history\n\
-                     Tab — expand/collapse Thinking | Esc — cancel generation\n\
-                     F1–F6 or Alt+1–6: Switch tabs | Ctrl+C: Quit",
+                     Tab — toggle Thinking (or next tab) | Shift+Tab — prev tab | Esc — cancel generation\n\
+                     F1–F6, Alt+1–6, or Alt+←/→: Switch tabs | Ctrl+C: Quit",
                 );
             }
             "/system" => {
@@ -2304,12 +2533,20 @@ impl TuiApp {
         } else {
             let field = self.server_panel_state.current_field().clone();
             match key.code {
-                // Sub-tab switching with [ and ]
+                // Sub-tab switching ONLY with [ / ] or Ctrl+Left / Ctrl+Right
                 KeyCode::Char('[') => {
                     self.server_panel_state.prev_subtab();
                     self.server_panel_state.clear_status();
                 }
                 KeyCode::Char(']') => {
+                    self.server_panel_state.next_subtab();
+                    self.server_panel_state.clear_status();
+                }
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.server_panel_state.prev_subtab();
+                    self.server_panel_state.clear_status();
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.server_panel_state.next_subtab();
                     self.server_panel_state.clear_status();
                 }
@@ -2338,7 +2575,7 @@ impl TuiApp {
                         self.refresh_api_keys().await;
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.server_panel_state.next();
                     self.server_panel_state.clear_status();
                 }
@@ -2354,34 +2591,58 @@ impl TuiApp {
                     self.server_panel_state.jump_back(10);
                     self.server_panel_state.clear_status();
                 }
-                KeyCode::Left | KeyCode::Char('h') => match field {
-                    ConfigField::ModelSelection => {
-                        self.server_panel_state.select_model_prev();
+                // Left / Right NEVER switch sub-tabs — strictly cycle/toggle the focused field
+                KeyCode::Left | KeyCode::Right => {
+                    let forward = key.code == KeyCode::Right;
+                    match field {
+                        ConfigField::ModelSelection => {
+                            if forward {
+                                self.server_panel_state.select_model_next();
+                            } else {
+                                self.server_panel_state.select_model_prev();
+                            }
+                        }
+                        ConfigField::UnloadModel => {
+                            if forward {
+                                self.server_panel_state.unload_select_next();
+                            } else {
+                                self.server_panel_state.unload_select_prev();
+                            }
+                        }
+                        ConfigField::SetDefaultModel => {
+                            if forward {
+                                self.server_panel_state.default_select_next();
+                            } else {
+                                self.server_panel_state.default_select_prev();
+                            }
+                        }
+                        ConfigField::GpuRuntime => {
+                            let next = self.server_panel_state.cycle_gpu_runtime(forward);
+                            let config = self.sync_config_from_server_panel();
+                            if let Err(e) = self.save_config_async(config).await {
+                                self.server_panel_state
+                                    .set_error(format!("Failed to save config: {}", e));
+                            } else {
+                                self.server_panel_state
+                                    .set_status(format!("GPU runtime: {} — saved", next));
+                            }
+                        }
+                        f if f.is_toggle() => {
+                            self.server_panel_state.toggle();
+                            let config = self.sync_config_from_server_panel();
+                            if let Err(e) = self.save_config_async(config).await {
+                                self.server_panel_state
+                                    .set_error(format!("Failed to save config: {}", e));
+                            } else if self.server_panel_state.phase == ServerPhase::Running {
+                                self.server_panel_state
+                                    .set_status("Toggled — applies on next server start");
+                            } else {
+                                self.server_panel_state.set_status("Toggled — saved");
+                            }
+                        }
+                        _ => {}
                     }
-                    ConfigField::UnloadModel => {
-                        self.server_panel_state.unload_select_prev();
-                    }
-                    ConfigField::SetDefaultModel => {
-                        self.server_panel_state.default_select_prev();
-                    }
-                    _ => {
-                        self.server_panel_state.prev_subtab();
-                    }
-                },
-                KeyCode::Right => match field {
-                    ConfigField::ModelSelection => {
-                        self.server_panel_state.select_model_next();
-                    }
-                    ConfigField::UnloadModel => {
-                        self.server_panel_state.unload_select_next();
-                    }
-                    ConfigField::SetDefaultModel => {
-                        self.server_panel_state.default_select_next();
-                    }
-                    _ => {
-                        self.server_panel_state.next_subtab();
-                    }
-                },
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
@@ -2396,16 +2657,7 @@ impl TuiApp {
                             self.server_panel_state.set_status("Toggled — saved");
                         }
                     } else if field == ConfigField::GpuRuntime {
-                        use athenas_core::GpuRuntime;
-                        let next = match self.server_panel_state.gpu_runtime {
-                            GpuRuntime::Auto => GpuRuntime::Cuda,
-                            GpuRuntime::Cuda => GpuRuntime::Rocm,
-                            GpuRuntime::Rocm => GpuRuntime::Vulkan,
-                            GpuRuntime::Vulkan => GpuRuntime::Metal,
-                            GpuRuntime::Metal => GpuRuntime::Cpu,
-                            GpuRuntime::Cpu => GpuRuntime::Auto,
-                        };
-                        self.server_panel_state.gpu_runtime = next;
+                        let next = self.server_panel_state.cycle_gpu_runtime(true);
                         let config = self.sync_config_from_server_panel();
                         if let Err(e) = self.save_config_async(config).await {
                             self.server_panel_state

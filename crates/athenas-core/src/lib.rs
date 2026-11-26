@@ -2,6 +2,7 @@ pub mod config;
 pub mod errors;
 pub mod hardware;
 pub mod model_registry;
+pub mod update_check;
 
 pub use config::{
     AppConfig, BackendType, GpuRuntime, InferenceConfig, OtelConfig, SemanticCacheConfig,
@@ -17,3 +18,4 @@ pub use model_registry::{
     is_onnx_model_path, read_gguf_metadata, validate_gguf, GgufMetadata, ModelFormat, ModelInfo,
     ModelRegistry,
 };
+pub use update_check::{is_newer_version, UpdateInfo, GITHUB_REPO, UPDATE_CACHE_TTL_SECS};

@@ -263,6 +263,18 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if !is_tui {
+        if matches!(
+            command,
+            Commands::Serve { .. }
+                | Commands::Chat { .. }
+                | Commands::Models { .. }
+                | Commands::Hardware
+                | Commands::Config { .. }
+                | Commands::Backend { .. }
+        ) {
+            commands::update::print_cached_update_notice();
+        }
+
         match command {
             Commands::Chat {
                 model,

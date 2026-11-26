@@ -59,6 +59,18 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
         "logging.level" => {
             config.logging.level = value.to_string();
         }
+        "check_updates" => {
+            config.check_updates = match value {
+                "true" | "1" => true,
+                "false" | "0" => false,
+                _ => {
+                    return Err(athenas_core::AthenasError::InvalidInput(format!(
+                        "Invalid boolean for check_updates: {}. Use true or false",
+                        value
+                    )))
+                }
+            };
+        }
         _ => {
             return Err(athenas_core::AthenasError::InvalidInput(format!(
                 "Unknown config key: {}",

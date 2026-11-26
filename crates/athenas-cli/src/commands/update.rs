@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use athenas_core::{AppConfig, UpdateInfo, GITHUB_REPO};
 use std::env;
 use std::process::Command;
 
-const REPO: &str = "Kodjaoglanian/athenas-studio";
 const INSTALL_URL: &str =
     "https://github.com/Kodjaoglanian/athenas-studio/releases/latest/download/install.sh";
 
@@ -42,7 +42,7 @@ pub async fn run() -> Result<()> {
     let latest_version = get_latest_version().await?;
     info(&format!("Latest version:  {}", latest_version));
 
-    if current_version == latest_version {
+    if !athenas_core::is_newer_version(&current_version, &latest_version) {
         println!();
         success("You're already up to date!");
         println!();
@@ -66,7 +66,7 @@ pub async fn run() -> Result<()> {
             println!();
             println!(
                 "  irm https://github.com/{}/releases/latest/download/install.ps1 | iex",
-                REPO
+                GITHUB_REPO
             );
             println!();
         }
@@ -75,7 +75,7 @@ pub async fn run() -> Result<()> {
                 "Unsupported platform: {}. Please download manually from:",
                 platform
             ));
-            println!("  https://github.com/{}/releases/latest", REPO);
+            println!("  https://github.com/{}/releases/latest", GITHUB_REPO);
         }
     }
 
@@ -170,17 +170,64 @@ fn get_current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
-async fn get_latest_version() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
+/// Print a non-intrusive 1-line update notice to stderr if a newer release is cached,
+/// and spawn a detached background refresh when the cache is missing or stale.
+pub fn print_cached_update_notice() {
+    let Ok(config) = AppConfig::load() else {
+        return;
+    };
+    if !config.check_updates {
+        return;
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let needs_refresh = match UpdateInfo::load_cache() {
+        Some(info) => {
+            let current = env!("CARGO_PKG_VERSION");
+            if info.is_newer_than(current) {
+                eprintln!("{}", format_update_notice(current, &info.latest_version));
+            }
+            !info.is_fresh(now)
+        }
+        None => true,
+    };
+
+    if needs_refresh {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async {
+                fetch_and_cache_latest().await;
+            });
+        }
+    }
+}
+
+fn format_update_notice(current: &str, latest: &str) -> String {
+    format!(
+        "  [update] New version available: v{} -> v{}  (run 'athenas update')",
+        current.trim_start_matches('v'),
+        latest.trim_start_matches('v')
+    )
+}
+
+async fn fetch_and_cache_latest() {
+    let _ = fetch_latest_release(4).await;
+}
+
+async fn fetch_latest_release(timeout_secs: u64) -> Result<UpdateInfo> {
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        GITHUB_REPO
+    );
     let client = reqwest::Client::builder()
         .user_agent("athenas-studio-updater")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()?;
 
     let resp: serde_json::Value = client
         .get(&url)
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await
         .context("Failed to fetch latest release info")?;
@@ -190,7 +237,32 @@ async fn get_latest_version() -> Result<String> {
         .and_then(|v| v.as_str())
         .context("No tag_name in release response")?;
 
-    Ok(tag.trim_start_matches('v').to_string())
+    let latest_version = tag.trim_start_matches('v').to_string();
+    let release_url = resp
+        .get("html_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("https://github.com/{}/releases/latest", GITHUB_REPO));
+    let release_notes = resp
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let info = UpdateInfo {
+        latest_version,
+        release_url,
+        release_notes,
+        checked_at: chrono::Utc::now().timestamp(),
+    };
+
+    let info_to_save = info.clone();
+    let _ = tokio::task::spawn_blocking(move || info_to_save.save_cache()).await;
+
+    Ok(info)
+}
+
+async fn get_latest_version() -> Result<String> {
+    Ok(fetch_latest_release(10).await?.latest_version)
 }
 
 async fn run_install_script() -> Result<()> {
@@ -210,4 +282,21 @@ async fn run_install_script() -> Result<()> {
     println!();
     success("Update complete! Run 'athenas --version' to verify.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_update_notice_strips_duplicate_v_prefix() {
+        assert_eq!(
+            format_update_notice("0.10.0", "0.10.1"),
+            "  [update] New version available: v0.10.0 -> v0.10.1  (run 'athenas update')"
+        );
+        assert_eq!(
+            format_update_notice("v0.10.0", "v0.10.1"),
+            "  [update] New version available: v0.10.0 -> v0.10.1  (run 'athenas update')"
+        );
+    }
 }

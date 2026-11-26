@@ -21,11 +21,16 @@ pub struct HeaderStatus<'a> {
     pub server_running: bool,
     pub server_port: Option<u16>,
     pub active_model: Option<&'a str>,
+    pub update_version: Option<&'a str>,
 }
 
 /// Render the sleek top studio header bar (1 row).
-/// Returns nothing; mouse hit-testing uses `header_tab_at_col(col)`.
-pub fn render_header_bar(f: &mut Frame, area: Rect, status: &HeaderStatus<'_>) {
+/// Returns the `[start_col, end_col)` of the update pill if rendered (for mouse click hit-testing).
+pub fn render_header_bar(
+    f: &mut Frame,
+    area: Rect,
+    status: &HeaderStatus<'_>,
+) -> Option<(u16, u16)> {
     let mut left_spans: Vec<Span> = vec![
         Span::styled(
             " ◆ ATHENAS ",
@@ -70,6 +75,22 @@ pub fn render_header_bar(f: &mut Frame, area: Rect, status: &HeaderStatus<'_>) {
 
     // Right-aligned live status pills
     let mut right_spans: Vec<Span> = Vec::new();
+    let mut update_pill_offset_in_right: Option<(usize, usize)> = None;
+    if let Some(ver) = status.update_version {
+        let pill_text = format!(" ↑ v{} ", ver);
+        let pill_w = pill_text.chars().count();
+        let start = right_spans.iter().map(|s| s.content.chars().count()).sum();
+        update_pill_offset_in_right = Some((start, start + pill_w));
+        right_spans.push(Span::styled(
+            pill_text,
+            Style::default()
+                .fg(theme::BG_HEADER)
+                .bg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ));
+        right_spans.push(Span::raw(" "));
+    }
+
     if let Some(model) = status.active_model {
         let short = short_model_name(model);
         let short_trunc: String = if short.chars().count() > 22 {
@@ -118,9 +139,34 @@ pub fn render_header_bar(f: &mut Frame, area: Rect, status: &HeaderStatus<'_>) {
     let total_w = area.width as usize;
 
     let mut all_spans = left_spans;
+    let mut update_pill_cols = None;
     if total_w > left_len + right_len {
-        all_spans.push(Span::raw(" ".repeat(total_w - left_len - right_len)));
+        let pad = total_w - left_len - right_len;
+        let right_start = area.x as usize + left_len + pad;
+        if let Some((off_start, off_end)) = update_pill_offset_in_right {
+            update_pill_cols = Some((
+                (right_start + off_start) as u16,
+                (right_start + off_end) as u16,
+            ));
+        }
+        all_spans.push(Span::raw(" ".repeat(pad)));
         all_spans.extend(right_spans);
+    } else if let Some(ver) = status.update_version {
+        let pill_text = format!(" ↑ v{} ", ver);
+        let pill_w = pill_text.chars().count();
+        if total_w > left_len + pill_w {
+            let pad = total_w - left_len - pill_w;
+            let start = (area.x as usize + left_len + pad) as u16;
+            update_pill_cols = Some((start, start + pill_w as u16));
+            all_spans.push(Span::raw(" ".repeat(pad)));
+            all_spans.push(Span::styled(
+                pill_text,
+                Style::default()
+                    .fg(theme::BG_HEADER)
+                    .bg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
     } else if total_w > left_len + 10 {
         // Fit at least the Help badge if narrow
         let help_only = " [?] Help ";
@@ -134,6 +180,7 @@ pub fn render_header_bar(f: &mut Frame, area: Rect, status: &HeaderStatus<'_>) {
 
     let p = Paragraph::new(Line::from(all_spans)).style(Style::default().bg(theme::BG_HEADER));
     f.render_widget(p, area);
+    update_pill_cols
 }
 
 /// Map a mouse click column on row 0 to a tab index (0..=5), or `None`.
@@ -162,8 +209,8 @@ pub fn header_tab_at_col(col: u16) -> Option<usize> {
 /// Centered Help Modal (`?`).
 pub fn render_help_modal(f: &mut Frame, active_tab: usize) {
     let area = f.area();
-    let modal_w = 68u16.min(area.width.saturating_sub(4).max(20));
-    let modal_h = 22u16.min(area.height.saturating_sub(2).max(12));
+    let modal_w = 72u16.min(area.width.saturating_sub(4).max(20));
+    let modal_h = 24u16.min(area.height.saturating_sub(2).max(12));
     let x = (area.width.saturating_sub(modal_w)) / 2;
     let y = (area.height.saturating_sub(modal_h)) / 2;
     let modal_area = Rect::new(x, y, modal_w, modal_h);
@@ -182,10 +229,11 @@ pub fn render_help_modal(f: &mut Frame, active_tab: usize) {
                 .fg(theme::WARNING)
                 .add_modifier(Modifier::BOLD),
         )),
-        help_row("F1–F6 / Alt+1–6", "Switch tabs directly"),
+        help_row("F1–F6 / Alt+1–6", "Switch tabs directly (works everywhere)"),
+        help_row("Alt+← / Alt+→", "Cycle tabs prev / next (works everywhere)"),
         help_row("1–6", "Switch tabs (when not typing)"),
         help_row("Tab / Shift+Tab", "Cycle tabs forward / backward"),
-        help_row("Mouse Click / Wheel", "Click tabs & scroll panes"),
+        help_row("U", "Open Update Checker (or /update in Chat)"),
         help_row("? / Esc", "Toggle / close help modal"),
         help_row("Ctrl+C", "Quit Athenas Studio"),
         Line::from(""),
@@ -199,7 +247,10 @@ pub fn render_help_modal(f: &mut Frame, active_tab: usize) {
                 ("Alt+Enter / Ctrl+J", "Insert newline (also Shift+Enter)"),
                 ("Alt+↑ / Alt+↓", "Recall prompt history"),
                 ("PgUp / PgDn / Wheel", "Scroll conversation"),
-                ("Tab", "Expand / collapse Thinking block"),
+                (
+                    "Tab / Shift+Tab",
+                    "Toggle Thinking (if present) / cycle tabs",
+                ),
                 ("Esc", "Cancel ongoing generation"),
             ],
         ),
@@ -216,29 +267,29 @@ pub fn render_help_modal(f: &mut Frame, active_tab: usize) {
         2 => (
             " Browser Tab (HuggingFace)",
             vec![
-                ("Enter", "Search / open repo files / download"),
-                ("Ctrl+G", "Toggle GGUF-only filter"),
-                ("/", "Edit search query"),
-                ("r", "Reset search"),
-                ("Esc", "Go back / cancel download"),
+                ("Enter / →", "Search / inspect repo files / download"),
+                ("← / Esc", "Back to results / clear search / Chat"),
+                ("Ctrl+G / Ctrl+U", "Toggle GGUF-only filter / clear query"),
+                ("/ / r", "Edit search query / reset search"),
+                ("Tab / Alt+←/→", "Switch tabs freely even in Search"),
             ],
         ),
         3 => (
             " Server Panel",
             vec![
-                ("[ / ]", "Switch config sub-tabs"),
-                ("s", "Quick Start / Stop server"),
-                ("l / u", "Load additional / Unload model"),
-                ("k", "Open API Key manager modal"),
-                ("←/→", "Cycle selected model"),
+                ("[ / ] or Ctrl+←/→", "Switch config sub-tabs"),
+                ("↑/↓ / PgUp/PgDn", "Navigate fields (±10 on PgUp/PgDn)"),
+                ("←/→", "Cycle model, GPU runtime, or toggle ON/OFF"),
                 ("Enter / Space", "Edit value / toggle ON-OFF / run action"),
+                ("s / l / u / k", "Start-Stop / Load / Unload / API Keys"),
             ],
         ),
         4 => (
             " Settings Tab",
             vec![
-                ("↑/↓ or j/k", "Navigate settings"),
-                ("Enter / Space", "Toggle boolean / cycle option / edit"),
+                ("↑/↓ or j/k", "Navigate settings (PgUp/PgDn ±5)"),
+                ("←/→", "Toggle boolean / cycle Backend, Device, GPU"),
+                ("Enter / Space", "Toggle / cycle / edit value"),
                 ("Esc", "Cancel edit / return to Chat"),
             ],
         ),
@@ -270,6 +321,161 @@ pub fn render_help_modal(f: &mut Frame, active_tab: usize) {
     lines.push(Line::from(""));
     let mut footer = Vec::new();
     footer.extend(theme::keycap("Esc / ?", "Close"));
+    lines.push(Line::from(footer).alignment(Alignment::Center));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+/// Centered Update Modal (`U`, `/update`, or clicking the header update pill).
+pub fn render_update_modal(
+    f: &mut Frame,
+    current_version: &str,
+    update_available: Option<&athenas_core::UpdateInfo>,
+    checking: bool,
+    status_msg: Option<&str>,
+) {
+    let area = f.area();
+    let modal_w = 72u16.min(area.width.saturating_sub(4).max(30));
+    let modal_h = 20u16.min(area.height.saturating_sub(2).max(12));
+    let x = (area.width.saturating_sub(modal_w)) / 2;
+    let y = (area.height.saturating_sub(modal_h)) / 2;
+    let modal_area = Rect::new(x, y, modal_w, modal_h);
+
+    f.render_widget(Clear, modal_area);
+
+    let accent = if update_available.is_some() {
+        theme::WARNING
+    } else {
+        theme::PRIMARY
+    };
+    let title = if update_available.is_some() {
+        " ↑ Athenas Studio Update Available "
+    } else {
+        " ◆ Athenas Studio Updates "
+    };
+    let block =
+        theme::rounded_block_colored(title, accent).style(Style::default().bg(theme::BG_SURFACE));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    let max_line_w = inner.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line<'static>> = vec![Line::from("")];
+
+    if checking {
+        lines.push(Line::from(vec![
+            Span::raw("  Current: "),
+            Span::styled(
+                format!("v{}", current_version),
+                Style::default()
+                    .fg(theme::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "   ◌ Checking GitHub releases…",
+                Style::default().fg(theme::WARNING),
+            ),
+        ]));
+    } else if let Some(info) = update_available {
+        lines.push(Line::from(vec![
+            Span::raw("  Version: "),
+            Span::styled(
+                format!("v{}", current_version),
+                Style::default().fg(theme::TEXT_DIM),
+            ),
+            Span::styled("  →  ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled(
+                format!("v{}", info.latest_version),
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  Release: "),
+            Span::styled(
+                info.release_url.clone(),
+                Style::default().fg(theme::PRIMARY),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        if let Some(ref notes) = info.release_notes {
+            lines.push(Line::from(Span::styled(
+                "  Release Notes:",
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for note_line in notes
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .take(6)
+            {
+                let truncated: String = if note_line.chars().count() > max_line_w {
+                    format!(
+                        "{}…",
+                        note_line
+                            .chars()
+                            .take(max_line_w.saturating_sub(1))
+                            .collect::<String>()
+                    )
+                } else {
+                    note_line.to_string()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", truncated),
+                    Style::default().fg(theme::TEXT_DIM),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(vec![
+            Span::raw("  Update command: "),
+            Span::styled(
+                " athenas update ",
+                Style::default()
+                    .fg(theme::BG_HEADER)
+                    .bg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  Current: "),
+            Span::styled(
+                format!("v{}", current_version),
+                Style::default()
+                    .fg(theme::PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("   ● ", Style::default().fg(theme::SUCCESS)),
+            Span::styled(
+                status_msg.unwrap_or("You're up to date!").to_string(),
+                Style::default()
+                    .fg(theme::SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  Update manually anytime with: "),
+            Span::styled(
+                " athenas update ",
+                Style::default()
+                    .fg(theme::PRIMARY)
+                    .bg(theme::BG_HIGHLIGHT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    let mut footer = Vec::new();
+    footer.extend(theme::keycap("r", "Check Now"));
+    footer.extend(theme::keycap("Esc", "Close"));
     lines.push(Line::from(footer).alignment(Alignment::Center));
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
@@ -927,9 +1133,10 @@ fn render_status_bar(f: &mut Frame, area: Rect, state: &ChatState) {
     let left_len: usize = parts.iter().map(|s| s.content.chars().count()).sum();
     let available = area.width as usize;
 
-    let shortcuts_full = "Enter: Send · Alt+Enter: Newline · Tab: Thinking · Esc: Stop · ?: Help ";
-    let shortcuts_mid = "Enter: Send · Alt+Enter: NL · Tab · Esc · ?: Help ";
-    let shortcuts_min = "Enter · Esc · ?: Help ";
+    let shortcuts_full =
+        "Enter: Send · Alt+Enter: Newline · Alt+←/→: Tabs · Tab: Think/Next · Esc: Stop ";
+    let shortcuts_mid = "Enter: Send · Alt+←/→: Tabs · Tab · Esc · /help ";
+    let shortcuts_min = "Enter · Esc · /help ";
 
     let remaining = available.saturating_sub(left_len + 2);
     let shortcuts = if remaining >= shortcuts_full.chars().count() {
@@ -1784,18 +1991,19 @@ pub fn render_model_browser(
             hints.extend(theme::keycap("Enter", "Search"));
             hints.extend(theme::keycap("Ctrl+G", "GGUF filter"));
             hints.extend(theme::keycap("Ctrl+U", "Clear"));
-            hints.extend(theme::keycap("Esc", "Back"));
+            hints.extend(theme::keycap("Tab/Alt+←/→", "Tabs"));
+            hints.extend(theme::keycap("Esc", "Clear/Back"));
         }
         BrowserPhase::Results => {
             hints.extend(theme::keycap("↑/↓", "Navigate"));
-            hints.extend(theme::keycap("Enter", "Inspect Files"));
+            hints.extend(theme::keycap("Enter/→", "Inspect Files"));
             hints.extend(theme::keycap("/", "Edit Query"));
             hints.extend(theme::keycap("r", "Reset"));
         }
         BrowserPhase::SelectFile => {
             hints.extend(theme::keycap("↑/↓", "Select"));
             hints.extend(theme::keycap("Enter", "Download"));
-            hints.extend(theme::keycap("Esc", "Back"));
+            hints.extend(theme::keycap("←/Esc", "Back"));
         }
         BrowserPhase::Downloading => {
             hints.extend(theme::keycap("Esc", "Cancel Download"));
@@ -2399,14 +2607,14 @@ fn render_server_status_bar(f: &mut Frame, area: Rect, state: &ServerPanelState)
     } else if state.phase == ServerPhase::Running {
         (
             format!(
-                " ● Running on {} │ [s] Stop · [l] Load · [u] Unload · [k] API Keys · [/] Sub-tab ",
+                " ● Running on {} │ [s] Stop · [l] Load · [u] Unload · [k] Keys · [/] or Ctrl+←/→ Sub-tab ",
                 state.server_url.as_deref().unwrap_or("?")
             ),
             theme::SUCCESS,
         )
     } else {
         (
-            " ↑/↓ Navigate │ Enter/Space Edit/Toggle │ ←/→ Model │ [s] Start │ [k] Keys │ [/] Sub-tab "
+            " ↑/↓ Nav │ ←/→ Cycle/Toggle │ Enter Edit │ [/] or Ctrl+←/→ Sub-tab │ [s] Start │ [k] Keys "
                 .to_string(),
             theme::TEXT_DIM,
         )
@@ -2429,7 +2637,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, state: &SettingsState) {
         .split(area);
 
     let block = theme::rounded_block(
-        " ◆ Settings — Enter/Space to toggle or edit ",
+        " ◆ Settings — ←/→ or Enter/Space to toggle/cycle · Enter to edit ",
         !state.editing,
     );
 
@@ -2612,7 +2820,7 @@ pub fn render_settings(f: &mut Frame, area: Rect, state: &SettingsState) {
         (msg.as_str(), color)
     } else {
         (
-            " ↑/↓ Navigate │ Enter/Space Toggle or Edit │ Esc Back to Chat │ ? Help ",
+            " ↑/↓ Nav · PgUp/PgDn ±5 │ ←/→ Toggle/Cycle │ Enter Edit │ Esc Chat │ ? Help ",
             theme::TEXT_DIM,
         )
     };

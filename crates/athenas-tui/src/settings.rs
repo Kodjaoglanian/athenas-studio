@@ -33,6 +33,7 @@ pub enum SettingsField {
     AutoResourceLimits,
     ServerHost,
     ServerPort,
+    CheckUpdates,
 }
 
 impl SettingsField {
@@ -59,6 +60,7 @@ impl SettingsField {
             SettingsField::AutoResourceLimits,
             SettingsField::ServerHost,
             SettingsField::ServerPort,
+            SettingsField::CheckUpdates,
         ]
     }
 
@@ -85,6 +87,7 @@ impl SettingsField {
             SettingsField::AutoResourceLimits => "Auto Resource Limits",
             SettingsField::ServerHost => "Server Host",
             SettingsField::ServerPort => "Server Port",
+            SettingsField::CheckUpdates => "Check Updates",
         }
     }
 
@@ -110,6 +113,7 @@ impl SettingsField {
             | SettingsField::CpuReserve
             | SettingsField::AutoResourceLimits => "Inference",
             SettingsField::ServerHost | SettingsField::ServerPort => "Server",
+            SettingsField::CheckUpdates => "General",
         }
     }
 
@@ -120,6 +124,7 @@ impl SettingsField {
                 | SettingsField::Streaming
                 | SettingsField::Reasoning
                 | SettingsField::AutoResourceLimits
+                | SettingsField::CheckUpdates
         )
     }
 
@@ -193,6 +198,18 @@ impl SettingsState {
         }
     }
 
+    pub fn jump_forward(&mut self, n: usize) {
+        if !self.editing && !self.fields.is_empty() {
+            self.selected = (self.selected + n).min(self.fields.len() - 1);
+        }
+    }
+
+    pub fn jump_back(&mut self, n: usize) {
+        if !self.editing {
+            self.selected = self.selected.saturating_sub(n);
+        }
+    }
+
     pub fn current_field(&self) -> &SettingsField {
         &self.fields[self.selected]
     }
@@ -220,8 +237,15 @@ impl SettingsState {
         self.edit_buffer.clear();
     }
 
-    /// Toggle a boolean field or cycle an enum field in-memory. Returns a human-readable summary.
+    /// Toggle a boolean field or cycle an enum field in-memory (forward).
+    /// Returns a human-readable summary.
     pub fn toggle_or_cycle_current(&mut self) -> Option<String> {
+        self.toggle_or_cycle_current_dir(true)
+    }
+
+    /// Toggle a boolean field or cycle an enum field in-memory in the given direction.
+    /// Returns a human-readable summary.
+    pub fn toggle_or_cycle_current_dir(&mut self, forward: bool) -> Option<String> {
         let field = self.current_field().clone();
         match field {
             SettingsField::FlashAttention => {
@@ -269,6 +293,17 @@ impl SettingsState {
                     }
                 ))
             }
+            SettingsField::CheckUpdates => {
+                self.config.check_updates = !self.config.check_updates;
+                Some(format!(
+                    "Check Updates: {}",
+                    if self.config.check_updates {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                ))
+            }
             SettingsField::Device => {
                 let current = self.config.inference.default_gpu_layers;
                 let new_val = if current == 0 { -1 } else { 0 };
@@ -277,23 +312,43 @@ impl SettingsState {
                 Some(format!("Device: {}", device))
             }
             SettingsField::Backend => {
-                let next = match self.config.inference.default_backend {
-                    BackendType::Auto => BackendType::LlamaCpp,
-                    BackendType::LlamaCpp => BackendType::Vllm,
-                    BackendType::Vllm => BackendType::Onnx,
-                    BackendType::Onnx => BackendType::Auto,
+                let next = if forward {
+                    match self.config.inference.default_backend {
+                        BackendType::Auto => BackendType::LlamaCpp,
+                        BackendType::LlamaCpp => BackendType::Vllm,
+                        BackendType::Vllm => BackendType::Onnx,
+                        BackendType::Onnx => BackendType::Auto,
+                    }
+                } else {
+                    match self.config.inference.default_backend {
+                        BackendType::Auto => BackendType::Onnx,
+                        BackendType::Onnx => BackendType::Vllm,
+                        BackendType::Vllm => BackendType::LlamaCpp,
+                        BackendType::LlamaCpp => BackendType::Auto,
+                    }
                 };
                 self.config.inference.default_backend = next;
                 Some(format!("Backend: {}", next))
             }
             SettingsField::GpuRuntime => {
-                let next = match self.config.inference.gpu_runtime {
-                    GpuRuntime::Auto => GpuRuntime::Cuda,
-                    GpuRuntime::Cuda => GpuRuntime::Rocm,
-                    GpuRuntime::Rocm => GpuRuntime::Vulkan,
-                    GpuRuntime::Vulkan => GpuRuntime::Metal,
-                    GpuRuntime::Metal => GpuRuntime::Cpu,
-                    GpuRuntime::Cpu => GpuRuntime::Auto,
+                let next = if forward {
+                    match self.config.inference.gpu_runtime {
+                        GpuRuntime::Auto => GpuRuntime::Cuda,
+                        GpuRuntime::Cuda => GpuRuntime::Rocm,
+                        GpuRuntime::Rocm => GpuRuntime::Vulkan,
+                        GpuRuntime::Vulkan => GpuRuntime::Metal,
+                        GpuRuntime::Metal => GpuRuntime::Cpu,
+                        GpuRuntime::Cpu => GpuRuntime::Auto,
+                    }
+                } else {
+                    match self.config.inference.gpu_runtime {
+                        GpuRuntime::Auto => GpuRuntime::Cpu,
+                        GpuRuntime::Cpu => GpuRuntime::Metal,
+                        GpuRuntime::Metal => GpuRuntime::Vulkan,
+                        GpuRuntime::Vulkan => GpuRuntime::Rocm,
+                        GpuRuntime::Rocm => GpuRuntime::Cuda,
+                        GpuRuntime::Cuda => GpuRuntime::Auto,
+                    }
                 };
                 self.config.inference.gpu_runtime = next;
                 Some(format!("GPU Runtime: {}", next))
@@ -452,6 +507,11 @@ impl SettingsState {
                 }
                 self.config.server.default_port = port;
             }
+            SettingsField::CheckUpdates => {
+                self.config.check_updates = value.eq_ignore_ascii_case("true")
+                    || value == "1"
+                    || value.eq_ignore_ascii_case("on");
+            }
         }
 
         self.editing = false;
@@ -512,6 +572,7 @@ impl SettingsState {
             SettingsField::AutoResourceLimits => on_off(self.config.inference.auto_resource_limits),
             SettingsField::ServerHost => self.config.server.default_host.clone(),
             SettingsField::ServerPort => self.config.server.default_port.to_string(),
+            SettingsField::CheckUpdates => on_off(self.config.check_updates),
         }
     }
 
@@ -520,10 +581,10 @@ impl SettingsState {
             SettingsField::HfToken => {
                 "Get token at huggingface.co/settings/tokens (leave empty to clear)"
             }
-            SettingsField::Backend => "Enter/Space to cycle: auto | llama.cpp | vllm | onnx",
-            SettingsField::Device => "Enter/Space to toggle: CPU | GPU",
+            SettingsField::Backend => "←/→ or Enter/Space to cycle: auto | llama.cpp | vllm | onnx",
+            SettingsField::Device => "←/→ or Enter/Space to toggle: CPU | GPU",
             SettingsField::GpuRuntime => {
-                "Enter/Space to cycle: auto | cuda | rocm | vulkan | metal | cpu"
+                "←/→ or Enter/Space to cycle: auto | cuda | rocm | vulkan | metal | cpu"
             }
             SettingsField::GpuDevice => "GPU index (0, 1, 2, ...) or leave empty for auto",
             SettingsField::GpuLayers => "-1 = all GPU, 0 = CPU only, N = N layers",
@@ -533,17 +594,20 @@ impl SettingsState {
             SettingsField::Temperature => "0.0 - 2.0",
             SettingsField::TopP => "0.0 - 1.0 (nucleus sampling)",
             SettingsField::MaxTokens => "Minimum 1 (e.g. 2048)",
-            SettingsField::FlashAttention => "Enter/Space to toggle ON/OFF",
-            SettingsField::Streaming => "Enter/Space to toggle ON/OFF",
+            SettingsField::FlashAttention => "←/→ or Enter/Space to toggle ON/OFF",
+            SettingsField::Streaming => "←/→ or Enter/Space to toggle ON/OFF",
             SettingsField::Reasoning => {
-                "Enter/Space to toggle ON/OFF (disable for Qwen3.5 if slow)"
+                "←/→ or Enter/Space to toggle ON/OFF (disable for Qwen3.5 if slow)"
             }
             SettingsField::ReasoningBudget => "-1 = unlimited, 0 = off, N = token limit",
             SettingsField::RamReserve => "MB reserved for OS (e.g. 2048)",
             SettingsField::CpuReserve => "Cores to leave free (e.g. 1)",
-            SettingsField::AutoResourceLimits => "Enter/Space to toggle ON/OFF",
+            SettingsField::AutoResourceLimits => "←/→ or Enter/Space to toggle ON/OFF",
             SettingsField::ServerHost => "e.g. 127.0.0.1 or 0.0.0.0",
             SettingsField::ServerPort => "Valid TCP port 1 - 65535 (e.g. 8080)",
+            SettingsField::CheckUpdates => {
+                "←/→ or Enter/Space to toggle automatic startup update checks"
+            }
         }
     }
 }
@@ -619,5 +683,48 @@ mod tests {
         assert!(state.apply_edit().is_err());
         state.edit_buffer = "8080".to_string();
         assert!(state.apply_edit().is_ok());
+    }
+
+    #[test]
+    fn settings_check_updates_toggle_and_directional_cycling() {
+        let mut state = SettingsState::new(AppConfig::default());
+
+        // CheckUpdates toggle
+        select_field(&mut state, SettingsField::CheckUpdates);
+        let initial = state.config.check_updates;
+        assert!(state.toggle_or_cycle_current_dir(true).is_some());
+        assert_eq!(state.config.check_updates, !initial);
+        assert!(state.toggle_or_cycle_current_dir(false).is_some());
+        assert_eq!(state.config.check_updates, initial);
+
+        // Backend forward & backward cycling
+        select_field(&mut state, SettingsField::Backend);
+        state.config.inference.default_backend = BackendType::Auto;
+        state.toggle_or_cycle_current_dir(true);
+        assert_eq!(
+            state.config.inference.default_backend,
+            BackendType::LlamaCpp
+        );
+        state.toggle_or_cycle_current_dir(false);
+        assert_eq!(state.config.inference.default_backend, BackendType::Auto);
+        state.toggle_or_cycle_current_dir(false);
+        assert_eq!(state.config.inference.default_backend, BackendType::Onnx);
+
+        // GpuRuntime forward & backward cycling
+        select_field(&mut state, SettingsField::GpuRuntime);
+        state.config.inference.gpu_runtime = GpuRuntime::Auto;
+        state.toggle_or_cycle_current_dir(true);
+        assert_eq!(state.config.inference.gpu_runtime, GpuRuntime::Cuda);
+        state.toggle_or_cycle_current_dir(false);
+        assert_eq!(state.config.inference.gpu_runtime, GpuRuntime::Auto);
+        state.toggle_or_cycle_current_dir(false);
+        assert_eq!(state.config.inference.gpu_runtime, GpuRuntime::Cpu);
+
+        // PgUp/PgDn jumps
+        state.selected = 0;
+        state.jump_forward(5);
+        assert_eq!(state.selected, 5);
+        state.jump_back(5);
+        assert_eq!(state.selected, 0);
     }
 }

@@ -1012,7 +1012,7 @@ impl ServerPanelState {
 
     pub fn field_hint(&self, field: &ConfigField) -> &'static str {
         match field {
-            ConfigField::ModelSelection => "Up/Down to select from local models",
+            ConfigField::ModelSelection => "Left/Right to select from local models",
             ConfigField::Host => "0.0.0.0 for all interfaces, 127.0.0.1 for local",
             ConfigField::Port => "Port number (e.g. 8080)",
             ConfigField::MaxConcurrent => "Max simultaneous inference requests",
@@ -1353,6 +1353,31 @@ impl ServerPanelState {
             }
             _ => {}
         }
+    }
+
+    pub fn cycle_gpu_runtime(&mut self, forward: bool) -> athenas_core::GpuRuntime {
+        use athenas_core::GpuRuntime;
+        let next = if forward {
+            match self.gpu_runtime {
+                GpuRuntime::Auto => GpuRuntime::Cuda,
+                GpuRuntime::Cuda => GpuRuntime::Rocm,
+                GpuRuntime::Rocm => GpuRuntime::Vulkan,
+                GpuRuntime::Vulkan => GpuRuntime::Metal,
+                GpuRuntime::Metal => GpuRuntime::Cpu,
+                GpuRuntime::Cpu => GpuRuntime::Auto,
+            }
+        } else {
+            match self.gpu_runtime {
+                GpuRuntime::Auto => GpuRuntime::Cpu,
+                GpuRuntime::Cpu => GpuRuntime::Metal,
+                GpuRuntime::Metal => GpuRuntime::Vulkan,
+                GpuRuntime::Vulkan => GpuRuntime::Rocm,
+                GpuRuntime::Rocm => GpuRuntime::Cuda,
+                GpuRuntime::Cuda => GpuRuntime::Auto,
+            }
+        };
+        self.gpu_runtime = next;
+        next
     }
 
     pub fn select_model_next(&mut self) {
@@ -1843,5 +1868,17 @@ mod tests {
         let config = AppConfig::default();
         state.refresh_models(&config); // real dir scan → 0 or N models, index must be valid
         assert!(state.model_selected < state.models.len().max(1));
+    }
+
+    #[test]
+    fn cycle_gpu_runtime_forward_and_backward() {
+        use athenas_core::GpuRuntime;
+        let mut state = test_state();
+        state.gpu_runtime = GpuRuntime::Auto;
+        assert_eq!(state.cycle_gpu_runtime(true), GpuRuntime::Cuda);
+        assert_eq!(state.cycle_gpu_runtime(true), GpuRuntime::Rocm);
+        assert_eq!(state.cycle_gpu_runtime(false), GpuRuntime::Cuda);
+        assert_eq!(state.cycle_gpu_runtime(false), GpuRuntime::Auto);
+        assert_eq!(state.cycle_gpu_runtime(false), GpuRuntime::Cpu);
     }
 }

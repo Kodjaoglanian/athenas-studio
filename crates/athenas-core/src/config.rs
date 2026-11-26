@@ -11,6 +11,9 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub huggingface: HuggingFaceConfig,
     pub logging: LoggingConfig,
+    /// Automatically check GitHub Releases for newer versions on startup (24h cache).
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +430,7 @@ impl Default for AppConfig {
                 level: "info".to_string(),
                 file_logging: false,
             },
+            check_updates: true,
         }
     }
 }
