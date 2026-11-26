@@ -7,7 +7,7 @@ pub async fn run(
     backend_type: BackendType,
     temperature: f32,
     max_tokens: u32,
-    gpu_layers: i32,
+    gpu_layers: Option<i32>,
 ) -> Result<()> {
     let config = AppConfig::load()?;
     config.ensure_dirs()?;
@@ -18,9 +18,11 @@ pub async fn run(
 
     let mut backend = BackendFactory::create_for_model(backend_type, &hardware, &model_path)?;
 
+    let effective_gpu_layers = gpu_layers.unwrap_or(config.inference.default_gpu_layers);
+
     let load_config = ModelLoadConfig {
         model_path,
-        gpu_layers,
+        gpu_layers: effective_gpu_layers,
         gpu_runtime: config.inference.gpu_runtime,
         gpu_device: config.inference.gpu_device,
         context_size: config.inference.default_context_size,

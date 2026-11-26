@@ -81,6 +81,45 @@ pub struct ApiKeyInfo {
     pub rate_limit_remaining: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSubTab {
+    General,
+    Inference,
+    Advanced,
+    RagCache,
+    OtelSecurity,
+}
+
+impl ServerSubTab {
+    pub const ALL: [ServerSubTab; 5] = [
+        ServerSubTab::General,
+        ServerSubTab::Inference,
+        ServerSubTab::Advanced,
+        ServerSubTab::RagCache,
+        ServerSubTab::OtelSecurity,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ServerSubTab::General => "General",
+            ServerSubTab::Inference => "Inference",
+            ServerSubTab::Advanced => "Advanced",
+            ServerSubTab::RagCache => "RAG & Cache",
+            ServerSubTab::OtelSecurity => "OTEL & Security",
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        match self {
+            ServerSubTab::General => 0,
+            ServerSubTab::Inference => 1,
+            ServerSubTab::Advanced => 2,
+            ServerSubTab::RagCache => 3,
+            ServerSubTab::OtelSecurity => 4,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConfigField {
     // Model selection
@@ -352,6 +391,61 @@ impl ConfigField {
                 | ConfigField::ManageApiKeys
         )
     }
+
+    pub fn subtab(&self) -> ServerSubTab {
+        match self {
+            ConfigField::ModelSelection
+            | ConfigField::Host
+            | ConfigField::Port
+            | ConfigField::MaxConcurrent
+            | ConfigField::RateLimit
+            | ConfigField::TimeoutSecs
+            | ConfigField::MaxBodySize
+            | ConfigField::CorsEnabled
+            | ConfigField::MetricsEnabled
+            | ConfigField::CompressionEnabled
+            | ConfigField::QueueVisibility
+            | ConfigField::StartServer
+            | ConfigField::StopServer
+            | ConfigField::LoadAdditionalModel
+            | ConfigField::UnloadModel
+            | ConfigField::SetDefaultModel
+            | ConfigField::ManageApiKeys => ServerSubTab::General,
+            ConfigField::Backend
+            | ConfigField::GpuRuntime
+            | ConfigField::GpuDevice
+            | ConfigField::GpuLayers
+            | ConfigField::ContextSize
+            | ConfigField::BatchSize
+            | ConfigField::Threads
+            | ConfigField::FlashAttention
+            | ConfigField::MaxTokens
+            | ConfigField::Temperature
+            | ConfigField::TopP
+            | ConfigField::Reasoning
+            | ConfigField::ReasoningBudget => ServerSubTab::Inference,
+            ConfigField::RamReserve
+            | ConfigField::CpuReserve
+            | ConfigField::AutoResourceLimits
+            | ConfigField::ParallelSlots
+            | ConfigField::LoraPaths
+            | ConfigField::DraftModel
+            | ConfigField::DraftMaxTokens
+            | ConfigField::DraftMinCtx => ServerSubTab::Advanced,
+            ConfigField::VectorStoreEnabled
+            | ConfigField::VectorStoreMaxDocs
+            | ConfigField::VectorStoreTopK => ServerSubTab::RagCache,
+            ConfigField::OtelEnabled
+            | ConfigField::OtelEndpoint
+            | ConfigField::OtelServiceName
+            | ConfigField::OtelSampleRatio
+            | ConfigField::OtelExportLogs
+            | ConfigField::OtelExportMetrics
+            | ConfigField::OtelEnvironment
+            | ConfigField::IpAllowlist
+            | ConfigField::IpDenylist => ServerSubTab::OtelSecurity,
+        }
+    }
 }
 
 /// Which field of the "Create API Key" form is being edited.
@@ -392,6 +486,7 @@ pub struct LoadEstimate {
 
 pub struct ServerPanelState {
     pub fields: Vec<ConfigField>,
+    pub active_subtab: ServerSubTab,
     pub selected: usize,
     pub editing: bool,
     pub edit_buffer: String,
@@ -499,6 +594,7 @@ impl ServerPanelState {
 
         Self {
             fields: ConfigField::all(),
+            active_subtab: ServerSubTab::General,
             selected: 0,
             editing: false,
             edit_buffer: String::new(),
@@ -600,34 +696,153 @@ impl ServerPanelState {
         self.status_is_error = false;
     }
 
-    pub fn next(&mut self) {
-        if !self.editing {
-            self.selected = (self.selected + 1) % self.fields.len();
+    pub fn set_models(&mut self, models: Vec<RegistryModelInfo>) {
+        self.models = models;
+        if self.models.is_empty() {
+            self.model_selected = 0;
+        } else if self.model_selected >= self.models.len() {
+            self.model_selected = self.models.len() - 1;
         }
+    }
+
+    /// Sync shared config fields from `AppConfig` (e.g. after edits in Settings tab).
+    pub fn sync_from_config(&mut self, config: &AppConfig) {
+        self.host = config.server.default_host.clone();
+        self.port = config.server.default_port;
+        self.max_concurrent = config.server.max_concurrent_requests;
+        self.rate_limit = config.server.rate_limit_per_second;
+        self.timeout_secs = config.server.request_timeout_secs;
+        self.max_body_size = config.server.max_body_size_mb;
+        self.cors_enabled = config.server.cors_enabled;
+        self.metrics_enabled = config.server.enable_metrics;
+        self.compression_enabled = config.server.enable_compression;
+        self.queue_visibility = config.server.queue_visibility;
+        self.backend = config.inference.default_backend;
+        self.gpu_layers = config.inference.default_gpu_layers;
+        self.gpu_runtime = config.inference.gpu_runtime;
+        self.gpu_device = config.inference.gpu_device;
+        self.context_size = config.inference.default_context_size;
+        self.batch_size = config.inference.default_batch_size;
+        self.threads = config.inference.default_threads;
+        self.flash_attention = config.inference.flash_attention;
+        self.max_tokens = config.inference.default_max_tokens;
+        self.temperature = config.inference.default_temperature;
+        self.top_p = config.inference.default_top_p;
+        self.reasoning_enabled = config.inference.reasoning_enabled;
+        self.reasoning_budget = config.inference.reasoning_budget;
+        self.ram_reserve_mb = config.inference.ram_reserve_mb;
+        self.cpu_reserve_cores = config.inference.cpu_reserve_cores;
+        self.auto_resource_limits = config.inference.auto_resource_limits;
+        self.auto_install_deps = config.inference.auto_install_deps;
+        self.parallel_slots = config.inference.parallel_slots;
+        self.lora_paths = config.inference.lora_paths.join(", ");
+        self.draft_model = config.inference.draft_model.clone().unwrap_or_default();
+        self.draft_max_tokens = config.inference.draft_max_tokens;
+        self.draft_min_ctx = config.inference.draft_min_ctx;
+        self.vs_enabled = config.server.vector_store.enabled;
+        self.vs_max_documents = config.server.vector_store.max_documents;
+        self.vs_top_k = config.server.vector_store.default_top_k;
+        self.otel_enabled = config.server.otel.enabled;
+        self.otel_endpoint = config.server.otel.endpoint.clone().unwrap_or_default();
+        self.otel_service_name = config.server.otel.service_name.clone();
+        self.otel_sample_ratio = config.server.otel.sample_ratio;
+        self.otel_export_logs = config.server.otel.export_logs;
+        self.otel_export_metrics = config.server.otel.export_metrics;
+        self.otel_environment = config.server.otel.environment.clone().unwrap_or_default();
+        self.ip_allowlist = config.server.ip_allowlist.join(", ");
+        self.ip_denylist = config.server.ip_denylist.join(", ");
+    }
+
+    pub fn visible_field_indices(&self) -> Vec<usize> {
+        self.fields
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.subtab() == self.active_subtab)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn set_subtab(&mut self, tab: ServerSubTab) {
+        if self.editing {
+            return;
+        }
+        self.active_subtab = tab;
+        if let Some(&first) = self.visible_field_indices().first() {
+            self.selected = first;
+        }
+    }
+
+    pub fn next_subtab(&mut self) {
+        let idx = (self.active_subtab.index() + 1) % ServerSubTab::ALL.len();
+        self.set_subtab(ServerSubTab::ALL[idx]);
+    }
+
+    pub fn prev_subtab(&mut self) {
+        let len = ServerSubTab::ALL.len();
+        let idx = (self.active_subtab.index() + len - 1) % len;
+        self.set_subtab(ServerSubTab::ALL[idx]);
+    }
+
+    pub fn next(&mut self) {
+        if self.editing {
+            return;
+        }
+        let indices = self.visible_field_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let pos = indices
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        self.selected = indices[(pos + 1) % indices.len()];
     }
 
     pub fn previous(&mut self) {
-        if !self.editing {
-            if self.selected == 0 {
-                self.selected = self.fields.len() - 1;
-            } else {
-                self.selected -= 1;
-            }
+        if self.editing {
+            return;
         }
+        let indices = self.visible_field_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let pos = indices
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        self.selected = indices[(pos + indices.len() - 1) % indices.len()];
     }
 
-    /// Jump forward `n` fields (PageDown) — stops at the last field.
+    /// Jump forward `n` fields (PageDown) within the active subtab.
     pub fn jump_forward(&mut self, n: usize) {
-        if !self.editing {
-            self.selected = (self.selected + n).min(self.fields.len() - 1);
+        if self.editing {
+            return;
         }
+        let indices = self.visible_field_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let pos = indices
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        self.selected = indices[(pos + n).min(indices.len() - 1)];
     }
 
-    /// Jump backward `n` fields (PageUp) — stops at the first field.
+    /// Jump backward `n` fields (PageUp) within the active subtab.
     pub fn jump_back(&mut self, n: usize) {
-        if !self.editing {
-            self.selected = self.selected.saturating_sub(n);
+        if self.editing {
+            return;
         }
+        let indices = self.visible_field_indices();
+        if indices.is_empty() {
+            return;
+        }
+        let pos = indices
+            .iter()
+            .position(|&i| i == self.selected)
+            .unwrap_or(0);
+        self.selected = indices[pos.saturating_sub(n)];
     }
 
     pub fn current_field(&self) -> &ConfigField {

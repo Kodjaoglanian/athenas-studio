@@ -68,7 +68,16 @@ pub async fn set(key: &str, value: &str) -> Result<()> {
     }
 
     config.save()?;
-    println!("Set {} = {}", key, value);
+    if key == "huggingface.token" {
+        let display = if value.is_empty() {
+            "[cleared]"
+        } else {
+            "[set]"
+        };
+        println!("Set {} = {}", key, display);
+    } else {
+        println!("Set {} = {}", key, value);
+    }
     Ok(())
 }
 
@@ -89,21 +98,22 @@ pub async fn get(key: &str) -> Result<()> {
     let content = toml::to_string_pretty(&config)
         .map_err(|e| athenas_core::AthenasError::Config(e.to_string()))?;
 
-    // Simple key lookup in the TOML output
+    // Track current [section] header so section.key lookups match the right table
+    let mut current_section = String::new();
     for line in content.lines() {
-        if line.starts_with(&format!("{} = ", key)) {
-            println!("{}", line);
-            return Ok(());
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = trimmed[1..trimmed.len() - 1].trim().to_string();
+            continue;
         }
-    }
-
-    // Try nested
-    let parts: Vec<&str> = key.split('.').collect();
-    if parts.len() == 2 {
-        for line in content.lines() {
-            if line.starts_with(&format!("{} = ", parts[1])) {
-                // Check if we're in the right section
-                println!("{}", line);
+        if let Some((k, _)) = trimmed.split_once(" = ") {
+            let full_key = if current_section.is_empty() {
+                k.trim().to_string()
+            } else {
+                format!("{}.{}", current_section, k.trim())
+            };
+            if full_key == key {
+                println!("{}", trimmed);
                 return Ok(());
             }
         }

@@ -9,5 +9,6 @@ pub mod model_list;
 pub mod server_manager;
 pub mod server_panel;
 pub mod settings;
+pub mod theme;
 
 pub use app::TuiApp;

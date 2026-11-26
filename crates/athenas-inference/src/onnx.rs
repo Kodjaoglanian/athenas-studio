@@ -53,8 +53,7 @@ pub const GPU_OFFLOAD_CAPABLE: bool = cfg!(any(
     feature = "onnx-tensorrt",
     feature = "onnx-directml",
     feature = "onnx-coreml",
-    feature = "onnx-rocm",
-    feature = "onnx-openvino"
+    feature = "onnx-rocm"
 ));
 
 fn ort_env() {
@@ -408,7 +407,7 @@ fn take_logits(name: &str, outputs: &SessionOutputs<'_>) -> Result<Vec<f32>> {
         .map_err(|e| AthenasError::Backend(format!("cannot read logits: {e}")))?;
     let dims: Vec<i64> = shape.iter().copied().collect();
     let vocab = *dims.last().unwrap_or(&0) as usize;
-    if vocab == 0 || data.len() % vocab != 0 {
+    if vocab == 0 || data.is_empty() || data.len() % vocab != 0 {
         return Err(AthenasError::Backend(format!(
             "unexpected logits shape {dims:?}"
         )));
@@ -418,7 +417,7 @@ fn take_logits(name: &str, outputs: &SessionOutputs<'_>) -> Result<Vec<f32>> {
 
 impl OnnxSession {
     /// Full generation loop for a tokenized prompt. `on_text` is called with
-    /// decoded text deltas for streaming.
+    /// decoded text deltas for streaming and returns `false` to stop early.
     #[allow(clippy::too_many_arguments)]
     fn generate(
         &mut self,
@@ -428,7 +427,7 @@ impl OnnxSession {
         max_tokens: u32,
         seed: Option<u64>,
         stop: &[String],
-        mut on_text: impl FnMut(&str),
+        mut on_text: impl FnMut(&str) -> bool,
     ) -> Result<(String, InferenceStats)> {
         let enc = self
             .tokenizer
@@ -436,15 +435,19 @@ impl OnnxSession {
             .map_err(|e| AthenasError::Backend(format!("tokenize failed: {e}")))?;
         let ids: Vec<i64> = enc.get_ids().iter().map(|&t| t as i64).collect();
         let prompt_tokens = ids.len() as u32;
-        if prompt_tokens >= self.context_size {
+        if self.context_size > 0 && prompt_tokens >= self.context_size {
             return Err(AthenasError::Backend(format!(
                 "prompt ({} tokens) exceeds context size {}",
                 prompt_tokens, self.context_size
             )));
         }
-        let budget = max_tokens
-            .min(self.context_size.saturating_sub(prompt_tokens))
-            .max(1);
+        let budget = if self.context_size > 0 {
+            max_tokens
+                .min(self.context_size.saturating_sub(prompt_tokens))
+                .max(1)
+        } else {
+            max_tokens.max(1)
+        };
 
         let mut rng = match seed {
             Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -481,16 +484,25 @@ impl OnnxSession {
             // Decode cumulative and emit the delta (handles BPE merges).
             let gen_ids: Vec<u32> = generated.iter().map(|&t| t as u32).collect();
             let new_text = self.tokenizer.decode(&gen_ids, true).unwrap_or_default();
-            // Earliest stop string truncates the output.
+            // Earliest non-empty stop string truncates the output.
             let mut cut: Option<usize> = None;
             for s in stop {
+                if s.is_empty() {
+                    continue;
+                }
                 if let Some(p) = new_text.find(s.as_str()) {
                     cut = Some(cut.map_or(p, |q: usize| q.min(p)));
                 }
             }
             let emit_to = cut.unwrap_or(new_text.len());
-            if emit_to > text.len() {
-                on_text(&new_text[text.len()..emit_to]);
+            let common_bytes: usize = text
+                .chars()
+                .zip(new_text[..emit_to].chars())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a.len_utf8())
+                .sum();
+            if emit_to > common_bytes && !on_text(&new_text[common_bytes..emit_to]) {
+                finished = true;
             }
             if cut.is_some() {
                 finished = true;
@@ -913,13 +925,13 @@ impl OnnxBackend {
             eos_token,
             chat_template,
         };
-        *self.inner.lock().expect("onnx mutex poisoned") = Some(sess);
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some(sess);
         self.loaded.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     fn with_session<R>(&self, f: impl FnOnce(&mut OnnxSession) -> Result<R>) -> Result<R> {
-        let mut g = self.inner.lock().expect("onnx mutex poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let s = g
             .as_mut()
             .ok_or_else(|| AthenasError::Backend("no model loaded".into()))?;
@@ -946,8 +958,14 @@ impl Backend for OnnxBackend {
     }
 
     async fn unload_model(&mut self) -> Result<()> {
-        *self.inner.lock().expect("onnx mutex poisoned") = None;
-        self.loaded.store(false, Ordering::SeqCst);
+        let inner = Arc::clone(&self.inner);
+        let loaded = Arc::clone(&self.loaded);
+        tokio::task::spawn_blocking(move || {
+            *inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            loaded.store(false, Ordering::SeqCst);
+        })
+        .await
+        .map_err(|e| AthenasError::Backend(format!("unload task failed: {e}")))?;
         Ok(())
     }
 
@@ -968,7 +986,7 @@ impl Backend for OnnxBackend {
                     request.max_tokens.unwrap_or(2048),
                     request.seed,
                     request.stop.as_deref().unwrap_or(&[]),
-                    |_| {},
+                    |_| true,
                 )?;
                 Ok(ChatResponse {
                     model: request.model.clone(),
@@ -994,7 +1012,7 @@ impl Backend for OnnxBackend {
                 }
                 let prompt = render_chat_prompt(s, &request)?;
                 let tx2 = tx.clone();
-                let (text, stats) = s.generate(
+                let (_text, stats) = s.generate(
                     &prompt,
                     request.temperature.unwrap_or(0.7),
                     request.top_p.unwrap_or(0.9),
@@ -1002,16 +1020,17 @@ impl Backend for OnnxBackend {
                     request.seed,
                     request.stop.as_deref().unwrap_or(&[]),
                     |delta| {
-                        let _ = tx2.blocking_send(StreamChunk {
+                        tx2.blocking_send(StreamChunk {
                             text: delta.to_string(),
                             done: false,
                             stats: None,
                             is_reasoning: false,
-                        });
+                        })
+                        .is_ok()
                     },
                 )?;
                 let _ = tx.blocking_send(StreamChunk {
-                    text,
+                    text: String::new(),
                     done: true,
                     stats: Some(stats),
                     is_reasoning: false,
@@ -1049,7 +1068,7 @@ impl Backend for OnnxBackend {
                     request.max_tokens.unwrap_or(2048),
                     request.seed,
                     request.stop.as_deref().unwrap_or(&[]),
-                    |_| {},
+                    |_| true,
                 )?;
                 Ok(CompletionResponse {
                     model: request.model.clone(),
@@ -1076,7 +1095,7 @@ impl Backend for OnnxBackend {
                     ));
                 }
                 let tx2 = tx.clone();
-                let (text, stats) = s.generate(
+                let (_text, stats) = s.generate(
                     &request.prompt,
                     request.temperature.unwrap_or(0.7),
                     request.top_p.unwrap_or(0.9),
@@ -1084,16 +1103,17 @@ impl Backend for OnnxBackend {
                     request.seed,
                     request.stop.as_deref().unwrap_or(&[]),
                     |delta| {
-                        let _ = tx2.blocking_send(StreamChunk {
+                        tx2.blocking_send(StreamChunk {
                             text: delta.to_string(),
                             done: false,
                             stats: None,
                             is_reasoning: false,
-                        });
+                        })
+                        .is_ok()
                     },
                 )?;
                 let _ = tx.blocking_send(StreamChunk {
-                    text,
+                    text: String::new(),
                     done: true,
                     stats: Some(stats),
                     is_reasoning: false,
@@ -1153,9 +1173,10 @@ impl Backend for OnnxBackend {
                         .tokenizer
                         .decode(&ids, true)
                         .map_err(|e| AthenasError::Backend(format!("decode failed: {e}")))?;
+                    let count = ids.len();
                     Ok(TokenizeResponse {
                         tokens: ids,
-                        count: text.len(),
+                        count,
                         text: Some(text),
                     })
                 } else {

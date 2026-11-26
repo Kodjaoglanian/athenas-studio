@@ -142,19 +142,30 @@ pub fn init_tracing(config: &OtelConfig) -> OtelGuards {
 
     // --- Traces ---
     let tracer_provider = if let Some(endpoint) = &config.endpoint {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
+        match opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
             .build()
-            .expect("Failed to create OTLP trace exporter");
-
-        eprintln!("OpenTelemetry: trace exporter created for {}", endpoint);
-
-        SdkTracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-            .with_resource(resource.clone())
-            .with_sampler(sampler)
-            .build()
+        {
+            Ok(exporter) => {
+                eprintln!("OpenTelemetry: trace exporter created for {}", endpoint);
+                SdkTracerProvider::builder()
+                    .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+                    .with_resource(resource.clone())
+                    .with_sampler(sampler)
+                    .build()
+            }
+            Err(e) => {
+                eprintln!(
+                    "OpenTelemetry: failed to create OTLP trace exporter for {}: {} (falling back to local provider)",
+                    endpoint, e
+                );
+                SdkTracerProvider::builder()
+                    .with_resource(resource.clone())
+                    .with_sampler(sampler)
+                    .build()
+            }
+        }
     } else {
         eprintln!("OpenTelemetry: no endpoint configured — traces will not be exported");
         SdkTracerProvider::builder()
@@ -175,20 +186,29 @@ pub fn init_tracing(config: &OtelConfig) -> OtelGuards {
     // --- Logs ---
     let logger_provider = if config.export_logs {
         if let Some(endpoint) = &config.endpoint {
-            let log_exporter = opentelemetry_otlp::LogExporter::builder()
+            match opentelemetry_otlp::LogExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .build()
-                .expect("Failed to create OTLP log exporter");
+            {
+                Ok(log_exporter) => {
+                    eprintln!("OpenTelemetry: log exporter created for {}", endpoint);
 
-            eprintln!("OpenTelemetry: log exporter created for {}", endpoint);
+                    let provider = LoggerProvider::builder()
+                        .with_batch_exporter(log_exporter, opentelemetry_sdk::runtime::Tokio)
+                        .with_resource(resource.clone())
+                        .build();
 
-            let provider = LoggerProvider::builder()
-                .with_batch_exporter(log_exporter, opentelemetry_sdk::runtime::Tokio)
-                .with_resource(resource.clone())
-                .build();
-
-            Some(provider)
+                    Some(provider)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "OpenTelemetry: failed to create OTLP log exporter for {}: {} (disabling OTLP logs)",
+                        endpoint, e
+                    );
+                    None
+                }
+            }
         } else {
             None
         }
@@ -200,30 +220,39 @@ pub fn init_tracing(config: &OtelConfig) -> OtelGuards {
     // --- Metrics ---
     let meter_provider = if config.export_metrics {
         if let Some(endpoint) = &config.endpoint {
-            let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+            match opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
                 .with_endpoint(endpoint)
                 .build()
-                .expect("Failed to create OTLP metric exporter");
+            {
+                Ok(metric_exporter) => {
+                    eprintln!("OpenTelemetry: metric exporter created for {}", endpoint);
 
-            eprintln!("OpenTelemetry: metric exporter created for {}", endpoint);
+                    let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
+                        metric_exporter,
+                        opentelemetry_sdk::runtime::Tokio,
+                    )
+                    .with_interval(std::time::Duration::from_secs(10))
+                    .build();
 
-            let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(
-                metric_exporter,
-                opentelemetry_sdk::runtime::Tokio,
-            )
-            .with_interval(std::time::Duration::from_secs(10))
-            .build();
+                    let provider = SdkMeterProvider::builder()
+                        .with_reader(reader)
+                        .with_resource(resource.clone())
+                        .build();
 
-            let provider = SdkMeterProvider::builder()
-                .with_reader(reader)
-                .with_resource(resource.clone())
-                .build();
+                    // Register a global meter provider so all code can access it
+                    opentelemetry::global::set_meter_provider(provider.clone());
 
-            // Register a global meter provider so all code can access it
-            opentelemetry::global::set_meter_provider(provider.clone());
-
-            Some(provider)
+                    Some(provider)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "OpenTelemetry: failed to create OTLP metric exporter for {}: {} (disabling OTLP metrics)",
+                        endpoint, e
+                    );
+                    None
+                }
+            }
         } else {
             None
         }

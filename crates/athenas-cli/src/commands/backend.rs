@@ -265,7 +265,8 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
         return Ok(model.file_path.to_string_lossy().to_string());
     }
     let path = std::path::Path::new(model_id);
-    if path.exists() && path.is_file() {
+    // ONNX models are directories; GGUF files are regular files.
+    if path.exists() {
         return Ok(model_id.to_string());
     }
     Err(athenas_core::AthenasError::ModelNotFound(

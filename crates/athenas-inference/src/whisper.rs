@@ -1,9 +1,49 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 use athenas_core::{AthenasError, Result};
 
 use crate::types::{TranscriptionRequest, TranscriptionResponse, TranscriptionSegment};
+
+/// RAII guard that removes temporary files on drop (error, timeout, or early return).
+struct TempFileGuard(Vec<PathBuf>);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Sanitize the audio file extension to ASCII alphanumeric characters only.
+/// Falls back to `"wav"` if missing or invalid, preventing path traversal.
+fn sanitize_audio_extension(filename: &str) -> String {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let clean: String = ext
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(10)
+        .collect();
+    if clean.is_empty() {
+        "wav".to_string()
+    } else {
+        clean.to_ascii_lowercase()
+    }
+}
+
+/// Map requested response format to the whisper-cli flag and output file extension.
+fn whisper_format_flag_and_ext(format: &str) -> (&'static str, &'static str) {
+    match format {
+        "json" => ("-oj", "json"),
+        "srt" => ("-osrt", "srt"),
+        "vtt" => ("-ovtt", "vtt"),
+        _ => ("-otxt", "txt"),
+    }
+}
 
 /// Whisper backend — wraps the whisper-cli binary for audio transcription.
 ///
@@ -30,16 +70,26 @@ impl WhisperBackend {
         &self,
         request: &TranscriptionRequest,
     ) -> Result<TranscriptionResponse> {
-        // Write audio data to a temp file
+        // Write audio data to a unique temp file with a sanitized extension
         let tmp_dir = std::env::temp_dir();
-        let tmp_audio = tmp_dir.join(format!("athenas-whisper-{}", request.filename));
-        std::fs::write(&tmp_audio, &request.audio_data).map_err(|e| {
-            AthenasError::Backend(format!("Failed to write temp audio file: {}", e))
-        })?;
+        let unique_id = uuid::Uuid::new_v4();
+        let ext = sanitize_audio_extension(&request.filename);
+        let tmp_audio = tmp_dir.join(format!("athenas-whisper-{}.{}", unique_id, ext));
 
-        // Determine output format
+        // Determine output format flag and resulting file path
         let format = request.response_format.as_deref().unwrap_or("json");
-        let output_file = tmp_audio.with_extension(format!("{}.txt", format));
+        let (format_flag, out_ext) = whisper_format_flag_and_ext(format);
+        let output_prefix = tmp_dir.join(format!("athenas-whisper-{}-out", unique_id));
+        let output_file = PathBuf::from(format!("{}.{}", output_prefix.display(), out_ext));
+
+        // Ensure temp files are cleaned up on any return, error, or cancellation
+        let _cleanup = TempFileGuard(vec![tmp_audio.clone(), output_file.clone()]);
+
+        tokio::fs::write(&tmp_audio, &request.audio_data)
+            .await
+            .map_err(|e| {
+                AthenasError::Backend(format!("Failed to write temp audio file: {}", e))
+            })?;
 
         // Build whisper-cli command
         let mut cmd = tokio::process::Command::new(&self.cli_path);
@@ -47,12 +97,12 @@ impl WhisperBackend {
             .arg(&request.model)
             .arg("--file")
             .arg(&tmp_audio)
-            .arg("--output-file")
-            .arg(&output_file)
-            .arg("--output-format")
-            .arg(format)
+            .arg("-of")
+            .arg(&output_prefix)
+            .arg(format_flag)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
 
         // Language
         if let Some(ref lang) = request.language {
@@ -97,19 +147,16 @@ impl WhisperBackend {
             request.filename, request.model
         );
 
-        let output = cmd
-            .output()
+        let output = tokio::time::timeout(std::time::Duration::from_secs(600), cmd.output())
             .await
+            .map_err(|_| {
+                AthenasError::Backend("whisper-cli timed out after 600 seconds".to_string())
+            })?
             .map_err(|e| AthenasError::Backend(format!("Failed to run whisper-cli: {}", e)))?;
-
-        // Clean up temp audio file
-        let _ = std::fs::remove_file(&tmp_audio);
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Clean up output file if it exists
-            let _ = std::fs::remove_file(&output_file);
             return Err(AthenasError::Backend(format!(
                 "whisper-cli failed (exit code: {:?})\nstdout: {}\nstderr: {}",
                 output.status.code(),
@@ -118,12 +165,10 @@ impl WhisperBackend {
             )));
         }
 
-        // Read the output file
-        let output_content = std::fs::read_to_string(&output_file)
+        // Read the output file asynchronously
+        let output_content = tokio::fs::read_to_string(&output_file)
+            .await
             .map_err(|e| AthenasError::Backend(format!("Failed to read whisper output: {}", e)))?;
-
-        // Clean up output file
-        let _ = std::fs::remove_file(&output_file);
 
         // Parse output based on format
         let response = match format {
@@ -267,7 +312,8 @@ impl WhisperBackend {
     /// Parse SRT format subtitles.
     fn parse_srt(content: &str) -> Vec<TranscriptionSegment> {
         let mut segments = Vec::new();
-        let blocks: Vec<&str> = content.trim().split("\n\n").collect();
+        let normalized = content.replace("\r\n", "\n");
+        let blocks: Vec<&str> = normalized.trim().split("\n\n").collect();
 
         for (i, block) in blocks.iter().enumerate() {
             let lines: Vec<&str> = block.lines().collect();
@@ -456,5 +502,33 @@ mod tests {
         let resp = WhisperBackend::parse_subtitle_output(srt, "srt");
         assert_eq!(resp.text, "part one part two");
         assert_eq!(resp.segments.len(), 2);
+    }
+
+    #[test]
+    fn parse_srt_crlf() {
+        let srt = "1\r\n00:00:00,000 --> 00:00:02,500\r\nHello CRLF\r\n\r\n2\r\n00:00:03,000 --> 00:00:05,000\r\nSecond CRLF\r\n";
+        let segs = WhisperBackend::parse_srt(srt);
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "Hello CRLF");
+        assert!((segs[0].end - 2.5).abs() < 0.001);
+        assert_eq!(segs[1].text, "Second CRLF");
+        assert!((segs[1].start - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn whisper_output_format_flag_mapping() {
+        assert_eq!(whisper_format_flag_and_ext("json"), ("-oj", "json"));
+        assert_eq!(whisper_format_flag_and_ext("srt"), ("-osrt", "srt"));
+        assert_eq!(whisper_format_flag_and_ext("vtt"), ("-ovtt", "vtt"));
+        assert_eq!(whisper_format_flag_and_ext("text"), ("-otxt", "txt"));
+        assert_eq!(whisper_format_flag_and_ext("txt"), ("-otxt", "txt"));
+    }
+
+    #[test]
+    fn sanitize_audio_extension_strips_traversal() {
+        assert_eq!(sanitize_audio_extension("../../etc/passwd"), "wav");
+        assert_eq!(sanitize_audio_extension("clip.MP3"), "mp3");
+        assert_eq!(sanitize_audio_extension("voice.ogg;rm"), "oggrm");
+        assert_eq!(sanitize_audio_extension("noext"), "wav");
     }
 }

@@ -1,3 +1,8 @@
+use std::collections::HashMap;
+
+use chrono::{Local, TimeZone};
+use ratatui::text::Line;
+
 #[derive(Clone)]
 pub struct ChatMessage {
     pub role: String,
@@ -11,15 +16,16 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    /// Format the timestamp as HH:MM
+    /// Format the timestamp as local HH:MM (consistent with Logs).
     pub fn time_str(&self) -> String {
         if self.timestamp == 0 {
             return String::new();
         }
-        let secs = self.timestamp;
-        let h = (secs / 3600) % 24;
-        let m = (secs / 60) % 60;
-        format!("{:02}:{:02}", h, m)
+        Local
+            .timestamp_opt(self.timestamp as i64, 0)
+            .single()
+            .map(|dt| dt.format("%H:%M").to_string())
+            .unwrap_or_default()
     }
 }
 
@@ -54,18 +60,19 @@ pub struct ChatState {
     /// Custom system prompt sent to the model (set via /system command).
     /// Empty string = no custom system prompt.
     pub system_prompt: String,
+    /// Cached rendered markdown per (message_index, wrap_width) so streaming
+    /// does not re-parse the entire conversation every 100ms.
+    pub md_cache: HashMap<(usize, usize), Vec<Line<'static>>>,
+    /// Prompt history for Alt+Up / Alt+Down recall
+    pub prompt_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_draft: String,
 }
 
 impl Default for ChatState {
     fn default() -> Self {
         Self {
-            messages: vec![ChatMessage {
-                role: "system".to_string(),
-                content: "Welcome to Athenas Studio!\n\n  F1: Chat | F2: Models | F3: Browser | F4: Settings\n  Type /help for commands. Press Ctrl+C to quit.".to_string(),
-                reasoning: String::new(),
-                reasoning_expanded: false,
-                timestamp: now_timestamp(),
-            }],
+            messages: Vec::new(),
             input_text: String::new(),
             scroll: 0,
             max_scroll: 0,
@@ -81,6 +88,10 @@ impl Default for ChatState {
             gpu_runtime: String::new(),
             gpu_layers: -1,
             system_prompt: String::new(),
+            md_cache: HashMap::new(),
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
         }
     }
 }
@@ -96,6 +107,10 @@ impl ChatState {
         });
     }
 
+    pub fn add_error_message(&mut self, content: &str) {
+        self.add_message("error", content);
+    }
+
     pub fn add_assistant_message(&mut self, content: &str, reasoning: &str) {
         self.messages.push(ChatMessage {
             role: "assistant".to_string(),
@@ -108,10 +123,79 @@ impl ChatState {
 
     pub fn clear(&mut self) {
         self.messages.clear();
+        self.md_cache.clear();
         self.streaming_text.clear();
         self.streaming_reasoning.clear();
         self.is_generating = false;
         self.generation_start = None;
+        self.scroll = 0;
+        self.max_scroll = 0;
+        self.auto_scroll = true;
+    }
+
+    pub fn invalidate_md_cache(&mut self, idx: usize) {
+        self.md_cache.retain(|&(m_idx, _), _| m_idx != idx);
+    }
+
+    /// Return cached rendered markdown lines for message `idx` at `width`.
+    pub fn cached_markdown(&mut self, idx: usize, width: usize) -> Vec<Line<'static>> {
+        if let Some(lines) = self.md_cache.get(&(idx, width)) {
+            return lines.clone();
+        }
+        let content = self
+            .messages
+            .get(idx)
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let rendered = crate::markdown::render_markdown(content, width);
+        // Keep cache bounded on terminal resize
+        if self.md_cache.len() > 256 {
+            self.md_cache.clear();
+        }
+        self.md_cache.insert((idx, width), rendered.clone());
+        rendered
+    }
+
+    pub fn push_history(&mut self, prompt: String) {
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(|s| s.as_str()) != Some(prompt.as_str()) {
+            self.prompt_history.push(prompt);
+            if self.prompt_history.len() > 100 {
+                self.prompt_history.remove(0);
+            }
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    pub fn history_prev(&mut self, current_input: &str) -> Option<String> {
+        if self.prompt_history.is_empty() {
+            return None;
+        }
+        let next_idx = match self.history_index {
+            None => {
+                self.history_draft = current_input.to_string();
+                self.prompt_history.len() - 1
+            }
+            Some(0) => 0,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(next_idx);
+        self.prompt_history.get(next_idx).cloned()
+    }
+
+    pub fn history_next(&mut self) -> Option<String> {
+        let idx = self.history_index?;
+        if idx + 1 >= self.prompt_history.len() {
+            self.history_index = None;
+            Some(std::mem::take(&mut self.history_draft))
+        } else {
+            let next_idx = idx + 1;
+            self.history_index = Some(next_idx);
+            self.prompt_history.get(next_idx).cloned()
+        }
     }
 
     pub fn append_streaming(&mut self, text: &str) {

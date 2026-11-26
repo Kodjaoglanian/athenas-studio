@@ -1,12 +1,13 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
 use crate::server_panel::ApiKeyInfo;
+use crate::theme;
 
 /// Which phase of the API key modal is active.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,7 +52,7 @@ pub struct ApiKeyModalState {
 
     // Status / error message
     pub status_message: Option<String>,
-    /// Whether the status is an error (red) or info (cyan)
+    /// Whether the status is an error (rose) or info (primary)
     pub status_is_error: bool,
 }
 
@@ -158,6 +159,28 @@ impl ApiKeyModalState {
         self.status_message = None;
     }
 
+    /// Move focus to the next field in the create form (Tab / Down).
+    pub fn next_form_field(&mut self) {
+        self.form_field = match self.form_field {
+            Some(CreateFormField::Name) => Some(CreateFormField::RateLimit),
+            Some(CreateFormField::RateLimit) => Some(CreateFormField::TokenLimit),
+            Some(CreateFormField::TokenLimit) => Some(CreateFormField::AllowedModels),
+            Some(CreateFormField::AllowedModels) | None => Some(CreateFormField::Name),
+        };
+        self.status_message = None;
+    }
+
+    /// Move focus to the previous field in the create form (Shift+Tab / Up).
+    pub fn prev_form_field(&mut self) {
+        self.form_field = match self.form_field {
+            Some(CreateFormField::Name) | None => Some(CreateFormField::AllowedModels),
+            Some(CreateFormField::RateLimit) => Some(CreateFormField::Name),
+            Some(CreateFormField::TokenLimit) => Some(CreateFormField::RateLimit),
+            Some(CreateFormField::AllowedModels) => Some(CreateFormField::TokenLimit),
+        };
+        self.status_message = None;
+    }
+
     /// Advance to the next form field, or submit if on the last field.
     /// Returns true if the form was submitted (caller should send the request).
     pub fn advance_form(&mut self) -> bool {
@@ -183,7 +206,11 @@ impl ApiKeyModalState {
                 false
             }
             Some(CreateFormField::AllowedModels) => {
-                // Submit — caller will send the request
+                if self.form_name.trim().is_empty() {
+                    self.form_field = Some(CreateFormField::Name);
+                    self.set_error("Name cannot be empty".to_string());
+                    return false;
+                }
                 self.form_field = None;
                 true
             }
@@ -304,15 +331,22 @@ impl ApiKeyModalState {
     }
 }
 
-/// Mask an API key, showing only the last 8 characters.
-/// e.g. "sk-ath-abcdef1234567890" -> "sk-ath-••••••••••••••••56789012"
+/// Mask an API key safely (UTF-8 char-aware), showing prefix up to first '-' and last 8 chars.
+/// e.g. "sk-ath-abcdef1234567890" -> "sk-••••••••34567890"
 pub fn mask_key(key: &str) -> String {
-    if key.len() <= 12 {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 12 {
         return "••••".to_string();
     }
-    let prefix_end = key.find('-').map(|i| i + 1).unwrap_or(0);
-    let prefix = &key[..prefix_end.min(key.len())];
-    let suffix = &key[key.len().saturating_sub(8)..];
+    let prefix_end = chars
+        .iter()
+        .position(|&c| c == '-')
+        .map(|i| i + 1)
+        .unwrap_or(0)
+        .min(chars.len());
+    let prefix: String = chars[..prefix_end].iter().collect();
+    let suffix_start = chars.len().saturating_sub(8);
+    let suffix: String = chars[suffix_start..].iter().collect();
     format!("{}••••••••{}", prefix, suffix)
 }
 
@@ -324,9 +358,11 @@ pub fn render_api_key_modal(f: &mut Frame, state: &ApiKeyModalState) {
 
     let area = f.area();
 
-    // Calculate modal size — centered, 70% width, 80% height
-    let modal_width = (area.width as f32 * 0.7) as u16;
-    let modal_height = (area.height as f32 * 0.8) as u16;
+    // Adaptive size — comfortably fits 80x24 and scales gracefully on large screens
+    let modal_width = ((area.width as f32 * 0.86) as u16)
+        .clamp(60.min(area.width), area.width.saturating_sub(2).max(1));
+    let modal_height = ((area.height as f32 * 0.86) as u16)
+        .clamp(18.min(area.height), area.height.saturating_sub(2).max(1));
     let modal_x = (area.width.saturating_sub(modal_width)) / 2;
     let modal_y = (area.height.saturating_sub(modal_height)) / 2;
     let modal_area = Rect::new(modal_x, modal_y, modal_width, modal_height);
@@ -344,111 +380,135 @@ pub fn render_api_key_modal(f: &mut Frame, state: &ApiKeyModalState) {
 }
 
 fn render_list_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " API Key Management ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::Cyan));
+    let block = theme::rounded_block_colored(" ◆ API Key Management ", theme::PRIMARY)
+        .style(Style::default().bg(theme::BG_SURFACE));
 
-    // Render the outer border first, then split the inner area
+    // Render the outer border first, then split block.inner(area)
+    let inner = block.inner(area);
     f.render_widget(block, area);
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
 
-    // Layout: title hint + key list + details + actions + status
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),  // Header hint
-            Constraint::Min(5),     // Key list
-            Constraint::Length(16), // Selected key details (with usage metrics)
-            Constraint::Length(4),  // Action hints
-            Constraint::Length(2),  // Status
+            Constraint::Min(6),    // Main content (2-column or stacked)
+            Constraint::Length(1), // Action hints
+            Constraint::Length(1), // Status
         ])
         .split(inner);
 
-    // Header hint
-    let header = Paragraph::new(Line::from(vec![Span::styled(
-        "Manage API keys for multi-tenant access",
-        Style::default().fg(Color::DarkGray),
-    )]))
-    .alignment(Alignment::Center);
-    f.render_widget(header, chunks[0]);
+    let (list_area, detail_area) = if inner.width >= 68 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+            .split(chunks[0]);
+        (cols[0], cols[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(chunks[0]);
+        (rows[0], rows[1])
+    };
 
-    // Key list
+    // Left: Key list (scrollable)
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" Keys ", Style::default().fg(Color::Yellow)))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" Keys ({}) ", state.keys.len()),
+            Style::default()
+                .fg(theme::WARNING)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(theme::BORDER));
 
     if state.keys.is_empty() {
-        let empty = Paragraph::new(Line::from(vec![
-            Span::styled(
-                "\n  No API keys loaded",
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled("\n\n  Press ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "n",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" to create a new key", Style::default().fg(Color::Gray)),
-        ]))
+        let empty = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No API keys configured",
+                Style::default().fg(theme::TEXT_MUTED),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Press ", Style::default().fg(theme::TEXT_DIM)),
+                Span::styled(
+                    " n ",
+                    Style::default()
+                        .fg(theme::SUCCESS)
+                        .bg(theme::BG_HIGHLIGHT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" to create a new key", Style::default().fg(theme::TEXT_DIM)),
+            ]),
+        ])
         .block(list_block);
-        f.render_widget(empty, chunks[1]);
+        f.render_widget(empty, list_area);
     } else {
-        let mut lines: Vec<Line> = Vec::new();
+        let mut lines: Vec<Line> = Vec::with_capacity(state.keys.len());
         for (i, k) in state.keys.iter().enumerate() {
             let is_selected = i == state.selected;
             let status_icon = if k.active { "●" } else { "○" };
-            let status_color = if k.active { Color::Green } else { Color::Red };
-            let status_text = if k.active { "active" } else { "revoked" };
-            let masked = mask_key(&k.api_key);
+            let status_color = if k.active {
+                theme::SUCCESS
+            } else {
+                theme::ERROR
+            };
+            let prefix = if is_selected { "▶ " } else { "  " };
 
-            let prefix = if is_selected { "▶" } else { " " };
-
-            let style = if is_selected {
+            let row_style = if is_selected {
                 Style::default()
-                    .fg(Color::White)
+                    .fg(theme::TEXT)
+                    .bg(theme::BG_HIGHLIGHT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(theme::TEXT_DIM)
             };
 
+            let name_display: String = k.name.chars().take(18).collect();
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", prefix), style),
-                Span::styled(format!("{:<20}", k.name), style),
+                Span::styled(prefix, row_style),
                 Span::styled(
-                    format!("  {:<24}", masked),
-                    Style::default().fg(Color::Cyan),
+                    status_icon,
+                    Style::default().fg(status_color).bg(if is_selected {
+                        theme::BG_HIGHLIGHT
+                    } else {
+                        theme::BG_SURFACE
+                    }),
                 ),
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::styled(
-                    format!(" {}", status_text),
-                    Style::default().fg(status_color),
-                ),
+                Span::styled(format!(" {:<18}", name_display), row_style),
             ]));
         }
-        let list = Paragraph::new(lines).block(list_block);
-        f.render_widget(list, chunks[1]);
+
+        let visible_h = list_area.height.saturating_sub(2) as usize;
+        let scroll = if visible_h > 0 && state.selected >= visible_h {
+            (state.selected - visible_h + 1) as u16
+        } else {
+            0
+        };
+        let list = Paragraph::new(lines).block(list_block).scroll((scroll, 0));
+        f.render_widget(list, list_area);
+        theme::render_scrollbar(f, list_area, state.keys.len(), state.selected);
     }
 
-    // Selected key details
+    // Right: Selected key details
     let detail_block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(Span::styled(
-            " Details ",
-            Style::default().fg(Color::Yellow),
+            " Details & Usage ",
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(theme::BORDER));
 
     if let Some(k) = state.selected_key() {
-        let active_color = if k.active { Color::Green } else { Color::Red };
+        let active_color = if k.active {
+            theme::SUCCESS
+        } else {
+            theme::ERROR
+        };
         let models_str = if k.allowed_models.is_empty() {
             "all models".to_string()
         } else {
@@ -464,210 +524,174 @@ fn render_list_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
         } else {
             format!("{}/day", k.daily_token_limit)
         };
+        let remaining_str = if k.rate_limit_per_minute == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{}/min", k.rate_limit_remaining)
+        };
 
         let details = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  Name:           ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&k.name, Style::default().fg(Color::White)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Key ID:         ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&k.key_id, Style::default().fg(Color::Gray)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Key:            ", Style::default().fg(Color::DarkGray)),
-                Span::styled(mask_key(&k.api_key), Style::default().fg(Color::Cyan)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Status:         ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Name:     ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
-                    if k.active { "active" } else { "revoked" },
-                    Style::default().fg(active_color),
+                    &k.name,
+                    Style::default()
+                        .fg(theme::TEXT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    if k.active {
+                        "● active"
+                    } else {
+                        "○ revoked"
+                    },
+                    Style::default()
+                        .fg(active_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Rate limit:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(rate_str, Style::default().fg(Color::White)),
-                Span::styled("   Token limit: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(token_str, Style::default().fg(Color::White)),
+                Span::styled(" Key:      ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(mask_key(&k.api_key), Style::default().fg(theme::PRIMARY)),
             ]),
             Line::from(vec![
-                Span::styled("  Allowed models: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(models_str, Style::default().fg(Color::White)),
+                Span::styled(" ID:       ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(&k.key_id, Style::default().fg(theme::TEXT_DIM)),
             ]),
             Line::from(vec![
-                Span::styled("  Created:        ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&k.created_at, Style::default().fg(Color::Gray)),
+                Span::styled(" Limits:   ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(rate_str, Style::default().fg(theme::TEXT)),
+                Span::styled(" · ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(token_str, Style::default().fg(theme::TEXT)),
             ]),
-            // Usage metrics section
+            Line::from(vec![
+                Span::styled(" Models:   ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(models_str, Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled(" Created:  ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(&k.created_at, Style::default().fg(theme::TEXT_DIM)),
+            ]),
             Line::from(""),
-            Line::from(vec![Span::styled(
-                "  ── Usage (today) ──",
-                Style::default().fg(Color::Yellow),
-            )]),
+            Line::from(Span::styled(
+                " ── Usage (today) ──",
+                Style::default()
+                    .fg(theme::WARNING)
+                    .add_modifier(Modifier::BOLD),
+            )),
             Line::from(vec![
-                Span::styled("  Requests:       ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Requests: ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
                     format!("{}", k.usage_requests),
-                    Style::default().fg(Color::White),
+                    Style::default().fg(theme::TEXT),
                 ),
+                Span::styled("   Remain: ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(remaining_str, Style::default().fg(theme::SUCCESS)),
             ]),
             Line::from(vec![
-                Span::styled("  Tokens in:      ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Tokens:   ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
-                    format!("{}", k.usage_tokens_prompt),
-                    Style::default().fg(Color::White),
+                    format!("{} total", k.usage_tokens_total),
+                    Style::default().fg(theme::PRIMARY),
                 ),
-                Span::styled("   out: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    format!("{}", k.usage_tokens_generated),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Tokens total:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}", k.usage_tokens_total),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("  Rate remaining: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    if k.rate_limit_per_minute == 0 {
-                        "unlimited".to_string()
-                    } else {
-                        format!("{}/min", k.rate_limit_remaining)
-                    },
-                    Style::default().fg(Color::Green),
+                    format!(
+                        " (in {} / out {})",
+                        k.usage_tokens_prompt, k.usage_tokens_generated
+                    ),
+                    Style::default().fg(theme::TEXT_DIM),
                 ),
             ]),
         ])
-        .block(detail_block);
-        f.render_widget(details, chunks[2]);
+        .block(detail_block)
+        .wrap(Wrap { trim: false });
+        f.render_widget(details, detail_area);
     } else {
-        let empty = Paragraph::new("").block(detail_block);
-        f.render_widget(empty, chunks[2]);
+        let empty = Paragraph::new(Line::styled(
+            "  Select a key to view details",
+            Style::default().fg(theme::TEXT_MUTED),
+        ))
+        .block(detail_block);
+        f.render_widget(empty, detail_area);
     }
 
     // Action hints
-    let actions = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled(
-                "  ↑/↓",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Select   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "n",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" New   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "r",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Revoke   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "d",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Delete   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Refresh   ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Esc",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Close", Style::default().fg(Color::Gray)),
-        ]),
-        Line::from(""),
-    ])
-    .block(Block::default().borders(Borders::NONE));
-    f.render_widget(actions, chunks[3]);
+    let mut hint_spans = Vec::new();
+    hint_spans.extend(theme::keycap("↑/↓", "Select"));
+    hint_spans.extend(theme::keycap("n", "New"));
+    hint_spans.extend(theme::keycap("r", "Revoke"));
+    hint_spans.extend(theme::keycap("d", "Delete"));
+    hint_spans.extend(theme::keycap("Enter", "Refresh"));
+    hint_spans.extend(theme::keycap("Esc", "Close"));
+    let actions = Paragraph::new(Line::from(hint_spans)).alignment(Alignment::Center);
+    f.render_widget(actions, chunks[1]);
 
     // Status
     if let Some(ref msg) = state.status_message {
         let color = if state.status_is_error {
-            Color::Red
+            theme::ERROR
         } else {
-            Color::Cyan
+            theme::SUCCESS
         };
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(msg, Style::default().fg(color)),
-        ]))
-        .alignment(Alignment::Center);
-        f.render_widget(status, chunks[4]);
+        let status = Paragraph::new(Line::styled(msg.as_str(), Style::default().fg(color)))
+            .alignment(Alignment::Center);
+        f.render_widget(status, chunks[2]);
     }
 }
 
 fn render_create_form_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Create New API Key ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::Green));
+    let block = theme::rounded_block_colored(" ◆ Create New API Key ", theme::SUCCESS)
+        .style(Style::default().bg(theme::BG_SURFACE));
 
+    let inner = block.inner(area);
     f.render_widget(block, area);
-    let inner = area.inner(ratatui::layout::Margin::new(1, 1));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2), // Header
+            Constraint::Length(1), // Header
             Constraint::Min(10),   // Form fields
-            Constraint::Length(3), // Hints
-            Constraint::Length(2), // Status
+            Constraint::Length(1), // Hints
+            Constraint::Length(1), // Status
         ])
         .split(inner);
 
-    // Header
     let header = Paragraph::new(Line::from(vec![
+        Span::styled("Fill in fields — ", Style::default().fg(theme::TEXT_DIM)),
         Span::styled(
-            "Fill in the fields below — press ",
-            Style::default().fg(Color::DarkGray),
+            "Tab/↑/↓",
+            Style::default()
+                .fg(theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(" navigate, ", Style::default().fg(theme::TEXT_DIM)),
         Span::styled(
             "Enter",
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" to advance", Style::default().fg(Color::DarkGray)),
+        Span::styled(" next/submit", Style::default().fg(theme::TEXT_DIM)),
     ]))
     .alignment(Alignment::Center);
     f.render_widget(header, chunks[0]);
 
-    // Form fields
     let form_block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" Form ", Style::default().fg(Color::Yellow)))
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            " Key Parameters ",
+            Style::default().fg(theme::WARNING),
+        ))
+        .border_style(Style::default().fg(theme::BORDER));
 
     let fields: [(&str, &String, CreateFormField, &str); 4] = [
         (
             "Name",
             &state.form_name,
             CreateFormField::Name,
-            "Descriptive name for this key",
+            "Descriptive label for this key (required)",
         ),
         (
             "Rate limit/min",
@@ -685,7 +709,7 @@ fn render_create_form_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState)
             "Allowed models",
             &state.form_allowed_models,
             CreateFormField::AllowedModels,
-            "Comma-separated, empty = all",
+            "Comma-separated IDs, empty = all models",
         ),
     ];
 
@@ -694,36 +718,37 @@ fn render_create_form_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState)
 
     for (label, value, field, hint) in &fields {
         let is_current = state.form_field.as_ref() == Some(field);
-        let prefix = if is_current { "► " } else { "  " };
+        let prefix = if is_current { "▶ " } else { "  " };
         let display = if is_current {
-            format!("{}│", value)
+            format!("{}▏", value)
         } else if value.is_empty() {
             "(empty)".to_string()
         } else {
             value.to_string()
         };
-        let style = if is_current {
+        let value_style = if is_current {
             Style::default()
-                .fg(Color::White)
+                .fg(theme::TEXT)
+                .bg(theme::BG_HIGHLIGHT)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Gray)
+            Style::default().fg(theme::TEXT_DIM)
         };
         let label_style = if is_current {
             Style::default()
-                .fg(Color::Green)
+                .fg(theme::SUCCESS)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme::TEXT_MUTED)
         };
 
         lines.push(Line::from(vec![
-            Span::styled(format!("  {}{: <20}: ", prefix, label), label_style),
-            Span::styled(display, style),
+            Span::styled(format!("  {}{:<19}: ", prefix, label), label_style),
+            Span::styled(display, value_style),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("      ", Style::default()),
-            Span::styled(*hint, Style::default().fg(Color::DarkGray)),
+            Span::raw("      "),
+            Span::styled(*hint, Style::default().fg(theme::TEXT_MUTED)),
         ]));
         lines.push(Line::from(""));
     }
@@ -731,205 +756,153 @@ fn render_create_form_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState)
     let form = Paragraph::new(lines).block(form_block);
     f.render_widget(form, chunks[1]);
 
-    // Hints
-    let hints = Paragraph::new(vec![Line::from(vec![
-        Span::styled(
-            "  Enter",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" = Next/Submit   ", Style::default().fg(Color::Gray)),
-        Span::styled(
-            "Esc",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" = Cancel", Style::default().fg(Color::Gray)),
-    ])])
-    .alignment(Alignment::Center);
+    let mut hint_spans = Vec::new();
+    hint_spans.extend(theme::keycap("Tab/Shift+Tab", "Field"));
+    hint_spans.extend(theme::keycap("Enter", "Next / Submit"));
+    hint_spans.extend(theme::keycap("Esc", "Cancel"));
+    let hints = Paragraph::new(Line::from(hint_spans)).alignment(Alignment::Center);
     f.render_widget(hints, chunks[2]);
 
-    // Status
     if let Some(ref msg) = state.status_message {
         let color = if state.status_is_error {
-            Color::Red
+            theme::ERROR
         } else {
-            Color::Cyan
+            theme::PRIMARY
         };
-        let status = Paragraph::new(Line::from(vec![
-            Span::styled(" ", Style::default()),
-            Span::styled(msg, Style::default().fg(color)),
-        ]))
-        .alignment(Alignment::Center);
+        let status = Paragraph::new(Line::styled(msg.as_str(), Style::default().fg(color)))
+            .alignment(Alignment::Center);
         f.render_widget(status, chunks[3]);
     }
 }
 
 fn render_key_revealed_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            " Key Created — Copy Now! ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(Color::Yellow));
+    let block = theme::rounded_block_colored(" ⚠ Key Created — Copy Now! ", theme::WARNING)
+        .style(Style::default().bg(theme::BG_SURFACE));
+
+    // Render outer border FIRST, then split block.inner(area)
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Warning
             Constraint::Min(5),    // Key display
-            Constraint::Length(3), // Details
-            Constraint::Length(3), // Hint
+            Constraint::Length(2), // Details
+            Constraint::Length(2), // Hint
         ])
-        .split(area);
+        .split(inner);
 
-    // Warning
     let warning = Paragraph::new(vec![
-        Line::from(""),
         Line::from(vec![
             Span::styled(
-                "⚠  ",
+                "⚠ ",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                "This is the only time the full key will be shown.",
-                Style::default().fg(Color::Yellow),
+                "This is the ONLY time the full key will be shown.",
+                Style::default().fg(theme::WARNING),
             ),
         ]),
-        Line::from(vec![Span::styled(
-            "    Copy it now — it cannot be retrieved later.",
-            Style::default().fg(Color::Red),
-        )]),
+        Line::from(Span::styled(
+            "Copy it now — it cannot be retrieved later.",
+            Style::default().fg(theme::ERROR),
+        )),
     ])
     .alignment(Alignment::Center);
     f.render_widget(warning, chunks[0]);
 
-    // Key display
     if let Some((ref name, ref key)) = state.revealed_key {
-        let key_block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " Your New API Key ",
-                Style::default().fg(Color::Green),
-            ))
-            .border_style(Style::default().fg(Color::Green));
+        let key_block = theme::rounded_block_colored(" Your New API Key ", theme::SUCCESS);
 
         let key_display = Paragraph::new(vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Name: ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
                     name,
                     Style::default()
-                        .fg(Color::White)
+                        .fg(theme::TEXT)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Key:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Key:  ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
                     key,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme::PRIMARY)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
         ])
-        .block(key_block);
+        .block(key_block)
+        .wrap(Wrap { trim: false });
         f.render_widget(key_display, chunks[1]);
 
-        // Details
-        let details = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Rate limit: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}/min", state.form_rate_limit),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled("   Token limit: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{}/day", state.form_token_limit),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-        ])
+        let rate_str = if state.form_rate_limit.trim().parse::<u32>().unwrap_or(0) == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{}/min", state.form_rate_limit.trim())
+        };
+        let token_str = if state.form_token_limit.trim().parse::<u64>().unwrap_or(0) == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{}/day", state.form_token_limit.trim())
+        };
+
+        let details = Paragraph::new(Line::from(vec![
+            Span::styled("Rate limit: ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled(rate_str, Style::default().fg(theme::TEXT)),
+            Span::styled("   Token limit: ", Style::default().fg(theme::TEXT_MUTED)),
+            Span::styled(token_str, Style::default().fg(theme::TEXT)),
+        ]))
         .alignment(Alignment::Center);
         f.render_widget(details, chunks[2]);
     }
 
-    // Hint
-    let hint = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Press ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Enter",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" or ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "Esc",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" to continue", Style::default().fg(Color::Gray)),
-        ]),
-    ])
-    .alignment(Alignment::Center);
+    let mut hint_spans = Vec::new();
+    hint_spans.extend(theme::keycap("Enter / Esc", "Continue"));
+    let hint = Paragraph::new(Line::from(hint_spans)).alignment(Alignment::Center);
     f.render_widget(hint, chunks[3]);
-
-    f.render_widget(block, area);
 }
 
 fn render_confirm_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState, action: &str) {
     let (title, title_color, action_desc) = match action {
-        "revoke" => (" Confirm Revoke ", Color::Yellow, "revoke (deactivate)"),
-        "delete" => (" Confirm Delete ", Color::Red, "permanently delete"),
+        "revoke" => (" ⚠ Confirm Revoke ", theme::WARNING, "revoke (deactivate)"),
+        "delete" => (" ⚠ Confirm Delete ", theme::ERROR, "permanently delete"),
         _ => return,
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(title_color)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .border_style(Style::default().fg(title_color));
+    let block = theme::rounded_block_colored(title, title_color)
+        .style(Style::default().bg(theme::BG_SURFACE));
+
+    // Render outer border FIRST, then split block.inner(area)
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Warning
-            Constraint::Min(4),    // Key info
-            Constraint::Length(3), // Confirm/Cancel
+            Constraint::Min(5),    // Key info
+            Constraint::Length(2), // Confirm/Cancel
         ])
-        .split(area);
+        .split(inner);
 
-    // Warning
     let warning_text = if action == "delete" {
         "This action cannot be undone. The key will be permanently removed."
     } else {
-        "The key will be deactivated. You can re-enable it later by creating a new one."
+        "The key will be deactivated. You can create a new key later."
     };
     let warning = Paragraph::new(vec![
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "⚠  ",
+                "⚠ ",
                 Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD),
@@ -937,68 +910,59 @@ fn render_confirm_phase(f: &mut Frame, area: Rect, state: &ApiKeyModalState, act
             Span::styled(warning_text, Style::default().fg(title_color)),
         ]),
     ])
-    .alignment(Alignment::Center);
+    .alignment(Alignment::Center)
+    .wrap(Wrap { trim: false });
     f.render_widget(warning, chunks[0]);
 
-    // Key info
     if let Some(k) = state.selected_key() {
-        let key_block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                " Selected Key ",
-                Style::default().fg(Color::DarkGray),
-            ))
-            .border_style(Style::default().fg(Color::DarkGray));
-
+        let key_block = theme::rounded_block(" Selected Key ", false);
         let info = Paragraph::new(vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Name:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled("  Name:  ", Style::default().fg(theme::TEXT_MUTED)),
                 Span::styled(
                     &k.name,
                     Style::default()
-                        .fg(Color::White)
+                        .fg(theme::TEXT)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Key:   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(mask_key(&k.api_key), Style::default().fg(Color::Cyan)),
+                Span::styled("  Key:   ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(mask_key(&k.api_key), Style::default().fg(theme::PRIMARY)),
             ]),
             Line::from(vec![
-                Span::styled("  ID:    ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&k.key_id, Style::default().fg(Color::Gray)),
+                Span::styled("  ID:    ", Style::default().fg(theme::TEXT_MUTED)),
+                Span::styled(&k.key_id, Style::default().fg(theme::TEXT_DIM)),
             ]),
         ])
         .block(key_block);
         f.render_widget(info, chunks[1]);
     }
 
-    // Confirm/Cancel
-    let confirm = Paragraph::new(vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                "  Enter",
-                Style::default()
-                    .fg(title_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" = {}   ", action_desc),
-                Style::default().fg(Color::Gray),
-            ),
-            Span::styled(
-                "Esc",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" = Cancel", Style::default().fg(Color::Gray)),
-        ]),
-    ])
-    .alignment(Alignment::Center);
+    let mut spans = Vec::new();
+    spans.extend(theme::keycap("Enter", action_desc));
+    spans.extend(theme::keycap("Esc", "Cancel"));
+    let confirm = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     f.render_widget(confirm, chunks[2]);
+}
 
-    f.render_widget(block, area);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_key_handles_ascii_and_utf8_safely() {
+        assert_eq!(mask_key("short"), "••••");
+        assert_eq!(mask_key("sk-ath-abcdef1234567890"), "sk-••••••••34567890");
+        // Multi-byte UTF-8 characters (e.g. bullets already returned by server or accented chars)
+        let masked_from_server = "sk-ath-••••••••1234";
+        let res = mask_key(masked_from_server);
+        assert!(res.starts_with("sk-••••••••"));
+        // Pure multi-byte UTF-8 string longer than 12 chars
+        let unicode_key = "chave-αβγδεζηθικλμνξο";
+        let res2 = mask_key(unicode_key);
+        assert!(res2.starts_with("chave-••••••••"));
+        assert!(res2.ends_with("θικλμνξο"));
+    }
 }

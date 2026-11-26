@@ -8,7 +8,7 @@ pub async fn run(
     host: &str,
     port: u16,
     backend_type: BackendType,
-    gpu_layers: i32,
+    gpu_layers: Option<i32>,
     gpu_runtime: athenas_core::GpuRuntime,
     gpu_device: Option<u32>,
     context_size: u32,
@@ -100,13 +100,20 @@ pub async fn run(
 
         // Cap context size based on available memory
         if hardware.memory_total_mb > 0 {
-            let model_size_mb = std::fs::metadata(&model_path)
-                .map(|m| m.len() / (1024 * 1024))
-                .unwrap_or(0);
+            let model_p = std::path::PathBuf::from(&model_path);
+            let model_size_mb = if model_p.is_dir() {
+                athenas_core::dir_size(&model_p) / (1024 * 1024)
+            } else {
+                std::fs::metadata(&model_p)
+                    .map(|m| m.len() / (1024 * 1024))
+                    .unwrap_or(0)
+            };
             let reserved = model_size_mb + config.inference.ram_reserve_mb;
             let usable = hardware.memory_total_mb.saturating_sub(reserved);
-            // Rough: allow up to 50% of remaining RAM for context
-            let max_ctx = ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024;
+            // Rough: allow up to 50% of remaining RAM for KV cache (~64 MB per 1024 tokens)
+            let usable_for_kv = usable / 2;
+            let max_ctx_u64 = (usable_for_kv / 64).saturating_mul(1024);
+            let max_ctx = max_ctx_u64.min(u32::MAX as u64) as u32;
             if max_ctx > 0 && effective_context_size > max_ctx {
                 effective_context_size = max_ctx.max(512);
             }
@@ -123,9 +130,11 @@ pub async fn run(
         );
     }
 
+    let effective_gpu_layers = gpu_layers.unwrap_or(config.inference.default_gpu_layers);
+
     let load_config = ModelLoadConfig {
         model_path,
-        gpu_layers,
+        gpu_layers: effective_gpu_layers,
         gpu_runtime: effective_gpu_runtime,
         gpu_device: effective_gpu_device,
         context_size: effective_context_size,
@@ -164,7 +173,8 @@ pub async fn run(
     let sc_ttl = config.server.semantic_cache.ttl_secs;
     let sc_max_entries = config.server.semantic_cache.max_entries;
 
-    print_startup_banner(&config, host, port, &hardware, &model);
+    let backend_name = backend.name().to_string();
+    print_startup_banner(&config, host, port, &hardware, &model, &backend_name);
 
     let mut server = ApiServer::new(config, backend)
         .with_api_key_manager(api_key_mgr)
@@ -213,6 +223,7 @@ fn print_startup_banner(
     port: u16,
     hardware: &athenas_core::HardwareInfo,
     model: &str,
+    backend_name: &str,
 ) {
     println!();
     println!("  ┌─────────────────────────────────────────────────────────┐");
@@ -223,7 +234,7 @@ fn print_startup_banner(
         host, port
     );
     println!("  │  Model:     {:<44}│", truncate(model, 44));
-    println!("  │  Backend:   {:<44}│", config.inference.default_backend);
+    println!("  │  Backend:   {:<44}│", truncate(backend_name, 44));
     println!("  ├─────────────────────────────────────────────────────────┤");
     println!("  │  Hardware:                                              │");
     println!("  │    CPU threads: {:<38}│", hardware.cpus);
@@ -296,10 +307,13 @@ fn print_startup_banner(
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
+    } else if max <= 3 {
+        s.chars().take(max).collect()
     } else {
-        format!("{}...", &s[..max - 3])
+        let prefix: String = s.chars().take(max - 3).collect();
+        format!("{}...", prefix)
     }
 }
 
@@ -316,4 +330,18 @@ fn resolve_model(config: &AppConfig, model_id: &str) -> Result<String> {
     Err(athenas_core::AthenasError::ModelNotFound(
         model_id.to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate;
+
+    #[test]
+    fn truncate_utf8_safe() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 8), "hello...");
+        // Multi-byte UTF-8 characters must not panic on char boundary
+        assert_eq!(truncate("日本語モデル名テスト", 6), "日本語...");
+        assert_eq!(truncate("🚀🔥✨🎉", 3), "🚀🔥✨");
+    }
 }

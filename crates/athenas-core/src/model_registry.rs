@@ -133,13 +133,31 @@ impl ModelRegistry {
             .ok_or_else(|| AthenasError::ModelNotFound(id_or_name.to_string()))
     }
 
+    pub fn try_model_dir(&self, repo_id: &str) -> Result<PathBuf> {
+        let safe_repo = validate_repo_id(repo_id)?;
+        Ok(self.models_dir.join(safe_repo))
+    }
+
+    pub fn try_model_path(&self, repo_id: &str, filename: &str) -> Result<PathBuf> {
+        let dir = self.try_model_dir(repo_id)?;
+        let rel = validate_rel_path(filename, "filename")?;
+        Ok(dir.join(rel))
+    }
+
     pub fn model_path(&self, repo_id: &str, filename: &str) -> PathBuf {
-        let safe_repo = repo_id.replace('/', "__");
-        self.models_dir.join(safe_repo).join(filename)
+        if let Ok(path) = self.try_model_path(repo_id, filename) {
+            return path;
+        }
+        let dir = self.model_dir(repo_id);
+        let safe_file = sanitize_rel_path_fallback(filename);
+        dir.join(safe_file)
     }
 
     pub fn model_dir(&self, repo_id: &str) -> PathBuf {
-        let safe_repo = repo_id.replace('/', "__");
+        if let Ok(dir) = self.try_model_dir(repo_id) {
+            return dir;
+        }
+        let safe_repo = sanitize_repo_id_fallback(repo_id);
         self.models_dir.join(safe_repo)
     }
 
@@ -149,13 +167,16 @@ impl ModelRegistry {
             // ONNX model dir — remove the dir itself (a variant subdir must
             // not take sibling variants with it).
             std::fs::remove_dir_all(&model.file_path)?;
-            return Ok(());
-        }
-        let dir = model.file_path.parent().unwrap_or(&self.models_dir);
-        if dir != self.models_dir {
-            std::fs::remove_dir_all(dir)?;
         } else {
+            // Remove only the specific model file — never delete sibling models
+            // in the same repo directory.
             std::fs::remove_file(&model.file_path)?;
+        }
+        // Clean up the parent repo directory only if it is now completely empty.
+        if let Some(parent) = model.file_path.parent() {
+            if parent != self.models_dir {
+                let _ = std::fs::remove_dir(parent);
+            }
         }
         Ok(())
     }
@@ -169,14 +190,106 @@ impl ModelRegistry {
     }
 }
 
+const MAX_SCAN_DEPTH: usize = 8;
+const MAX_GGUF_KV_COUNT: usize = 100_000;
+const MAX_GGUF_BLOCK_COUNT: usize = 65_536;
+const MAX_GGUF_SKIP_DEPTH: usize = 8;
+
+fn validate_repo_id(repo_id: &str) -> Result<String> {
+    if repo_id.is_empty()
+        || repo_id.starts_with('/')
+        || repo_id.starts_with('\\')
+        || repo_id.contains('\\')
+    {
+        return Err(AthenasError::Config(format!("invalid repo_id: {repo_id}")));
+    }
+    let mut parts = Vec::new();
+    for comp in Path::new(repo_id).components() {
+        match comp {
+            std::path::Component::Normal(c) => parts.push(c.to_string_lossy().into_owned()),
+            _ => return Err(AthenasError::Config(format!("invalid repo_id: {repo_id}"))),
+        }
+    }
+    if parts.is_empty() {
+        return Err(AthenasError::Config(format!("invalid repo_id: {repo_id}")));
+    }
+    Ok(parts.join("__"))
+}
+
+fn validate_rel_path(rel: &str, label: &str) -> Result<PathBuf> {
+    if rel.is_empty() || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\\') {
+        return Err(AthenasError::Config(format!("invalid {label}: {rel}")));
+    }
+    let mut out = PathBuf::new();
+    for comp in Path::new(rel).components() {
+        match comp {
+            std::path::Component::Normal(c) => out.push(c),
+            _ => return Err(AthenasError::Config(format!("invalid {label}: {rel}"))),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        return Err(AthenasError::Config(format!("invalid {label}: {rel}")));
+    }
+    Ok(out)
+}
+
+fn sanitize_repo_id_fallback(repo_id: &str) -> String {
+    let normalized = repo_id.replace('\\', "/");
+    let parts: Vec<String> = Path::new(&normalized)
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        "_invalid".to_string()
+    } else {
+        parts.join("__")
+    }
+}
+
+fn sanitize_rel_path_fallback(rel: &str) -> PathBuf {
+    let normalized = rel.replace('\\', "/");
+    let mut out = PathBuf::new();
+    for comp in Path::new(&normalized).components() {
+        if let std::path::Component::Normal(c) = comp {
+            out.push(c);
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push("_invalid");
+    }
+    out
+}
+
 fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()> {
+    scan_dir_for_models_inner(dir, models, 0)
+}
+
+fn scan_dir_for_models_inner(
+    dir: &PathBuf,
+    models: &mut Vec<ModelInfo>,
+    depth: usize,
+) -> Result<()> {
+    if depth > MAX_SCAN_DEPTH {
+        return Ok(());
+    }
     let entries = std::fs::read_dir(dir).map_err(AthenasError::Io)?;
 
     for entry in entries {
         let entry = entry.map_err(AthenasError::Io)?;
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        // Skip symlinks to prevent directory traversal loops.
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
 
-        if path.is_dir() {
+        if file_type.is_dir() {
             // An ONNX model is a *directory*: model.onnx + .onnx_data weights
             // + tokenizer.json + genai_config.json. Register the dir itself
             // and don't descend (variant subdirs of a repo still get scanned
@@ -189,48 +302,50 @@ fn scan_dir_for_models(dir: &PathBuf, models: &mut Vec<ModelInfo>) -> Result<()>
                     }
                 }
             } else {
-                scan_dir_for_models(&path, models)?;
+                scan_dir_for_models_inner(&path, models, depth + 1)?;
             }
-        } else if let Some(ext) = path.extension() {
-            let filename_lower = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+        } else if file_type.is_file() {
+            if let Some(ext) = path.extension() {
+                let filename_lower = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
 
-            // Skip multimodal projector files — they are not standalone
-            // models and will cause "unsupported model architecture: 'clip'"
-            // errors if loaded directly. They should be loaded via --mmproj.
-            let is_mmproj = filename_lower.contains("mmproj")
-                || filename_lower.contains("mmproj-")
-                || filename_lower.contains("-mmproj");
+                // Skip multimodal projector files — they are not standalone
+                // models and will cause "unsupported model architecture: 'clip'"
+                // errors if loaded directly. They should be loaded via --mmproj.
+                let is_mmproj = filename_lower.contains("mmproj")
+                    || filename_lower.contains("mmproj-")
+                    || filename_lower.contains("-mmproj");
 
-            if ext == "gguf" && !is_mmproj {
-                // Read GGUF metadata (architecture, context length, license)
-                let meta = read_gguf_metadata(&path);
+                if ext.eq_ignore_ascii_case("gguf") && !is_mmproj {
+                    // Read GGUF metadata (architecture, context length, license)
+                    let meta = read_gguf_metadata(&path);
 
-                // Categorize model based on architecture
-                let category = meta
-                    .as_ref()
-                    .and_then(|m| m.architecture.as_ref())
-                    .map(|a| categorize_model(a));
+                    // Categorize model based on architecture
+                    let category = meta
+                        .as_ref()
+                        .and_then(|m| m.architecture.as_ref())
+                        .map(|a| categorize_model(a));
 
-                let mut model = create_model_info_from_file(&path, ModelFormat::Gguf)?;
-                if let Some(meta) = meta {
-                    model.architecture = meta.architecture;
-                    model.context_length = meta.context_length;
-                    model.license = meta.license;
+                    let mut model = create_model_info_from_file(&path, ModelFormat::Gguf)?;
+                    if let Some(meta) = meta {
+                        model.architecture = meta.architecture;
+                        model.context_length = meta.context_length;
+                        model.license = meta.license;
+                    }
+                    model.category = category;
+                    models.push(model);
+                } else if ext.eq_ignore_ascii_case("safetensors") && !is_mmproj {
+                    let model = create_model_info_from_file(&path, ModelFormat::Safetensors)?;
+                    models.push(model);
+                } else if ext.eq_ignore_ascii_case("onnx") && !is_mmproj {
+                    // Standalone .onnx file (no sibling model dir claim — dirs are
+                    // handled above and never reached here).
+                    let model = create_model_info_from_file(&path, ModelFormat::Onnx)?;
+                    models.push(model);
                 }
-                model.category = category;
-                models.push(model);
-            } else if ext == "safetensors" && !is_mmproj {
-                let model = create_model_info_from_file(&path, ModelFormat::Safetensors)?;
-                models.push(model);
-            } else if ext == "onnx" && !is_mmproj {
-                // Standalone .onnx file (no sibling model dir claim — dirs are
-                // handled above and never reached here).
-                let model = create_model_info_from_file(&path, ModelFormat::Onnx)?;
-                models.push(model);
             }
         }
     }
@@ -321,6 +436,11 @@ fn create_model_info_from_dir(dir: &PathBuf) -> Result<ModelInfo> {
             v["max_position_embeddings"]
                 .as_u64()
                 .or_else(|| v["model"]["context_length"].as_u64())
+        })
+        .or_else(|| {
+            genai
+                .as_ref()
+                .and_then(|v| v["model"]["context_length"].as_u64())
         })
         .map(|n| n as u32);
 
@@ -416,10 +536,18 @@ pub fn read_gguf_metadata(path: &Path) -> Option<GgufMetadata> {
     // GGUF v2+ uses u64 counts; v1 used u32.
     let kv_count = if version >= 2 {
         let _tensor_count: u64 = read_u64(&mut reader)?;
-        read_u64(&mut reader)? as usize
+        let count = read_u64(&mut reader)?;
+        if count > MAX_GGUF_KV_COUNT as u64 {
+            return None;
+        }
+        count as usize
     } else {
         let _tensor_count: u32 = read_u32(&mut reader)?;
-        read_u32(&mut reader)? as usize
+        let count = read_u32(&mut reader)? as usize;
+        if count > MAX_GGUF_KV_COUNT {
+            return None;
+        }
+        count
     };
     parse_gguf_metadata(&mut reader, kv_count, version)
 }
@@ -459,7 +587,7 @@ fn parse_gguf_metadata<R: std::io::Read + std::io::Seek>(
             }
             _ => {
                 // Skip the value based on its type
-                skip_gguf_value(reader, value_type, version)?;
+                skip_gguf_value(reader, value_type, version, 0)?;
             }
         }
     }
@@ -509,7 +637,11 @@ fn skip_gguf_value<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     value_type: u32,
     version: u32,
+    depth: usize,
 ) -> Option<()> {
+    if depth > MAX_GGUF_SKIP_DEPTH {
+        return None;
+    }
     match value_type {
         0 => {
             reader.read_exact(&mut [0u8; 1]).ok()?;
@@ -551,7 +683,7 @@ fn skip_gguf_value<R: std::io::Read + std::io::Seek>(
                 return None;
             }
             for _ in 0..len {
-                skip_gguf_value(reader, elem_type, version)?;
+                skip_gguf_value(reader, elem_type, version, depth + 1)?;
             }
         }
         10 => {
@@ -603,7 +735,10 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
         r.read_exact(&mut buf).ok()?;
         String::from_utf8(buf).ok()
     }
-    fn skip_value(r: &mut impl Read, vtype: u32, big: bool) -> Option<()> {
+    fn skip_value(r: &mut impl Read, vtype: u32, big: bool, depth: usize) -> Option<()> {
+        if depth > MAX_GGUF_SKIP_DEPTH {
+            return None;
+        }
         match vtype {
             0 | 1 | 7 => r.read_exact(&mut [0u8; 1]).ok()?,
             2 | 3 => r.read_exact(&mut [0u8; 2]).ok()?,
@@ -618,7 +753,7 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
                     return None;
                 }
                 for _ in 0..len {
-                    skip_value(r, elem, big)?;
+                    skip_value(r, elem, big, depth + 1)?;
                 }
             }
             10..=12 => r.read_exact(&mut [0u8; 8]).ok()?,
@@ -668,7 +803,7 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
         } else if key.ends_with(".nextn_predict_layers") && vtype == 4 {
             nextn_layers = r_u32(&mut r).unwrap_or(0);
         } else {
-            skip_value(&mut r, vtype, true).ok_or_else(|| corrupt("bad metadata value"))?;
+            skip_value(&mut r, vtype, true, 0).ok_or_else(|| corrupt("bad metadata value"))?;
         }
     }
     let block_count = block_counts
@@ -676,6 +811,9 @@ pub fn validate_gguf(path: &std::path::Path) -> std::result::Result<(), String> 
         .copied()
         .or_else(|| block_counts.values().next().copied())
         .unwrap_or(0) as usize;
+    if block_count > MAX_GGUF_BLOCK_COUNT {
+        return Err(corrupt("absurd block_count"));
+    }
     // MTP/nextn layers are counted in block_count but converters may omit
     // their tensors (e.g. qwen35: block_count=33 with only blk.0..31
     // written — llama.cpp #26916/#24737). Only the trunk is required.
@@ -823,7 +961,10 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
             self.read_exact(&mut buf).ok()?;
             String::from_utf8(buf).ok().map(|s| (off, s))
         }
-        fn skip_value(&mut self, vt: u32) -> Option<()> {
+        fn skip_value(&mut self, vt: u32, depth: usize) -> Option<()> {
+            if depth > MAX_GGUF_SKIP_DEPTH {
+                return None;
+            }
             match vt {
                 0 | 1 | 7 => self.read_exact(&mut [0u8; 1]).ok()?,
                 2 | 3 => self.read_exact(&mut [0u8; 2]).ok()?,
@@ -838,7 +979,7 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
                         return None;
                     }
                     for _ in 0..len {
-                        self.skip_value(elem)?;
+                        self.skip_value(elem, depth + 1)?;
                     }
                 }
                 10..=12 => self.read_exact(&mut [0u8; 8]).ok()?,
@@ -864,15 +1005,15 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
     }
     let tensor_count = r.r_u64().ok_or_else(|| bad("no tensor count"))?;
     let kv_count = r.r_u64().ok_or_else(|| bad("no kv count"))?;
-    if kv_count > 100_000 {
+    if kv_count > MAX_GGUF_KV_COUNT as u64 {
         return Ok(false);
     }
 
     let mut arch = String::new();
-    let mut block_count = 0u32;
-    let mut block_count_off = None;
-    let mut nextn = 0u32;
-    let mut nextn_off = None;
+    let mut block_counts: std::collections::HashMap<String, (u64, u32)> =
+        std::collections::HashMap::new();
+    let mut nextns: std::collections::HashMap<String, (u64, u32)> =
+        std::collections::HashMap::new();
     // (key_byte_off, key, array_len) for every arch-scoped array —
     // resolved after the loop once block_count is known.
     let mut arrays: Vec<(u64, String, u64)> = Vec::new();
@@ -886,12 +1027,12 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
                 arch = r.r_string().ok_or_else(|| bad("bad arch"))?.1;
             }
             _ if key.ends_with(".block_count") && vtype == 4 => {
-                block_count_off = Some(val_off);
-                block_count = r.r_u32().ok_or_else(|| bad("bad block_count"))?;
+                let val = r.r_u32().ok_or_else(|| bad("bad block_count"))?;
+                block_counts.insert(key, (val_off, val));
             }
             _ if key.ends_with(".nextn_predict_layers") && vtype == 4 => {
-                nextn_off = Some(val_off);
-                nextn = r.r_u32().ok_or_else(|| bad("bad nextn"))?;
+                let val = r.r_u32().ok_or_else(|| bad("bad nextn"))?;
+                nextns.insert(key, (val_off, val));
             }
             _ if vtype == 9 => {
                 let elem = r.r_u32().ok_or_else(|| bad("bad array type"))?;
@@ -901,14 +1042,45 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
                 }
                 arrays.push((key_off, key, len));
                 for _ in 0..len {
-                    r.skip_value(elem).ok_or_else(|| bad("bad array elem"))?;
+                    r.skip_value(elem, 1).ok_or_else(|| bad("bad array elem"))?;
                 }
             }
             _ => {
-                r.skip_value(vtype).ok_or_else(|| bad("bad value"))?;
+                r.skip_value(vtype, 0).ok_or_else(|| bad("bad value"))?;
             }
         }
     }
+
+    let (block_count_off, block_count) = if !arch.is_empty() {
+        block_counts
+            .get(&format!("{arch}.block_count"))
+            .copied()
+            .or_else(|| block_counts.values().next().copied())
+            .map(|(off, v)| (Some(off), v))
+            .unwrap_or((None, 0))
+    } else {
+        block_counts
+            .values()
+            .next()
+            .copied()
+            .map(|(off, v)| (Some(off), v))
+            .unwrap_or((None, 0))
+    };
+    let (nextn_off, nextn) = if !arch.is_empty() {
+        nextns
+            .get(&format!("{arch}.nextn_predict_layers"))
+            .copied()
+            .or_else(|| nextns.values().next().copied())
+            .map(|(off, v)| (Some(off), v))
+            .unwrap_or((None, 0))
+    } else {
+        nextns
+            .values()
+            .next()
+            .copied()
+            .map(|(off, v)| (Some(off), v))
+            .unwrap_or((None, 0))
+    };
 
     if nextn == 0 || nextn > block_count {
         return Ok(false);
@@ -946,12 +1118,16 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
 
     // Rename arch-scoped arrays whose length still counts the MTP layers.
     let prefix = format!("{}.", arch);
-    let renames: Vec<u64> = arrays
+    let renames: Vec<(u64, u8)> = arrays
         .iter()
         .filter(|(_, k, len)| {
             !arch.is_empty() && k.starts_with(&prefix) && *len == block_count as u64
         })
-        .map(|(off, _, _)| *off)
+        .map(|(off, k, _)| {
+            let first = k.as_bytes().first().copied().unwrap_or(b'a');
+            let replacement = if first == b'x' { b'z' } else { b'x' };
+            (*off, replacement)
+        })
         .collect();
 
     let mut f = std::fs::OpenOptions::new()
@@ -968,9 +1144,9 @@ pub fn fix_gguf_phantom_mtp(path: &std::path::Path) -> std::result::Result<bool,
         f.write_all(&0u32.to_le_bytes())
             .map_err(|e| e.to_string())?;
     }
-    for off in renames {
+    for (off, replacement) in renames {
         f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
-        f.write_all(b"x").map_err(|e| e.to_string())?;
+        f.write_all(&[replacement]).map_err(|e| e.to_string())?;
     }
     f.flush().map_err(|e| e.to_string())?;
     Ok(true)
@@ -1017,7 +1193,7 @@ fn ggml_type_nbytes(dtype: u32, elements: u64) -> Option<u64> {
         39 => (32, 17),       // MXFP4
         _ => return None,
     };
-    Some(elements.div_ceil(bs) * es)
+    Some(elements.div_ceil(bs).saturating_mul(es))
 }
 
 fn create_model_info_from_file(path: &PathBuf, format: ModelFormat) -> Result<ModelInfo> {
@@ -1064,9 +1240,9 @@ fn detect_quantization(filename: &str) -> Option<String> {
     // "bf16"/"fp16"/"fp32" before "f16"/"f32" — the shorts are substrings of
     // the longs.
     let quants = [
-        "q4f16", "q4f32", "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0", "q4_k_m",
-        "q4_k_s", "q3_k_m", "q3_k_s", "q3_k_l", "q2_k", "q1_0", "uint4", "uint8", "int4", "int8",
-        "iq4_xs", "iq3_xs", "q8_0_k", "q6_k", "q5_k_m", "q5_k_s", "rtn", "awq", "gptq", "fp16",
+        "q4f16", "q4f32", "q8_0_k", "q8_0", "q7_0", "q6_0", "q5_1", "q5_0", "q4_1", "q4_0",
+        "q4_k_m", "q4_k_s", "q3_k_m", "q3_k_s", "q3_k_l", "q2_k", "q1_0", "uint4", "uint8", "int4",
+        "int8", "iq4_xs", "iq3_xs", "q6_k", "q5_k_m", "q5_k_s", "rtn", "awq", "gptq", "fp16",
         "bf16", "fp32", "f16", "f32",
     ];
 
@@ -1080,14 +1256,28 @@ fn detect_quantization(filename: &str) -> Option<String> {
 
 /// Recursive size in bytes of a file or directory (ONNX models are dirs).
 pub fn dir_size(path: &PathBuf) -> u64 {
+    dir_size_inner(path, 0)
+}
+
+fn dir_size_inner(path: &PathBuf, depth: usize) -> u64 {
+    if depth > MAX_SCAN_DEPTH {
+        return 0;
+    }
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
-                total += dir_size(&path);
+            if file_type.is_dir() {
+                total = total.saturating_add(dir_size_inner(&path, depth + 1));
             } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
+                total = total.saturating_add(meta.len());
             }
         }
     }
@@ -1665,5 +1855,65 @@ mod tests {
         let err = validate_gguf(&path).unwrap_err();
         assert!(err.contains("not a GGUF") || err.contains("corrupt"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remove_model_preserves_sibling_models() {
+        let root = std::env::temp_dir().join(format!("athenas-rm-test-{}", uuid::Uuid::new_v4()));
+        let repo = root.join("org__repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let m1 = repo.join("model-q4.gguf");
+        let m2 = repo.join("model-q8.gguf");
+        std::fs::write(&m1, b"notgguf1").unwrap();
+        std::fs::write(&m2, b"notgguf2").unwrap();
+
+        let reg = ModelRegistry::new(root.clone());
+        reg.remove_model("model-q4.gguf").unwrap();
+        assert!(!m1.exists(), "removed model must be deleted");
+        assert!(m2.exists(), "sibling model must be preserved");
+        assert!(repo.exists(), "non-empty repo dir must remain");
+
+        // Removing the last model should also clean up the now-empty repo dir.
+        reg.remove_model("model-q8.gguf").unwrap();
+        assert!(!m2.exists());
+        assert!(!repo.exists(), "empty repo dir should be cleaned up");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn validate_gguf_rejects_absurd_block_count() {
+        let dir = std::env::temp_dir().join(format!("athenas-gguf-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_full_gguf(&dir, "huge-blocks.gguf", 100_000, 0, &[], 0, false);
+        let err = validate_gguf(&path).unwrap_err();
+        assert!(err.contains("block_count"), "unexpected: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_path_rejects_traversal() {
+        let root = PathBuf::from("/tmp/athenas-models-root");
+        let reg = ModelRegistry::new(root.clone());
+
+        assert!(reg.try_model_dir("../evil").is_err());
+        assert!(reg.try_model_dir("/abs/repo").is_err());
+        assert!(reg.try_model_dir("a\\b").is_err());
+        assert!(reg.try_model_path("org/repo", "../escape.gguf").is_err());
+        assert!(reg.try_model_path("org/repo", "/etc/passwd").is_err());
+        assert!(reg.try_model_path("org/repo", "sub\\file.gguf").is_err());
+
+        // Safe fallback APIs must never escape models_dir.
+        let p = reg.model_path("../evil", "../../etc/passwd");
+        assert!(p.starts_with(&root), "escaped root: {}", p.display());
+        let d = reg.model_dir("../evil");
+        assert!(d.starts_with(&root), "escaped root: {}", d.display());
+    }
+
+    #[test]
+    fn quantization_q8_0_k_matches_before_q8_0() {
+        assert_eq!(
+            detect_quantization("model-Q8_0_K.gguf"),
+            Some("Q8_0_K".to_string())
+        );
     }
 }

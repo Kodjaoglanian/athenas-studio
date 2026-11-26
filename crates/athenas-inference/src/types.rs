@@ -385,8 +385,7 @@ pub struct ToolFunction {
     pub parameters: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ToolChoice {
     #[default]
     Auto,
@@ -395,14 +394,51 @@ pub enum ToolChoice {
     Specific(ToolChoiceSpecific),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Serialize for ToolChoice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ToolChoice::Auto => serializer.serialize_str("auto"),
+            ToolChoice::None => serializer.serialize_str("none"),
+            ToolChoice::Required => serializer.serialize_str("required"),
+            ToolChoice::Specific(spec) => spec.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum ToolChoiceMode {
+            Auto,
+            None,
+            Required,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ToolChoiceHelper {
+            Mode(ToolChoiceMode),
+            Specific(ToolChoiceSpecific),
+        }
+
+        match ToolChoiceHelper::deserialize(deserializer)? {
+            ToolChoiceHelper::Mode(ToolChoiceMode::Auto) => Ok(ToolChoice::Auto),
+            ToolChoiceHelper::Mode(ToolChoiceMode::None) => Ok(ToolChoice::None),
+            ToolChoiceHelper::Mode(ToolChoiceMode::Required) => Ok(ToolChoice::Required),
+            ToolChoiceHelper::Specific(spec) => Ok(ToolChoice::Specific(spec)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolChoiceSpecific {
     #[serde(rename = "type")]
     pub choice_type: String,
     pub function: ToolChoiceFunction,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolChoiceFunction {
     pub name: String,
 }
@@ -493,4 +529,50 @@ pub struct TranscriptionSegment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_choice_serde_roundtrip() {
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::None).unwrap(),
+            "\"none\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ToolChoice::Required).unwrap(),
+            "\"required\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<ToolChoice>("\"auto\"").unwrap(),
+            ToolChoice::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolChoice>("\"none\"").unwrap(),
+            ToolChoice::None
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolChoice>("\"required\"").unwrap(),
+            ToolChoice::Required
+        );
+
+        let specific = ToolChoice::Specific(ToolChoiceSpecific {
+            choice_type: "function".to_string(),
+            function: ToolChoiceFunction {
+                name: "get_weather".to_string(),
+            },
+        });
+        let json = serde_json::to_string(&specific).unwrap();
+        assert_eq!(serde_json::from_str::<ToolChoice>(&json).unwrap(), specific);
+
+        assert!(serde_json::from_str::<ToolChoice>("null").is_err());
+        assert!(serde_json::from_str::<ToolChoice>("\"invalid\"").is_err());
+    }
 }

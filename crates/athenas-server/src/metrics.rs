@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     middleware::Next,
     response::Response,
 };
@@ -126,7 +126,12 @@ pub async fn metrics_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let endpoint = req.uri().path().to_string();
+    let endpoint = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str())
+        .unwrap_or("unmatched")
+        .to_string();
     let method = req.method().to_string();
 
     // Prometheus metrics

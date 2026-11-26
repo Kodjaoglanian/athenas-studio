@@ -6,7 +6,7 @@
 //! When OTEL is disabled, the instruments are no-ops (the global meter
 //! provider returns no-op instruments).
 
-use opentelemetry::metrics::{Counter, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use opentelemetry::{global, KeyValue};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::OnceLock;
@@ -25,6 +25,8 @@ pub struct OtelMetrics {
     tokens_prompt_total: Counter<u64>,
     tokens_generated_total: Counter<u64>,
     errors_total: Counter<u64>,
+    #[allow(dead_code)]
+    _active_gauge: ObservableGauge<i64>,
 }
 
 impl OtelMetrics {
@@ -78,6 +80,7 @@ impl OtelMetrics {
             tokens_prompt_total,
             tokens_generated_total,
             errors_total,
+            _active_gauge,
         }
     }
 }

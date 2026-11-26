@@ -136,8 +136,13 @@ pub struct LlamaCppBackend {
     /// Set after one llama-server re-download attempt during this load —
     /// prevents retry loops when a stale binary rejects a valid model.
     refreshed_server_bin: bool,
+    /// Guards to prevent unbounded recursion when auto-installing missing libs
+    tried_install_libgomp: bool,
+    tried_install_vulkan: bool,
     /// Whether reasoning/thinking mode is enabled (from config)
     reasoning_enabled: bool,
+    /// True on the primary instance that owns the watchdog; false on boxed_clone()
+    owns_watchdog: bool,
     /// Watchdog task that periodically checks if llama-server is alive
     watchdog_handle: Option<tokio::task::JoinHandle<()>>,
     /// Shared flag to signal the watchdog to stop
@@ -169,10 +174,13 @@ impl LlamaCppBackend {
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .http1_only()
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| reqwest::Client::new()),
             skip_reasoning_flag: false,
             refreshed_server_bin: false,
+            tried_install_libgomp: false,
+            tried_install_vulkan: false,
             reasoning_enabled: true,
+            owns_watchdog: true,
             watchdog_handle: None,
             watchdog_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             unresponsive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -493,8 +501,25 @@ impl LlamaCppBackend {
         // accept --mmap/--no-mmap/--mlock and --draft-*/--draft-min-ctx;
         // newer ones replaced them with --load-mode and --spec-draft-*.
         // Probe --help once to pick the right syntax.
-        let help_text = tokio::process::Command::new(&server_bin)
-            .arg("--help")
+        let mut help_cmd = tokio::process::Command::new(&server_bin);
+        help_cmd.arg("--help");
+        #[cfg(unix)]
+        if let Some(parent) = std::path::Path::new(&server_bin).parent() {
+            let lib_path = parent.to_string_lossy().to_string();
+            let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            let new_ld_path = if existing.is_empty() {
+                lib_path
+            } else {
+                format!("{}:{}", lib_path, existing)
+            };
+            help_cmd.env("LD_LIBRARY_PATH", new_ld_path);
+        }
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            help_cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let help_text = help_cmd
             .output()
             .await
             .map(|o| {
@@ -762,9 +787,10 @@ impl LlamaCppBackend {
 
                         if status.code() == Some(127) {
                             // Check if it's libgomp missing — try to auto-install
-                            // (only with inference.auto_install_deps = true)
+                            // (only with inference.auto_install_deps = true, at most once)
                             if full_log.contains("libgomp.so.1") {
-                                if config.auto_install_deps {
+                                if config.auto_install_deps && !self.tried_install_libgomp {
+                                    self.tried_install_libgomp = true;
                                     info!("libgomp.so.1 missing, attempting auto-install...");
                                     let installed = try_install_libgomp().await;
                                     if installed {
@@ -794,7 +820,8 @@ impl LlamaCppBackend {
                             }
                             // Check if libvulkan is missing (Vulkan binary needs it)
                             if full_log.contains("libvulkan.so") || full_log.contains("libvulkan") {
-                                if config.auto_install_deps {
+                                if config.auto_install_deps && !self.tried_install_vulkan {
+                                    self.tried_install_vulkan = true;
                                     info!("libvulkan missing, attempting auto-install...");
                                     let installed =
                                         crate::backend_setup::try_install_vulkan_libs_pub().await;
@@ -875,9 +902,12 @@ impl LlamaCppBackend {
     /// becomes unresponsive (deadlock, OOM, crash), the watchdog logs
     /// an error and marks the backend as unloaded.
     fn start_watchdog(&mut self) {
-        // Stop any existing watchdog
+        // Stop and abort any existing watchdog
         self.watchdog_stop
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.watchdog_handle.take() {
+            handle.abort();
+        }
 
         self.watchdog_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.unresponsive
@@ -1098,6 +1128,8 @@ impl Backend for LlamaCppBackend {
     }
 
     async fn load_model(&mut self, mut config: ModelLoadConfig) -> Result<()> {
+        self.stop_server().await?;
+        self.loaded = false;
         self.model_path = config.model_path.clone();
         self.model_name = std::path::Path::new(&config.model_path)
             .file_stem()
@@ -1106,6 +1138,8 @@ impl Backend for LlamaCppBackend {
             .to_string();
         self.gpu_layers = config.gpu_layers;
         self.refreshed_server_bin = false;
+        self.tried_install_libgomp = false;
+        self.tried_install_vulkan = false;
         self.embedding_mode = false;
         self.decision_mode = false;
 
@@ -1242,6 +1276,9 @@ impl Backend for LlamaCppBackend {
         }
         if let Some(ref grammar) = request.grammar {
             body["grammar"] = serde_json::Value::String(grammar.clone());
+        }
+        if let Some(seed) = request.seed {
+            body["seed"] = serde_json::json!(seed);
         }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
@@ -1439,6 +1476,9 @@ impl Backend for LlamaCppBackend {
         if let Some(ref grammar) = request.grammar {
             body["grammar"] = serde_json::Value::String(grammar.clone());
         }
+        if let Some(seed) = request.seed {
+            body["seed"] = serde_json::json!(seed);
+        }
 
         let url = format!("{}/v1/chat/completions", self.server_url());
         tracing::info!("Sending stream request to llama-server at {}", url);
@@ -1469,7 +1509,7 @@ impl Backend for LlamaCppBackend {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
         let mut full_text = String::new();
         let start_time = std::time::Instant::now();
         let mut token_count: u32 = 0;
@@ -1477,7 +1517,7 @@ impl Backend for LlamaCppBackend {
         while let Some(chunk_result) = stream.next().await {
             match chunk_result {
                 Ok(chunk) => {
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
                 }
                 Err(e) => {
                     tracing::warn!("Stream chunk error (graceful handling): {}", e);
@@ -1510,9 +1550,9 @@ impl Backend for LlamaCppBackend {
                 }
             }
 
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
 
                 if line.is_empty() || !line.starts_with("data: ") {
                     continue;
@@ -1569,7 +1609,7 @@ impl Backend for LlamaCppBackend {
                         } else {
                             0.0
                         };
-                        let _ = tx
+                        if tx
                             .send(StreamChunk {
                                 text: reasoning.to_string(),
                                 done: false,
@@ -1581,7 +1621,11 @@ impl Backend for LlamaCppBackend {
                                     tokens_per_second: tps,
                                 }),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
 
                     // Send actual content tokens
@@ -1594,7 +1638,7 @@ impl Backend for LlamaCppBackend {
                         } else {
                             0.0
                         };
-                        let _ = tx
+                        if tx
                             .send(StreamChunk {
                                 text: content.to_string(),
                                 done: false,
@@ -1606,7 +1650,11 @@ impl Backend for LlamaCppBackend {
                                     tokens_per_second: tps,
                                 }),
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
 
                     // Check finish_reason
@@ -1712,6 +1760,9 @@ impl Backend for LlamaCppBackend {
         if let Some(ref rf) = request.response_format {
             body["response_format"] = rf.clone();
         }
+        if let Some(seed) = request.seed {
+            body["seed"] = serde_json::json!(seed);
+        }
 
         let url = format!("{}/completion", self.server_url());
         tracing::info!("Sending completion request to llama-server at {}", url);
@@ -1747,12 +1798,12 @@ impl Backend for LlamaCppBackend {
             .unwrap_or("")
             .to_string();
 
-        let tokens_decoded = result
-            .get("tokens_decoded")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
         let tokens_predicted = result
             .get("tokens_predicted")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let tokens_evaluated = result
+            .get("tokens_evaluated")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let timings = result.get("timings");
@@ -1769,8 +1820,8 @@ impl Backend for LlamaCppBackend {
             model: self.model_name.clone(),
             text: content,
             stats: InferenceStats {
-                tokens_generated: tokens_decoded,
-                tokens_prompt: tokens_predicted,
+                tokens_generated: tokens_predicted,
+                tokens_prompt: tokens_evaluated,
                 time_total_ms: time_ms,
                 tokens_per_second: tps,
             },
@@ -1790,6 +1841,7 @@ impl Backend for LlamaCppBackend {
             max_tokens: request.max_tokens,
             stream: true,
             stop: request.stop.clone(),
+            seed: request.seed,
             grammar: request.grammar.clone(),
             response_format: request.response_format.clone(),
             ..Default::default()
@@ -2065,7 +2117,10 @@ impl Backend for LlamaCppBackend {
             client: self.client.clone(),
             skip_reasoning_flag: self.skip_reasoning_flag,
             refreshed_server_bin: self.refreshed_server_bin,
+            tried_install_libgomp: self.tried_install_libgomp,
+            tried_install_vulkan: self.tried_install_vulkan,
             reasoning_enabled: self.reasoning_enabled,
+            owns_watchdog: false,
             watchdog_handle: None, // Watchdog is not cloned
             watchdog_stop: self.watchdog_stop.clone(),
             unresponsive: self.unresponsive.clone(),
@@ -2075,11 +2130,14 @@ impl Backend for LlamaCppBackend {
 
 impl Drop for LlamaCppBackend {
     fn drop(&mut self) {
-        // Stop the watchdog
-        self.watchdog_stop
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(handle) = self.watchdog_handle.take() {
-            handle.abort();
+        // Only the primary instance owns the watchdog; dropping a boxed_clone()
+        // must not kill the shared watchdog.
+        if self.owns_watchdog {
+            self.watchdog_stop
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.watchdog_handle.take() {
+                handle.abort();
+            }
         }
         if let Some(mut child) = self.server_handle.take() {
             let _ = child.start_kill();
@@ -2096,11 +2154,12 @@ fn auto_detect_mmproj(model_path: &str) -> Option<String> {
 
     let entries = std::fs::read_dir(dir).ok()?;
 
-    let model_name = path
-        .file_stem()
+    let model_file_name = path
+        .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let model_canonical = std::fs::canonicalize(path).ok();
 
     // Patterns that indicate a multimodal projector file
     let mmproj_patterns = ["mmproj", "vision", "projector"];
@@ -2113,8 +2172,13 @@ fn auto_detect_mmproj(model_path: &str) -> Option<String> {
                 let lower = name.to_lowercase();
 
                 // Skip the model file itself
-                if lower == model_name {
+                if lower == model_file_name {
                     continue;
+                }
+                if let Some(ref model_canon) = model_canonical {
+                    if std::fs::canonicalize(&entry_path).ok().as_ref() == Some(model_canon) {
+                        continue;
+                    }
                 }
 
                 // Check for mmproj patterns
@@ -2351,5 +2415,53 @@ mod tests {
             Some("qwen2"),
             Some("Qwen2")
         ));
+    }
+
+    #[test]
+    fn auto_detect_mmproj_does_not_match_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let vision_model = dir.path().join("llava-vision-7b-Q4_K_M.gguf");
+        std::fs::write(&vision_model, b"model").unwrap();
+
+        assert_eq!(auto_detect_mmproj(vision_model.to_str().unwrap()), None);
+
+        let mmproj = dir.path().join("mmproj-model-f16.gguf");
+        std::fs::write(&mmproj, b"proj").unwrap();
+        assert_eq!(
+            auto_detect_mmproj(vision_model.to_str().unwrap()),
+            Some(mmproj.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn dropping_boxed_clone_does_not_stop_watchdog() {
+        let hw = HardwareInfo {
+            cpus: 4,
+            memory_total_mb: 16 * 1024,
+            memory_available_mb: 16 * 1024,
+            gpus: Vec::new(),
+            has_cuda: false,
+            has_rocm: false,
+            has_vulkan: false,
+            has_metal: false,
+        };
+        let primary = LlamaCppBackend::new(&hw);
+        let stop_flag = primary.watchdog_stop.clone();
+        assert!(!stop_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        {
+            let cloned = primary.boxed_clone();
+            drop(cloned);
+        }
+        assert!(
+            !stop_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping a boxed_clone() must not set watchdog_stop"
+        );
+
+        drop(primary);
+        assert!(
+            stop_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping the primary instance must set watchdog_stop"
+        );
     }
 }

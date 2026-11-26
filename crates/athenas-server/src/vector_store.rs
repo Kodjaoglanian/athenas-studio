@@ -58,28 +58,25 @@ pub struct VectorStore {
 impl VectorStore {
     pub fn new(config: VectorStoreConfig) -> Self {
         let storage_path = config.data_dir.join("vector_store.json");
-        let documents = RwLock::new(HashMap::new());
+        let docs = Self::load_from_disk_sync(&storage_path);
+        let documents = RwLock::new(docs);
 
-        let store = Self {
+        Self {
             config,
             documents,
             storage_path,
-        };
-
-        // Attempt to load existing data
-        store.load_from_disk_blocking();
-        store
+        }
     }
 
-    fn load_from_disk_blocking(&self) {
-        if !self.storage_path.exists() {
-            return;
+    fn load_from_disk_sync(storage_path: &std::path::Path) -> HashMap<String, VectorDocument> {
+        let mut map = HashMap::new();
+        if !storage_path.exists() {
+            return map;
         }
 
-        match std::fs::read_to_string(&self.storage_path) {
+        match std::fs::read_to_string(storage_path) {
             Ok(content) => match serde_json::from_str::<Vec<VectorDocument>>(&content) {
                 Ok(docs) => {
-                    let mut map = self.documents.blocking_write();
                     for doc in docs {
                         map.insert(doc.id.clone(), doc);
                     }
@@ -93,6 +90,7 @@ impl VectorStore {
                 warn!("Failed to read vector store file: {}", e);
             }
         }
+        map
     }
 
     async fn save_to_disk(&self) {
@@ -101,10 +99,20 @@ impl VectorStore {
             map.values().cloned().collect()
         };
 
+        let storage_path = self.storage_path.clone();
         match serde_json::to_string_pretty(&docs) {
             Ok(content) => {
-                if let Err(e) = std::fs::write(&self.storage_path, content) {
-                    warn!("Failed to write vector store: {}", e);
+                let res = tokio::task::spawn_blocking(move || {
+                    if let Some(parent) = storage_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&storage_path, content)
+                })
+                .await;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Failed to write vector store: {}", e),
+                    Err(e) => warn!("Failed to join vector store write task: {}", e),
                 }
             }
             Err(e) => {

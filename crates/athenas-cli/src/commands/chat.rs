@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 pub async fn run(
     model: Option<String>,
     backend: BackendType,
-    gpu_layers: i32,
+    gpu_layers: Option<i32>,
     context_size: u32,
 ) -> Result<()> {
     let config = AppConfig::load()?;
@@ -28,9 +28,10 @@ pub async fn run(
     } else {
         context_size
     };
+    let effective_gpu_layers = gpu_layers.unwrap_or(config.inference.default_gpu_layers);
     let load_config = ModelLoadConfig {
         model_path: model_path.clone(),
-        gpu_layers,
+        gpu_layers: effective_gpu_layers,
         gpu_runtime: config.inference.gpu_runtime,
         gpu_device: config.inference.gpu_device,
         context_size: effective_context_size,
@@ -111,28 +112,36 @@ pub async fn run(
         };
 
         let (tx, mut rx) = mpsc::channel::<StreamChunk>(100);
-        let backend_ref = &backend;
-        let _ = backend_ref.chat_stream(req, tx).await;
+        let stream_fut = backend.chat_stream(req, tx);
+        let recv_fut = async {
+            print!("AI: ");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            let mut full_response = String::new();
+            let mut tps = 0.0f32;
 
-        print!("AI: ");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        let mut full_response = String::new();
-        let mut tps = 0.0f32;
-
-        while let Some(chunk) = rx.recv().await {
-            if chunk.done {
-                if let Some(stats) = chunk.stats {
-                    tps = stats.tokens_per_second;
+            while let Some(chunk) = rx.recv().await {
+                if chunk.done {
+                    if let Some(stats) = chunk.stats {
+                        tps = stats.tokens_per_second;
+                    }
+                } else {
+                    print!("{}", chunk.text);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                    full_response.push_str(&chunk.text);
                 }
-            } else {
-                print!("{}", chunk.text);
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-                full_response.push_str(&chunk.text);
             }
+            (full_response, tps)
+        };
+
+        let (stream_res, (full_response, tps)) = tokio::join!(stream_fut, recv_fut);
+        if let Err(e) = stream_res {
+            eprintln!("\nError: {}", e);
         }
         println!("\n[{:.1} tok/s]\n", tps);
 
-        messages.push(ChatMessage::assistant(&full_response));
+        if !full_response.is_empty() {
+            messages.push(ChatMessage::assistant(&full_response));
+        }
     }
 
     Ok(())

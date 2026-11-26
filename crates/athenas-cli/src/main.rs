@@ -36,9 +36,9 @@ enum Commands {
         /// Backend to use
         #[arg(long, value_enum, default_value = "auto")]
         backend: athenas_core::BackendType,
-        /// GPU layers to offload (-1 for all)
-        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
-        gpu_layers: i32,
+        /// GPU layers to offload (-1 for all; defaults to config.toml)
+        #[arg(long, allow_hyphen_values = true)]
+        gpu_layers: Option<i32>,
         /// Context size (0 = use config default)
         #[arg(long, default_value = "0")]
         context_size: u32,
@@ -57,9 +57,9 @@ enum Commands {
         /// Backend to use
         #[arg(long, value_enum, default_value = "auto")]
         backend: athenas_core::BackendType,
-        /// GPU layers to offload
-        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
-        gpu_layers: i32,
+        /// GPU layers to offload (-1 for all; defaults to config.toml)
+        #[arg(long, allow_hyphen_values = true)]
+        gpu_layers: Option<i32>,
         /// GPU runtime to use (auto, cuda, rocm, vulkan, metal, cpu)
         #[arg(long, value_enum, default_value = "auto")]
         gpu_runtime: athenas_core::GpuRuntime,
@@ -104,9 +104,9 @@ enum Commands {
         /// Max tokens to generate
         #[arg(long, default_value = "2048")]
         max_tokens: u32,
-        /// GPU layers
-        #[arg(long, default_value = "-1", allow_hyphen_values = true)]
-        gpu_layers: i32,
+        /// GPU layers (-1 for all; defaults to config.toml)
+        #[arg(long, allow_hyphen_values = true)]
+        gpu_layers: Option<i32>,
     },
 
     /// Manage models

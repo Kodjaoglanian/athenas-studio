@@ -64,12 +64,35 @@ impl ServerState {
     }
 }
 
-/// Check if a process with the given PID is still running.
+/// Check if a process with the given PID is still running (and not a zombie).
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
+        // Reap if it's our own direct child that already exited.
+        let mut status: libc::c_int = 0;
+        let waited = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+        if waited == pid as i32 {
+            return false;
+        }
+
         // SAFETY: kill(pid, 0) doesn't send a signal — it just checks existence.
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        if unsafe { libc::kill(pid as i32, 0) != 0 } {
+            return false;
+        }
+
+        // On Linux (and systems with /proc), detect zombie ('Z') or dead ('X')
+        // processes so a crashed server doesn't look alive for 5 minutes.
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            if let Some(rparen) = stat.rfind(')') {
+                if let Some(state_ch) = stat[rparen + 1..].trim_start().chars().next() {
+                    if state_ch == 'Z' || state_ch == 'X' {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
     }
     #[cfg(windows)]
     {

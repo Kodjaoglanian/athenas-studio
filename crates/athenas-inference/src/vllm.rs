@@ -38,7 +38,7 @@ impl VllmBackend {
                 .timeout(std::time::Duration::from_secs(300))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
-                .unwrap(),
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -52,7 +52,7 @@ impl VllmBackend {
     }
 
     async fn start_server(&mut self, config: &ModelLoadConfig) -> Result<()> {
-        let python_bin = self.find_vllm().ok_or_else(|| {
+        let bin = self.find_vllm().ok_or_else(|| {
             AthenasError::Backend(
                 "Python/vLLM not found. Install vLLM: pip install vllm".to_string(),
             )
@@ -60,17 +60,28 @@ impl VllmBackend {
 
         self.server_port = find_free_port();
 
-        let mut cmd = tokio::process::Command::new(&python_bin);
-        cmd.arg("-m")
-            .arg("vllm.entrypoints.openai.api_server")
-            .arg("--model")
-            .arg(&config.model_path)
-            .arg("--port")
-            .arg(self.server_port.to_string())
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--max-model-len")
-            .arg(config.context_size.to_string());
+        let mut cmd = tokio::process::Command::new(&bin);
+        if bin == "vllm" {
+            cmd.arg("serve")
+                .arg(&config.model_path)
+                .arg("--port")
+                .arg(self.server_port.to_string())
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--max-model-len")
+                .arg(config.context_size.to_string());
+        } else {
+            cmd.arg("-m")
+                .arg("vllm.entrypoints.openai.api_server")
+                .arg("--model")
+                .arg(&config.model_path)
+                .arg("--port")
+                .arg(self.server_port.to_string())
+                .arg("--host")
+                .arg("127.0.0.1")
+                .arg("--max-model-len")
+                .arg(config.context_size.to_string());
+        }
 
         // GPU configuration
         if self.hardware.has_cuda {
@@ -79,9 +90,42 @@ impl VllmBackend {
             info!("Configuring vLLM with ROCm support");
         }
 
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        // Redirect stdout/stderr to a log file (or null) instead of undrained pipes
+        // to avoid the 64KB pipe buffer deadlock.
+        let vllm_log = dirs::home_dir().and_then(|home| {
+            let dir = home.join(".athenas");
+            let _ = std::fs::create_dir_all(&dir);
+            let launch_id = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default();
+            let log_path = dir.join(format!(
+                "vllm-server-{}-{}.log",
+                self.server_port, launch_id
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .ok()?;
+            let file_clone = file.try_clone().ok()?;
+            info!("vLLM server logs: {}", log_path.display());
+            Some((file, file_clone))
+        });
+
+        match vllm_log {
+            Some((out, err)) => {
+                cmd.stdout(Stdio::from(out))
+                    .stderr(Stdio::from(err))
+                    .kill_on_drop(true);
+            }
+            None => {
+                cmd.stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true);
+            }
+        }
 
         info!(
             "Starting vLLM server on port {} with model: {}",
@@ -98,7 +142,13 @@ impl VllmBackend {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         for _attempt in 0..60 {
             let url = format!("http://127.0.0.1:{}/health", self.server_port);
-            if let Ok(resp) = self.client.get(&url).send().await {
+            if let Ok(resp) = self
+                .client
+                .get(&url)
+                .timeout(tokio::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
                 if resp.status().is_success() {
                     info!("vLLM server is ready on port {}", self.server_port);
                     return Ok(());
@@ -107,6 +157,7 @@ impl VllmBackend {
             if let Some(ref mut child) = self.server_handle {
                 match child.try_wait() {
                     Ok(Some(status)) => {
+                        self.server_handle = None;
                         return Err(AthenasError::Backend(format!(
                             "vLLM exited early with status: {}. Make sure vLLM is installed: pip install vllm",
                             status
@@ -117,6 +168,10 @@ impl VllmBackend {
                 }
             }
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+
+        if let Some(mut child) = self.server_handle.take() {
+            let _ = child.kill().await;
         }
 
         Err(AthenasError::Backend(
@@ -151,6 +206,8 @@ impl Backend for VllmBackend {
     }
 
     async fn load_model(&mut self, config: ModelLoadConfig) -> Result<()> {
+        self.stop_server().await?;
+        self.loaded = false;
         self.model_path = config.model_path.clone();
         self.model_name = std::path::Path::new(&config.model_path)
             .file_stem()
@@ -322,16 +379,16 @@ impl Backend for VllmBackend {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk =
                 chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend_from_slice(&chunk);
 
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
 
                 if line.is_empty() || !line.starts_with("data: ") {
                     continue;
@@ -356,15 +413,18 @@ impl Backend for VllmBackend {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    if !content.is_empty() {
-                        let _ = tx
+                    if !content.is_empty()
+                        && tx
                             .send(StreamChunk {
                                 text: content.to_string(),
                                 done: false,
                                 is_reasoning: false,
                                 stats: None,
                             })
-                            .await;
+                            .await
+                            .is_err()
+                    {
+                        return Ok(());
                     }
 
                     let finish = json
@@ -523,16 +583,16 @@ impl Backend for VllmBackend {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk =
                 chunk_result.map_err(|e| AthenasError::Backend(format!("Stream error: {}", e)))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend_from_slice(&chunk);
 
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
+            while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
 
                 if line.is_empty() || !line.starts_with("data: ") {
                     continue;
@@ -557,15 +617,18 @@ impl Backend for VllmBackend {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
 
-                    if !text.is_empty() {
-                        let _ = tx
+                    if !text.is_empty()
+                        && tx
                             .send(StreamChunk {
                                 text: text.to_string(),
                                 done: false,
                                 is_reasoning: false,
                                 stats: None,
                             })
-                            .await;
+                            .await
+                            .is_err()
+                    {
+                        return Ok(());
                     }
 
                     let finish = json
@@ -588,6 +651,14 @@ impl Backend for VllmBackend {
             }
         }
 
+        let _ = tx
+            .send(StreamChunk {
+                text: String::new(),
+                done: true,
+                is_reasoning: false,
+                stats: None,
+            })
+            .await;
         Ok(())
     }
 
@@ -598,7 +669,7 @@ impl Backend for VllmBackend {
 
         let inputs = request.input.as_vec();
         let body = serde_json::json!({
-            "model": self.model_name,
+            "model": self.model_path,
             "input": inputs,
         });
 
@@ -672,6 +743,23 @@ impl Backend for VllmBackend {
                 total_tokens,
             },
         })
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        if !self.loaded || self.server_port == 0 {
+            return Ok(false);
+        }
+        let url = format!("{}/health", self.server_url());
+        match self
+            .client
+            .get(&url)
+            .timeout(tokio::time::Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(resp) => Ok(resp.status().is_success()),
+            Err(_) => Ok(false),
+        }
     }
 
     fn model_info(&self) -> Option<ModelInfo> {

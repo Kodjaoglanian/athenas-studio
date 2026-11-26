@@ -460,16 +460,46 @@ impl AppConfig {
         }
         let content =
             toml::to_string_pretty(self).map_err(|e| AthenasError::Config(e.to_string()))?;
-        // Owner-only permissions: the config stores the HuggingFace token.
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+
+        // Atomic save: write to a sibling temp file with owner-only permissions
+        // (config may store the HuggingFace token), then rename into place.
+        let tmp_name = format!(
+            ".{}.tmp.{}",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("config.toml"),
+            uuid::Uuid::new_v4()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+
+        let write_result = (|| -> std::io::Result<()> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::io::Write::write_all(&mut f, content.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
         }
-        let mut f = opts.open(&path)?;
-        std::io::Write::write_all(&mut f, content.as_bytes())?;
+
+        if let Err(e) = std::fs::rename(&tmp_path, &path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
         Ok(())
     }
 

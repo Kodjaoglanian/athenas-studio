@@ -20,6 +20,10 @@ pub struct ApiKey {
     pub daily_token_limit: u64,
     pub allowed_models: Vec<String>,
     pub metadata: serde_json::Value,
+    /// Whether this key has administrative privileges (key management, model load/unload,
+    /// audit logs, cache clear, vector store admin, routing mutations).
+    #[serde(default)]
+    pub is_admin: bool,
 }
 
 /// Daily usage tracking for a single API key.
@@ -89,29 +93,47 @@ impl ApiKeyManager {
     }
 
     fn save_keys(&self) {
-        if let Some(parent) = self.keys_file().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let keys: Vec<&ApiKey> = self.keys.values().collect();
-        if let Ok(json) = serde_json::to_string_pretty(&keys) {
-            if let Err(e) = write_private_file(&self.keys_file(), json.as_bytes()) {
+        let path = self.keys_file();
+        let keys: Vec<ApiKey> = self.keys.values().cloned().collect();
+        let Ok(json) = serde_json::to_string_pretty(&keys) else {
+            return;
+        };
+        let write_fn = move || {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = write_private_file(&path, json.as_bytes()) {
                 warn!("Failed to save API keys: {}", e);
             }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(write_fn);
+        } else {
+            write_fn();
         }
     }
 
     fn save_usage(&self) {
-        if let Some(parent) = self.usage_file().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&self.usage) {
-            if let Err(e) = write_private_file(&self.usage_file(), json.as_bytes()) {
+        let path = self.usage_file();
+        let Ok(json) = serde_json::to_string_pretty(&self.usage) else {
+            return;
+        };
+        let write_fn = move || {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = write_private_file(&path, json.as_bytes()) {
                 warn!("Failed to save key usage: {}", e);
             }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(write_fn);
+        } else {
+            write_fn();
         }
     }
 
-    /// Create a new API key.
+    /// Create a new non-admin tenant API key.
     pub fn create_key(
         &mut self,
         name: &str,
@@ -119,6 +141,26 @@ impl ApiKeyManager {
         daily_token_limit: u64,
         allowed_models: Vec<String>,
         metadata: Option<serde_json::Value>,
+    ) -> ApiKey {
+        self.create_key_with_admin(
+            name,
+            rate_limit_per_minute,
+            daily_token_limit,
+            allowed_models,
+            metadata,
+            false,
+        )
+    }
+
+    /// Create a new API key with explicit admin scope.
+    pub fn create_key_with_admin(
+        &mut self,
+        name: &str,
+        rate_limit_per_minute: u32,
+        daily_token_limit: u64,
+        allowed_models: Vec<String>,
+        metadata: Option<serde_json::Value>,
+        is_admin: bool,
     ) -> ApiKey {
         let key_id = format!("key_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let api_key = format!("sk-ath-{}", uuid::Uuid::new_v4().simple());
@@ -133,11 +175,22 @@ impl ApiKeyManager {
             daily_token_limit,
             allowed_models,
             metadata: metadata.unwrap_or(serde_json::Value::Null),
+            is_admin,
         };
         self.keys.insert(api_key.clone(), key.clone());
         self.save_keys();
-        info!("Created API key: {} ({})", key_id, name);
+        info!("Created API key: {} ({}, admin={})", key_id, name, is_admin);
         key
+    }
+
+    /// Returns true if no API keys are configured.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns the number of configured API keys.
+    pub fn len(&self) -> usize {
+        self.keys.len()
     }
 
     /// Revoke (deactivate) a key by key_id.
@@ -291,18 +344,57 @@ impl ApiKeyManager {
     }
 }
 
-/// Write a file with owner-only permissions (0600 on Unix).
+/// Write a file atomically with owner-only permissions (0600 on Unix).
 /// Used for files that contain API secrets.
 fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("secret");
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}",
+        file_name,
+        uuid::Uuid::new_v4().simple()
+    ));
+
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    std::io::Write::write_all(&mut f, contents)
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::io::Write::write_all(&mut f, contents)?;
+        f.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(())
 }
 
 pub type SharedApiKeyManager = Arc<Mutex<ApiKeyManager>>;
@@ -418,9 +510,45 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("athenas-test-{}", uuid::Uuid::new_v4()));
         let mut mgr = ApiKeyManager::new(dir.clone());
         let key = mgr.create_key("persist", 60, 0, vec![], None);
+        assert!(!key.is_admin);
 
-        let mgr2 = ApiKeyManager::new(dir);
+        let mgr2 = ApiKeyManager::new(dir.clone());
         assert!(mgr2.validate(&key.api_key).is_some());
         assert_eq!(mgr2.get_key(&key.key_id).unwrap().name, "persist");
+        assert!(!mgr2.get_key(&key.key_id).unwrap().is_admin);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("api_keys.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn admin_key_and_legacy_json_compat() {
+        let mut mgr = tmp_mgr();
+        let admin = mgr.create_key_with_admin("admin", 60, 0, vec![], None, true);
+        assert!(admin.is_admin);
+
+        // Legacy JSON without is_admin must deserialize with is_admin = false
+        let legacy_json = r#"{
+            "key_id": "key_12345678",
+            "api_key": "sk-ath-legacy",
+            "name": "legacy",
+            "created_at": "2025-01-01T00:00:00Z",
+            "expires_at": null,
+            "active": true,
+            "rate_limit_per_minute": 60,
+            "daily_token_limit": 0,
+            "allowed_models": [],
+            "metadata": null
+        }"#;
+        let parsed: ApiKey = serde_json::from_str(legacy_json).unwrap();
+        assert!(!parsed.is_admin);
     }
 }

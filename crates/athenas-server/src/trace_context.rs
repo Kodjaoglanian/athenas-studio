@@ -8,7 +8,10 @@
 use axum::{extract::Request, http::HeaderMap, middleware::Next, response::Response};
 use opentelemetry::{
     propagation::Extractor,
-    trace::{Span, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState, Tracer},
+    trace::{
+        FutureExt, SpanBuilder, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags,
+        TraceId, TraceState, Tracer,
+    },
     Context, KeyValue,
 };
 
@@ -88,24 +91,33 @@ pub async fn trace_context_middleware(req: Request, next: Next) -> Response {
     let method = req.method().to_string();
     let route = req.uri().path().to_string();
 
-    // Create a server span directly via the OTEL API.
+    // Create a server span directly via the OTEL API with SpanKind::Server
+    // and attach its context to the downstream request future.
     let tracer = opentelemetry::global::tracer("athenas-server");
-    let mut span = tracer.start_with_context("http.server.handle", &remote_context);
-    span.set_attribute(KeyValue::new("http.method", method));
-    span.set_attribute(KeyValue::new("http.route", route));
-    span.set_attribute(KeyValue::new("span.kind", "server"));
+    let span = tracer.build_with_context(
+        SpanBuilder::from_name("http.server.handle")
+            .with_kind(SpanKind::Server)
+            .with_attributes(vec![
+                KeyValue::new("http.method", method),
+                KeyValue::new("http.route", route),
+            ]),
+        &remote_context,
+    );
+    let cx = remote_context.with_span(span);
 
-    let response = next.run(req).await;
+    let response = next.run(req).with_context(cx.clone()).await;
 
-    span.set_attribute(KeyValue::new(
-        "http.status_code",
-        response.status().as_u16() as i64,
-    ));
-    if !response.status().is_success() {
-        span.set_attribute(KeyValue::new("error", true));
+    {
+        let span_ref = cx.span();
+        span_ref.set_attribute(KeyValue::new(
+            "http.status_code",
+            response.status().as_u16() as i64,
+        ));
+        if !response.status().is_success() {
+            span_ref.set_attribute(KeyValue::new("error", true));
+        }
+        span_ref.end();
     }
-
-    span.end();
 
     response
 }

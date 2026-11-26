@@ -24,28 +24,33 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
     for raw_line in text.lines() {
         // Handle code block fences
         if raw_line.trim_start().starts_with("```") {
+            let rule_len = width.saturating_sub(14).clamp(10, 48);
             if in_code_block {
                 // End of code block
                 lines.push(Line::styled(
-                    "  ──────────────────────────".to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    format!("  ╰{}", "─".repeat(rule_len + 8)),
+                    Style::default().fg(crate::theme::BORDER),
                 ));
                 in_code_block = false;
             } else {
                 // Start of code block
                 let lang = raw_line.trim_start().trim_start_matches('`').trim();
                 let label = if lang.is_empty() { "code" } else { lang };
+                let tail_len = rule_len.saturating_sub(label.chars().count()).max(4);
                 lines.push(Line::from(vec![
-                    Span::styled("  ┌─ ".to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        "  ╭─ ".to_string(),
+                        Style::default().fg(crate::theme::BORDER),
+                    ),
                     Span::styled(
                         label.to_string(),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(crate::theme::WARNING)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        " ──────────────────────".to_string(),
-                        Style::default().fg(Color::DarkGray),
+                        format!(" {}", "─".repeat(tail_len)),
+                        Style::default().fg(crate::theme::BORDER),
                     ),
                 ]));
                 in_code_block = true;
@@ -54,12 +59,21 @@ pub fn render_markdown(text: &str, width: usize) -> Vec<Line<'static>> {
         }
 
         if in_code_block {
-            // Render code block content with monospace-like styling
-            for wrapped in wrap_text(raw_line, width.saturating_sub(2)) {
-                lines.push(Line::styled(
-                    format!("  {} ", wrapped),
-                    Style::default().fg(Color::Cyan),
-                ));
+            // Render code block content preserving ALL leading whitespace and internal spacing
+            let inner_w = width.saturating_sub(5);
+            for wrapped in wrap_code_line(raw_line, inner_w) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "  │ ".to_string(),
+                        Style::default().fg(crate::theme::BORDER),
+                    ),
+                    Span::styled(
+                        wrapped,
+                        Style::default()
+                            .fg(crate::theme::PRIMARY)
+                            .bg(crate::theme::BG_CODE),
+                    ),
+                ]));
             }
             continue;
         }
@@ -313,58 +327,23 @@ fn parse_inline(text: &str) -> Vec<Span<'static>> {
     spans
 }
 
-/// Word-wrap a plain text string to the given width.
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+/// Wrap a code block line without collapsing or stripping leading whitespace/indentation.
+/// Tabs are expanded to 4 spaces for consistent display.
+fn wrap_code_line(line: &str, width: usize) -> Vec<String> {
+    let expanded = line.replace('\t', "    ");
     if width == 0 {
-        return vec![text.to_string()];
+        return vec![expanded];
     }
-    let mut result: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_len = 0usize;
-
-    for word in text.split_whitespace() {
-        let word_len = word.chars().count();
-        if current_len == 0 {
-            if word_len <= width {
-                current = word.to_string();
-                current_len = word_len;
-            } else {
-                let chars: Vec<char> = word.chars().collect();
-                let mut idx = 0;
-                while idx < chars.len() {
-                    let end = (idx + width).min(chars.len());
-                    let chunk: String = chars[idx..end].iter().collect();
-                    result.push(chunk);
-                    idx = end;
-                }
-            }
-        } else if current_len + 1 + word_len <= width {
-            current.push(' ');
-            current.push_str(word);
-            current_len += 1 + word_len;
-        } else {
-            result.push(std::mem::take(&mut current));
-            current_len = 0;
-            if word_len <= width {
-                current = word.to_string();
-                current_len = word_len;
-            } else {
-                let chars: Vec<char> = word.chars().collect();
-                let mut idx = 0;
-                while idx < chars.len() {
-                    let end = (idx + width).min(chars.len());
-                    let chunk: String = chars[idx..end].iter().collect();
-                    result.push(chunk);
-                    idx = end;
-                }
-            }
-        }
+    let chars: Vec<char> = expanded.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
     }
-    if !current.is_empty() {
-        result.push(current);
-    }
-    if result.is_empty() {
-        result.push(String::new());
+    let mut result = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let end = (idx + width).min(chars.len());
+        result.push(chars[idx..end].iter().collect());
+        idx = end;
     }
     result
 }
@@ -530,6 +509,20 @@ mod tests {
         let lines = render_markdown(input, 80);
         // Should have: start border, code line, end border
         assert!(lines.len() >= 3);
+    }
+
+    #[test]
+    fn test_render_markdown_code_block_preserves_indentation() {
+        let input = "```python\ndef foo():\n    if True:\n        return  1  +  2\n```";
+        let lines = render_markdown(input, 80);
+        // lines[0] is header, lines[1..4] are code, lines[4] is footer
+        assert_eq!(lines.len(), 5);
+        let line1: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        let line2: String = lines[2].spans.iter().map(|s| s.content.as_ref()).collect();
+        let line3: String = lines[3].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(line1.ends_with("def foo():"));
+        assert!(line2.ends_with("    if True:"));
+        assert!(line3.ends_with("        return  1  +  2"));
     }
 
     #[test]

@@ -159,7 +159,31 @@ impl ModelRouter {
 
     /// Record a failure for a model. Returns true if the model should be skipped.
     pub fn record_failure(&mut self, model_id: &str) -> bool {
+        const MAX_HEALTH_ENTRIES: usize = 256;
         let resolved = self.resolve(model_id);
+
+        if !self.health.contains_key(&resolved) && self.health.len() >= MAX_HEALTH_ENTRIES {
+            // Evict healthy or cooldown-expired entries first
+            let cooldown = self.cooldown_secs;
+            self.health.retain(|_, h| {
+                !h.healthy
+                    && h.last_failure
+                        .map(|t| t.elapsed().as_secs() < cooldown)
+                        .unwrap_or(false)
+            });
+            // If still at capacity, evict the oldest entry
+            if self.health.len() >= MAX_HEALTH_ENTRIES {
+                if let Some(oldest_key) = self
+                    .health
+                    .iter()
+                    .min_by_key(|(_, h)| h.last_failure)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.health.remove(&oldest_key);
+                }
+            }
+        }
+
         let health = self
             .health
             .entry(resolved.clone())

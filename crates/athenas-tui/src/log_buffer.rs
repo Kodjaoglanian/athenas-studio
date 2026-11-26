@@ -99,6 +99,10 @@ impl LogBuffer {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
+    }
 }
 
 /// Strip ANSI escape codes from a string.
@@ -236,8 +240,8 @@ fn format_rfc3339_to_short(ts: &str) -> String {
     if let Some(dot_pos) = time_part.find('.') {
         let secs = &time_part[..dot_pos];
         let frac = &time_part[dot_pos + 1..];
-        // Take first 3 digits of fractional part for milliseconds
-        let ms = if frac.len() >= 3 { &frac[..3] } else { frac };
+        // Take first 3 characters (UTF-8 safe) of fractional part for milliseconds
+        let ms: String = frac.chars().take(3).collect();
         format!("{}.{}", secs, ms)
     } else {
         time_part.to_string()
@@ -310,6 +314,42 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Level filter for the TUI logs page.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogLevelFilter {
+    All,
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl LogLevelFilter {
+    pub fn matches(&self, level: &str) -> bool {
+        match self {
+            LogLevelFilter::All => true,
+            LogLevelFilter::Error => level.eq_ignore_ascii_case("ERROR"),
+            LogLevelFilter::Warn => level.eq_ignore_ascii_case("WARN"),
+            LogLevelFilter::Info => {
+                level.eq_ignore_ascii_case("INFO") || level.eq_ignore_ascii_case("LOG")
+            }
+            LogLevelFilter::Debug => {
+                level.eq_ignore_ascii_case("DEBUG") || level.eq_ignore_ascii_case("TRACE")
+            }
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            LogLevelFilter::All => "ALL",
+            LogLevelFilter::Error => "ERROR",
+            LogLevelFilter::Warn => "WARN",
+            LogLevelFilter::Info => "INFO",
+            LogLevelFilter::Debug => "DEBUG",
+        }
+    }
+}
+
 /// State for the TUI logs page.
 pub struct LogsState {
     pub buffer: LogBuffer,
@@ -319,6 +359,10 @@ pub struct LogsState {
     /// When new logs arrive while scrolled up, this value doesn't change,
     /// so the view stays frozen at the position the user chose.
     pub scroll_top: u16,
+    pub level_filter: LogLevelFilter,
+    pub search_query: String,
+    pub searching: bool,
+    pub wrap_lines: bool,
 }
 
 impl LogsState {
@@ -327,11 +371,38 @@ impl LogsState {
             buffer,
             auto_scroll: true,
             scroll_top: 0,
+            level_filter: LogLevelFilter::All,
+            search_query: String::new(),
+            searching: false,
+            wrap_lines: false,
         }
     }
 
     pub fn entries(&self) -> Vec<LogEntry> {
         self.buffer.entries()
+    }
+
+    pub fn filtered_entries(&self) -> Vec<LogEntry> {
+        let query = self.search_query.to_lowercase();
+        self.buffer
+            .entries()
+            .into_iter()
+            .filter(|e| self.level_filter.matches(&e.level))
+            .filter(|e| {
+                query.is_empty()
+                    || e.message.to_lowercase().contains(&query)
+                    || e.target.to_lowercase().contains(&query)
+                    || e.level.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.buffer.max_entries()
     }
 
     pub fn clear(&self) {
@@ -342,7 +413,7 @@ impl LogsState {
     pub fn scroll_up(&mut self, n: u16) {
         if self.auto_scroll {
             self.auto_scroll = false;
-            let total = self.buffer.entries().len() as u16;
+            let total = self.buffer.len().min(u16::MAX as usize) as u16;
             self.scroll_top = total.saturating_sub(n + 1);
         } else {
             self.scroll_top = self.scroll_top.saturating_sub(n);
@@ -356,7 +427,7 @@ impl LogsState {
             return;
         }
         self.scroll_top = self.scroll_top.saturating_add(n);
-        let total = self.buffer.entries().len() as u16;
+        let total = self.buffer.len().min(u16::MAX as usize) as u16;
         let max_scroll = total.saturating_sub(1);
         if self.scroll_top >= max_scroll {
             self.auto_scroll = true;
@@ -368,5 +439,23 @@ impl LogsState {
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_top = 0;
         self.auto_scroll = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_rfc3339_to_short_handles_utf8_safely() {
+        assert_eq!(
+            format_rfc3339_to_short("2024-08-04T16:33:43.768912Z"),
+            "16:33:43.768"
+        );
+        // Non-ASCII bytes in fractional part must never panic
+        assert_eq!(
+            format_rfc3339_to_short("2024-08-04T16:33:43.ééZ"),
+            "16:33:43.éé"
+        );
     }
 }

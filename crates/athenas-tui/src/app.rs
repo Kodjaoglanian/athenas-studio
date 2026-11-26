@@ -1,12 +1,20 @@
+use std::io::stdout;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io::stdout;
 
-use athenas_core::{AppConfig, HardwareInfo, ModelRegistry, Result};
+use athenas_core::{AppConfig, HardwareInfo, ModelInfo, ModelRegistry, Result};
 use athenas_inference::{
     Backend, BackendFactory, ChatMessage, ChatRequest, MessageContent, ModelLoadConfig,
     RemoteBackend, Role, StreamChunk,
@@ -14,11 +22,18 @@ use athenas_inference::{
 
 use crate::chat::ChatState;
 use crate::components;
+use crate::log_buffer::{LogBuffer, LogLevelFilter, LogsState};
 use crate::model_browser::{BrowserPhase, ModelBrowserState};
 use crate::model_list::ModelListState;
 use crate::server_manager;
 use crate::server_panel::{ConfigField, ServerPanelState, ServerPhase};
 use crate::settings::SettingsState;
+use crate::theme;
+
+enum ChatStreamEvent {
+    Chunk(StreamChunk),
+    Error(String),
+}
 
 enum AdditionalModelLoadResult {
     InProcess(std::result::Result<Box<dyn Backend>, (athenas_core::AthenasError, String, String)>),
@@ -26,6 +41,16 @@ enum AdditionalModelLoadResult {
 }
 
 type AdditionalModelLoadTask = Option<tokio::task::JoinHandle<AdditionalModelLoadResult>>;
+type BrowserSearchTask = Option<
+    tokio::task::JoinHandle<std::result::Result<Vec<athenas_hub::ModelSearchResult>, String>>,
+>;
+type BrowserFilesTask = Option<
+    tokio::task::JoinHandle<
+        std::result::Result<Vec<(String, Option<u64>, Option<String>)>, String>,
+    >,
+>;
+type ModelsRefreshTask = Option<tokio::task::JoinHandle<Vec<ModelInfo>>>;
+type ModelDeleteTask = Option<tokio::task::JoinHandle<(String, std::result::Result<(), String>)>>;
 
 type ServerStartResult = std::result::Result<
     (
@@ -37,6 +62,22 @@ type ServerStartResult = std::result::Result<
     athenas_core::AthenasError,
 >;
 type ServerStartTask = Option<tokio::task::JoinHandle<ServerStartResult>>;
+
+fn http_client(timeout_secs: u64) -> std::result::Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))
+}
+
+fn new_chat_input() -> tui_textarea::TextArea<'static> {
+    let mut ta = tui_textarea::TextArea::default();
+    ta.set_block(theme::rounded_block(" ✦ Message ", true));
+    ta.set_placeholder_text("Message Athenas... (Enter send · Alt+Enter newline · /help)");
+    ta.set_placeholder_style(ratatui::style::Style::default().fg(theme::TEXT_MUTED));
+    ta.set_cursor_line_style(ratatui::style::Style::default());
+    ta
+}
 
 #[derive(PartialEq)]
 pub enum AppMode {
@@ -57,6 +98,17 @@ impl AppMode {
             AppMode::Server => 3,
             AppMode::Settings => 4,
             AppMode::Logs => 5,
+        }
+    }
+
+    pub fn from_tab_index(idx: usize) -> Self {
+        match idx {
+            0 => AppMode::Chat,
+            1 => AppMode::ModelList,
+            2 => AppMode::Browser,
+            3 => AppMode::Server,
+            4 => AppMode::Settings,
+            _ => AppMode::Logs,
         }
     }
 }
@@ -80,6 +132,12 @@ pub struct TuiApp {
             std::result::Result<std::path::PathBuf, athenas_core::AthenasError>,
         >,
     >,
+    // Non-blocking HuggingFace search & file listing tasks
+    browser_search_task: BrowserSearchTask,
+    browser_files_task: BrowserFilesTask,
+    // Non-blocking local model scan & delete tasks
+    models_refresh_task: ModelsRefreshTask,
+    model_delete_task: ModelDeleteTask,
     // Background server state
     server_handle: Option<tokio::task::JoinHandle<athenas_core::Result<()>>>,
     shared_model_manager: Option<athenas_server::SharedModelManager>,
@@ -98,66 +156,64 @@ pub struct TuiApp {
     // Background server start task (server panel)
     server_start_task: ServerStartTask,
     // Logs page state
-    logs_state: crate::log_buffer::LogsState,
-    // Background server log tailer task
+    logs_state: LogsState,
+    // Background server log tailer task + stop flag
     server_log_tailer: Option<tokio::task::JoinHandle<()>>,
+    log_tailer_stop: Arc<AtomicBool>,
     // Background chat streaming state
-    chat_stream_rx: Option<tokio::sync::mpsc::Receiver<StreamChunk>>,
+    chat_stream_rx: Option<tokio::sync::mpsc::Receiver<ChatStreamEvent>>,
     // Cancellation token for the current chat generation.
-    // Sending `true` signals the background stream task to abort.
     chat_cancel: Option<tokio::sync::watch::Sender<bool>>,
     // API Key management modal
     api_key_modal: crate::api_key_modal::ApiKeyModalState,
-    // Periodic system memory refresh (keeps the server panel's
-    // "Est. load" verdict honest — available RAM changes over time)
+    // Global Help modal
+    help_open: bool,
+    // Periodic system memory refresh
     mem_refresh_task: Option<tokio::task::JoinHandle<(u64, u64)>>,
     last_mem_refresh: std::time::Instant,
 }
 
 impl TuiApp {
     pub fn new(config: AppConfig, hardware: HardwareInfo) -> Self {
+        let log_buffer = LogBuffer::new(2000);
+        Self::build_internal(config, hardware, log_buffer)
+    }
+
+    pub fn with_log_buffer(
+        config: AppConfig,
+        hardware: HardwareInfo,
+        log_buffer: LogBuffer,
+    ) -> Self {
+        Self::build_internal(config, hardware, log_buffer)
+    }
+
+    fn build_internal(config: AppConfig, hardware: HardwareInfo, log_buffer: LogBuffer) -> Self {
         let registry = ModelRegistry::new(config.paths.models_dir.clone());
         let models = registry.list_local_models().unwrap_or_default();
 
         let mut model_list_state = ModelListState::default();
-        model_list_state.set_models(models);
+        model_list_state.set_models(models.clone());
 
         let settings_state = SettingsState::new(config.clone()).with_hardware(hardware.clone());
-        let server_panel_state = ServerPanelState::new(&config, hardware.clone());
+        let mut server_panel_state = ServerPanelState::new(&config, hardware.clone());
+        server_panel_state.set_models(models);
 
         // Spawn a background health check to detect an already-running server
         let health_task = tokio::spawn(server_manager::check_running());
 
-        // Create the log buffer (in-memory, circular — never persisted to disk)
-        let log_buffer = crate::log_buffer::LogBuffer::new(2000);
-
-        // Spawn a background task that tails the detached server's log file
-        // and feeds new lines into the log buffer so they appear in the TUI
-        // logs page alongside the TUI process's own tracing events.
-        //
-        // Uses spawn_blocking because the tailer does synchronous file I/O
-        // (std::fs, BufReader) which would block the tokio async runtime
-        // and freeze the TUI rendering if run in an async task.
+        // Spawn a SINGLE background log tailer with an explicit stop flag
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let tailer_stop = Arc::clone(&stop_flag);
         let tailer_buffer = log_buffer.clone();
-        let log_tailer =
-            tokio::task::spawn_blocking(move || Self::run_server_log_tailer(tailer_buffer));
+        let log_tailer = tokio::task::spawn_blocking(move || {
+            Self::run_server_log_tailer(tailer_buffer, tailer_stop)
+        });
 
         Self {
             config,
             hardware,
             chat_state: ChatState::default(),
-            chat_input: {
-                let mut ta = tui_textarea::TextArea::default();
-                ta.set_block(
-                    ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .title(" Input ")
-                        .border_style(
-                            ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
-                        ),
-                );
-                ta
-            },
+            chat_input: new_chat_input(),
             model_list_state,
             browser_state: ModelBrowserState::default(),
             server_panel_state,
@@ -166,6 +222,10 @@ impl TuiApp {
             backend: None,
             download_progress_rx: None,
             download_task: None,
+            browser_search_task: None,
+            browser_files_task: None,
+            models_refresh_task: None,
+            model_delete_task: None,
             server_handle: None,
             shared_model_manager: None,
             server_state: None,
@@ -176,38 +236,19 @@ impl TuiApp {
             additional_model_load_task: None,
             additional_model_name_hint: None,
             server_start_task: None,
-            logs_state: crate::log_buffer::LogsState::new(log_buffer),
+            logs_state: LogsState::new(log_buffer),
             server_log_tailer: Some(log_tailer),
+            log_tailer_stop: stop_flag,
             chat_stream_rx: None,
             chat_cancel: None,
             api_key_modal: crate::api_key_modal::ApiKeyModalState::new(),
+            help_open: false,
             mem_refresh_task: None,
             // Start stale so the first server-tab visit refreshes immediately
             last_mem_refresh: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
         }
-    }
-
-    pub fn with_log_buffer(
-        config: AppConfig,
-        hardware: HardwareInfo,
-        log_buffer: crate::log_buffer::LogBuffer,
-    ) -> Self {
-        let mut app = Self::new(config, hardware);
-        // Replace the default buffer with the one provided by the caller
-        // (which already has a LogBufferLayer attached). The existing tailer
-        // task is still running with the old buffer, so we spawn a new one
-        // with the provided buffer and abort the old one.
-        if let Some(old_tailer) = app.server_log_tailer.take() {
-            old_tailer.abort();
-        }
-        let tailer_buffer = log_buffer.clone();
-        app.server_log_tailer = Some(tokio::task::spawn_blocking(move || {
-            Self::run_server_log_tailer(tailer_buffer)
-        }));
-        app.logs_state = crate::log_buffer::LogsState::new(log_buffer);
-        app
     }
 
     /// Log a TUI event to the tracing system (appears in the logs page).
@@ -227,11 +268,11 @@ impl TuiApp {
     }
 
     /// Ports of llama-server processes that are running now.
-    fn live_llama_server_ports() -> std::collections::HashSet<String> {
+    /// Returns `None` on platforms without `/proc` (macOS/Windows) so the caller
+    /// can fall back to tailing any active log file that grows.
+    fn live_llama_server_ports() -> Option<std::collections::HashSet<String>> {
+        let entries = std::fs::read_dir("/proc").ok()?;
         let mut ports = std::collections::HashSet::new();
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return ports;
-        };
         for entry in entries.flatten() {
             let pid = entry.file_name();
             let pid = pid.to_string_lossy();
@@ -252,29 +293,16 @@ impl TuiApp {
                 }
             }
         }
-        ports
+        Some(ports)
     }
 
-    /// Background thread that tails `~/.athenas/server.log` and pushes new
-    /// lines into the log buffer. This makes the detached server's logs
-    /// (including HTTP request logs) visible in the TUI logs page.
-    ///
-    /// This is a **blocking** function — it must run on a blocking thread
-    /// (via `tokio::task::spawn_blocking`) so it doesn't freeze the async
-    /// runtime and TUI rendering.
-    ///
-    /// The buffer is in-memory only — no logs are persisted by the TUI.
-    ///
-    /// Unlike the previous version, this does NOT block waiting for the log
-    /// file to exist. If the file doesn't exist (no server running), it just
-    /// polls periodically. This means the TUI's own tracing events still
-    /// appear in the logs page even when no server is running.
-    fn run_server_log_tailer(buffer: crate::log_buffer::LogBuffer) {
+    /// Background blocking thread that tails `~/.athenas/server.log` and active
+    /// `llama-server-*.log` files into the in-memory `LogBuffer`.
+    fn run_server_log_tailer(buffer: LogBuffer, stop: Arc<AtomicBool>) {
         let log_path = match dirs::home_dir() {
             Some(h) => h.join(".athenas").join("server.log"),
             None => return,
         };
-        // Also tail the isolated llama-server logs (subprocess output).
         let llama_log_dir = match dirs::home_dir() {
             Some(h) => h.join(".athenas"),
             None => return,
@@ -282,15 +310,17 @@ impl TuiApp {
 
         use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-        // Track the file size we've already read. 0 means we haven't read
-        // anything yet (or the file was truncated/recreated).
         let mut last_size: u64 = 0;
         let mut llama_last_sizes = std::collections::HashMap::new();
-        // Track whether we've done the initial read of the file
         let mut initialized = false;
+        let mut live_ports = Self::live_llama_server_ports();
+        let mut last_proc_scan = std::time::Instant::now();
 
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
 
             // --- Tail server.log (athenas serve output) ---
             let current_size = match std::fs::metadata(&log_path) {
@@ -339,11 +369,12 @@ impl TuiApp {
                 }
             }
 
-            // --- Tail llama-server-<port>.log files (subprocess output) ---
-            // Only files for processes that are running. Old sessions stay on
-            // disk and were being replayed with the current clock, so a batch
-            // error from a previous launch looked like it had just happened.
-            let live_ports = Self::live_llama_server_ports();
+            // Throttle /proc scan to once every 2 seconds
+            if last_proc_scan.elapsed() >= std::time::Duration::from_secs(2) {
+                live_ports = Self::live_llama_server_ports();
+                last_proc_scan = std::time::Instant::now();
+            }
+
             let Ok(entries) = std::fs::read_dir(&llama_log_dir) else {
                 continue;
             };
@@ -357,8 +388,8 @@ impl TuiApp {
                 {
                     continue;
                 }
-                if let Some(port) = Self::llama_log_port(name) {
-                    if !live_ports.contains(port) {
+                if let (Some(ref ports), Some(port)) = (&live_ports, Self::llama_log_port(name)) {
+                    if !ports.contains(port) {
                         continue;
                     }
                 }
@@ -367,8 +398,6 @@ impl TuiApp {
                     continue;
                 };
                 let size = metadata.len();
-                // Attach at EOF — do not replay the last 50KB when the TUI
-                // starts or when a model is reloaded on a new port.
                 let last_size = llama_last_sizes.entry(path.clone()).or_insert(size);
                 if size < *last_size {
                     *last_size = 0;
@@ -401,29 +430,157 @@ impl TuiApp {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        // Install a panic hook that restores the terminal before printing the panic
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let mut out = stdout();
+            let _ = execute!(
+                out,
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
+            default_hook(info);
+        }));
+
         enable_raw_mode().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
         let mut stdout = stdout();
-        execute!(stdout, EnterAlternateScreen)
-            .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )
+        .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal =
             Terminal::new(backend).map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
         let result = self.main_loop(&mut terminal).await;
 
-        // Abort the background server log tailer
+        // Signal the background log tailer to stop cleanly
+        self.log_tailer_stop.store(true, Ordering::Relaxed);
         if let Some(tailer) = self.server_log_tailer.take() {
             tailer.abort();
         }
 
-        disable_raw_mode().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)
-            .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
-        terminal
-            .show_cursor()
-            .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = terminal.show_cursor();
 
         result
+    }
+
+    fn is_modal_or_edit_active(&self) -> bool {
+        self.api_key_modal.open
+            || self.help_open
+            || self.model_list_state.confirm_delete.is_some()
+            || (self.mode == AppMode::Settings && self.settings_state.editing)
+            || (self.mode == AppMode::Server && self.server_panel_state.editing)
+            || (self.mode == AppMode::ModelList && self.model_list_state.filtering)
+            || (self.mode == AppMode::Logs && self.logs_state.searching)
+            || (self.mode == AppMode::Browser && self.browser_state.phase == BrowserPhase::Search)
+    }
+
+    fn switch_to_mode(&mut self, mode: AppMode) {
+        self.mode = mode;
+        if matches!(self.mode, AppMode::ModelList | AppMode::Server) {
+            self.spawn_refresh_models();
+        }
+    }
+
+    fn spawn_refresh_models(&mut self) {
+        if self.models_refresh_task.is_some() {
+            return;
+        }
+        let models_dir = self.config.paths.models_dir.clone();
+        self.models_refresh_task = Some(tokio::task::spawn_blocking(move || {
+            let registry = ModelRegistry::new(models_dir);
+            registry.list_local_models().unwrap_or_default()
+        }));
+    }
+
+    async fn poll_models_refresh(&mut self) {
+        let Some(task) = self.models_refresh_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.models_refresh_task = Some(task);
+            return;
+        }
+        if let Ok(models) = task.await {
+            self.model_list_state.set_models(models.clone());
+            self.server_panel_state.set_models(models);
+        }
+    }
+
+    async fn poll_model_delete(&mut self) {
+        let Some(task) = self.model_delete_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.model_delete_task = Some(task);
+            return;
+        }
+        if let Ok((name, res)) = task.await {
+            match res {
+                Ok(()) => {
+                    self.model_list_state
+                        .set_status(format!("Deleted model '{}'", name));
+                    self.chat_state
+                        .add_message("system", &format!("Model '{}' deleted.", name));
+                    self.spawn_refresh_models();
+                }
+                Err(e) => {
+                    self.model_list_state
+                        .set_error(format!("Failed to delete '{}': {}", name, e));
+                    self.chat_state
+                        .add_error_message(&format!("Failed to delete model '{}': {}", name, e));
+                }
+            }
+        }
+    }
+
+    async fn save_config_async(&self, config: AppConfig) -> std::result::Result<(), String> {
+        tokio::task::spawn_blocking(move || config.save().map_err(|e| e.to_string()))
+            .await
+            .map_err(|e| format!("Save task failed: {}", e))?
+    }
+
+    fn sync_config_from_settings(&mut self) {
+        self.config = self.settings_state.config.clone();
+        self.server_panel_state.sync_from_config(&self.config);
+    }
+
+    fn sync_config_from_server_panel(&mut self) -> AppConfig {
+        let cfg = self.server_panel_state.build_app_config(&self.config);
+        self.config = cfg.clone();
+        self.settings_state.config = cfg.clone();
+        cfg
+    }
+
+    fn scroll_chat_up(&mut self, step: usize) {
+        if self.chat_state.auto_scroll {
+            self.chat_state.auto_scroll = false;
+            self.chat_state.scroll = self.chat_state.max_scroll.saturating_sub(step);
+        } else {
+            self.chat_state.scroll = self.chat_state.scroll.saturating_sub(step);
+        }
+    }
+
+    fn scroll_chat_down(&mut self, step: usize) {
+        if !self.chat_state.auto_scroll {
+            self.chat_state.scroll = self.chat_state.scroll.saturating_add(step);
+            if self.chat_state.scroll >= self.chat_state.max_scroll {
+                self.chat_state.auto_scroll = true;
+            }
+        }
     }
 
     async fn main_loop(
@@ -431,122 +588,138 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         loop {
-            // Poll background download progress (non-blocking)
+            // Poll all non-blocking background tasks
             self.poll_download_progress().await;
-
-            // Poll server task status
+            self.poll_browser_search().await;
+            self.poll_browser_files().await;
+            self.poll_models_refresh().await;
+            self.poll_model_delete().await;
             self.poll_server_status().await;
-
-            // Poll server health check (detect external running server)
             self.poll_server_health().await;
-
-            // Poll model loading task (chat mode)
             self.poll_model_loading().await;
-
-            // Poll additional model loading task (server panel)
             self.poll_additional_model_loading().await;
-
-            // Poll server start task (server panel)
             self.poll_server_start_task().await;
-
-            // Poll/spawn periodic memory refresh (server panel estimate)
             self.poll_mem_refresh().await;
-
-            // Poll chat stream
             self.poll_chat_stream().await;
 
-            // Animate loading spinner
-            if self.is_loading_model {
-                self.loading_spinner = (self.loading_spinner + 1) % 4;
-            }
+            // Smooth 10fps spinner tick (100ms loop interval)
+            self.loading_spinner = self.loading_spinner.wrapping_add(1);
 
             terminal.draw(|f| self.render(f)).ok();
 
             if event::poll(std::time::Duration::from_millis(100))
                 .map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?
             {
-                let event =
+                let ev =
                     event::read().map_err(|e| athenas_core::AthenasError::Tui(e.to_string()))?;
 
-                if let Event::Key(key) = event {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
+                match ev {
+                    Event::Paste(text) => {
+                        self.handle_paste(&text);
                     }
-
-                    // Global keys
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        break;
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
                     }
-
-                    // Tab navigation with F1-F5
-                    if key.code == KeyCode::F(1) {
-                        self.mode = AppMode::Chat;
-                        continue;
-                    }
-                    if key.code == KeyCode::F(2) {
-                        self.mode = AppMode::ModelList;
-                        self.refresh_models();
-                        continue;
-                    }
-                    if key.code == KeyCode::F(3) {
-                        self.mode = AppMode::Browser;
-                        continue;
-                    }
-                    if key.code == KeyCode::F(4) {
-                        self.mode = AppMode::Server;
-                        self.server_panel_state.refresh_models(&self.config);
-                        continue;
-                    }
-                    if key.code == KeyCode::F(5) {
-                        self.mode = AppMode::Settings;
-                        continue;
-                    }
-                    if key.code == KeyCode::F(6) {
-                        self.mode = AppMode::Logs;
-                        continue;
-                    }
-
-                    // Global Tab cycling (skip when editing, in chat mode,
-                    // or when the API key modal is open)
-                    if key.code == KeyCode::Tab
-                        && self.mode != AppMode::Chat
-                        && !(self.mode == AppMode::Settings && self.settings_state.editing)
-                        && !(self.mode == AppMode::Server && self.server_panel_state.editing)
-                        && !self.api_key_modal.open
-                    {
-                        self.mode = match self.mode {
-                            AppMode::Chat => AppMode::ModelList,
-                            AppMode::ModelList => AppMode::Browser,
-                            AppMode::Browser => AppMode::Server,
-                            AppMode::Server => AppMode::Settings,
-                            AppMode::Settings => AppMode::Logs,
-                            AppMode::Logs => AppMode::Chat,
-                        };
-                        if matches!(self.mode, AppMode::ModelList) {
-                            self.refresh_models();
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                        if matches!(self.mode, AppMode::Server) {
-                            self.server_panel_state.refresh_models(&self.config);
+
+                        // Global quit
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            break;
                         }
-                        continue;
-                    }
 
-                    // API key modal intercepts all keys when open
-                    if self.api_key_modal.open {
-                        self.handle_api_key_modal_key(key).await;
-                        continue;
-                    }
+                        // Help modal intercepts keys when open
+                        if self.help_open {
+                            if matches!(
+                                key.code,
+                                KeyCode::Esc
+                                    | KeyCode::Char('?')
+                                    | KeyCode::Enter
+                                    | KeyCode::Char('q')
+                            ) {
+                                self.help_open = false;
+                            }
+                            continue;
+                        }
 
-                    match self.mode {
-                        AppMode::Chat => self.handle_chat_key(key).await,
-                        AppMode::ModelList => self.handle_model_list_key(key).await,
-                        AppMode::Browser => self.handle_browser_key(key).await,
-                        AppMode::Server => self.handle_server_key(key).await,
-                        AppMode::Settings => self.handle_settings_key(key).await,
-                        AppMode::Logs => self.handle_logs_key(key).await,
+                        // API key modal intercepts all keys when open
+                        if self.api_key_modal.open {
+                            self.handle_api_key_modal_key(key).await;
+                            continue;
+                        }
+
+                        // Delete confirmation modal on Models tab intercepts keys
+                        if self.mode == AppMode::ModelList
+                            && self.model_list_state.confirm_delete.is_some()
+                        {
+                            self.handle_model_list_key(key).await;
+                            continue;
+                        }
+
+                        let modal_or_edit = self.is_modal_or_edit_active();
+
+                        // Global F1-F6 & Alt+1..Alt+6 tab switching (blocked during modals/edits)
+                        if !modal_or_edit {
+                            let target_tab = match key.code {
+                                KeyCode::F(1) => Some(0),
+                                KeyCode::F(2) => Some(1),
+                                KeyCode::F(3) => Some(2),
+                                KeyCode::F(4) => Some(3),
+                                KeyCode::F(5) => Some(4),
+                                KeyCode::F(6) => Some(5),
+                                KeyCode::Char(c @ '1'..='6')
+                                    if key.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    Some((c as u8 - b'1') as usize)
+                                }
+                                KeyCode::Char(c @ '1'..='6')
+                                    if self.mode != AppMode::Chat && key.modifiers.is_empty() =>
+                                {
+                                    Some((c as u8 - b'1') as usize)
+                                }
+                                _ => None,
+                            };
+
+                            if let Some(tab) = target_tab {
+                                self.switch_to_mode(AppMode::from_tab_index(tab));
+                                continue;
+                            }
+
+                            // '?' opens Help modal (when not in Chat text input)
+                            if key.code == KeyCode::Char('?') && self.mode != AppMode::Chat {
+                                self.help_open = true;
+                                continue;
+                            }
+
+                            // Tab / Shift+Tab global tab cycling (skip Chat where Tab toggles thinking)
+                            if self.mode != AppMode::Chat {
+                                if key.code == KeyCode::Tab {
+                                    let next = (self.mode.tab_index() + 1) % 6;
+                                    self.switch_to_mode(AppMode::from_tab_index(next));
+                                    continue;
+                                }
+                                if key.code == KeyCode::BackTab {
+                                    let prev = (self.mode.tab_index() + 5) % 6;
+                                    self.switch_to_mode(AppMode::from_tab_index(prev));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match self.mode {
+                            AppMode::Chat => self.handle_chat_key(key).await,
+                            AppMode::ModelList => self.handle_model_list_key(key).await,
+                            AppMode::Browser => self.handle_browser_key(key).await,
+                            AppMode::Server => self.handle_server_key(key).await,
+                            AppMode::Settings => self.handle_settings_key(key).await,
+                            AppMode::Logs => self.handle_logs_key(key).await,
+                        }
                     }
+                    _ => {}
                 }
             }
         }
@@ -554,16 +727,100 @@ impl TuiApp {
         Ok(())
     }
 
-    fn refresh_models(&mut self) {
-        let registry = ModelRegistry::new(self.config.paths.models_dir.clone());
-        let models = registry.list_local_models().unwrap_or_default();
-        self.model_list_state.set_models(models);
+    fn handle_paste(&mut self, text: &str) {
+        if self.help_open || self.api_key_modal.open {
+            return;
+        }
+        match self.mode {
+            AppMode::Chat => {
+                // Insert multiline text cleanly without triggering Enter/send
+                self.chat_input.insert_str(text);
+                self.chat_state.auto_scroll = true;
+            }
+            AppMode::Browser if self.browser_state.phase == BrowserPhase::Search => {
+                self.browser_state
+                    .search_input
+                    .push_str(text.replace(['\r', '\n'], " ").trim());
+            }
+            AppMode::Settings if self.settings_state.editing => {
+                self.settings_state
+                    .edit_buffer
+                    .push_str(text.trim_matches(['\r', '\n']));
+            }
+            AppMode::Server if self.server_panel_state.editing => {
+                self.server_panel_state
+                    .edit_buffer
+                    .push_str(text.trim_matches(['\r', '\n']));
+            }
+            AppMode::ModelList if self.model_list_state.filtering => {
+                self.model_list_state
+                    .filter
+                    .push_str(text.trim_matches(['\r', '\n']));
+                self.model_list_state.clamp_selection();
+            }
+            AppMode::Logs if self.logs_state.searching => {
+                self.logs_state
+                    .search_query
+                    .push_str(text.trim_matches(['\r', '\n']));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: event::MouseEvent) {
+        if self.help_open || self.api_key_modal.open {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Click on top header row (row 0) switches tabs
+                if mouse.row == 0 && !self.is_modal_or_edit_active() {
+                    if let Some(tab) = components::header_tab_at_col(mouse.column) {
+                        self.switch_to_mode(AppMode::from_tab_index(tab));
+                        return;
+                    }
+                }
+                // Click on Server Panel sub-tab bar (row 8: header=1 + telemetry=7)
+                if self.mode == AppMode::Server
+                    && mouse.row == 8
+                    && !self.server_panel_state.editing
+                {
+                    if let Some(subtab) = components::server_subtab_at_col(mouse.column) {
+                        self.server_panel_state.set_subtab(subtab);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => match self.mode {
+                AppMode::Chat => self.scroll_chat_up(3),
+                AppMode::ModelList => self.model_list_state.previous(),
+                AppMode::Browser => match self.browser_state.phase {
+                    BrowserPhase::Results => self.browser_state.prev_result(),
+                    BrowserPhase::SelectFile => self.browser_state.prev_file(),
+                    _ => {}
+                },
+                AppMode::Server => self.server_panel_state.previous(),
+                AppMode::Settings => self.settings_state.previous(),
+                AppMode::Logs => self.logs_state.scroll_up(3),
+            },
+            MouseEventKind::ScrollDown => match self.mode {
+                AppMode::Chat => self.scroll_chat_down(3),
+                AppMode::ModelList => self.model_list_state.next(),
+                AppMode::Browser => match self.browser_state.phase {
+                    BrowserPhase::Results => self.browser_state.next_result(),
+                    BrowserPhase::SelectFile => self.browser_state.next_file(),
+                    _ => {}
+                },
+                AppMode::Server => self.server_panel_state.next(),
+                AppMode::Settings => self.settings_state.next(),
+                AppMode::Logs => self.logs_state.scroll_down(3),
+            },
+            _ => {}
+        }
     }
 
     fn render(&mut self, f: &mut ratatui::Frame) {
         let area = f.area();
 
-        // Split off tab bar (1 line) + content
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .constraints([
@@ -572,12 +829,23 @@ impl TuiApp {
             ])
             .split(area);
 
-        components::render_tab_bar(f, chunks[0], self.mode.tab_index());
+        let header = components::HeaderStatus {
+            active_tab: self.mode.tab_index(),
+            server_running: self.server_panel_state.phase == ServerPhase::Running,
+            server_port: self.server_state.as_ref().map(|s| s.port).or(
+                if self.server_panel_state.phase == ServerPhase::Running {
+                    Some(self.server_panel_state.port)
+                } else {
+                    None
+                },
+            ),
+            active_model: self.chat_state.current_model.as_deref(),
+        };
+        components::render_header_bar(f, chunks[0], &header);
 
         let content = chunks[1];
         match self.mode {
             AppMode::Chat => {
-                // Update GPU info in chat state for status bar display
                 if self.chat_state.gpu_info.is_empty() && !self.hardware.gpus.is_empty() {
                     self.chat_state.gpu_info = self
                         .hardware
@@ -606,10 +874,18 @@ impl TuiApp {
                     &self.model_list_state,
                     self.chat_state.current_model.as_deref(),
                     self.chat_state.current_backend.as_deref(),
+                    &self.hardware,
+                    self.config.inference.default_context_size,
+                    self.config.inference.default_gpu_layers,
                 );
             }
             AppMode::Browser => {
-                components::render_model_browser(f, content, &self.browser_state);
+                components::render_model_browser(
+                    f,
+                    content,
+                    &self.browser_state,
+                    self.loading_spinner,
+                );
             }
             AppMode::Server => {
                 components::render_server_panel(f, content, &self.server_panel_state);
@@ -622,20 +898,43 @@ impl TuiApp {
             }
         }
 
-        // Render API key modal on top of everything if open
+        // Render modals on top
         if self.api_key_modal.open {
             crate::api_key_modal::render_api_key_modal(f, &self.api_key_modal);
+        }
+        if self.help_open {
+            components::render_help_modal(f, self.mode.tab_index());
         }
     }
 
     async fn handle_chat_key(&mut self, key: event::KeyEvent) {
         match key.code {
             KeyCode::Enter => {
-                // Shift+Enter = newline, Enter = send
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.chat_input.input(tui_textarea::Input::from(key));
+                // Shift+Enter or Alt+Enter = newline, Enter = send
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    self.chat_input.insert_newline();
                 } else {
                     self.send_message().await;
+                }
+            }
+            // Ctrl+J = newline (works reliably across all terminals)
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.chat_input.insert_newline();
+            }
+            // Alt+Up / Alt+Down = prompt history
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                let current = self.chat_input.lines().join("\n");
+                if let Some(prev) = self.chat_state.history_prev(&current) {
+                    self.chat_input = new_chat_input();
+                    self.chat_input.insert_str(&prev);
+                }
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(next) = self.chat_state.history_next() {
+                    self.chat_input = new_chat_input();
+                    self.chat_input.insert_str(&next);
                 }
             }
             // Tab toggles reasoning/thinking expansion on last assistant message
@@ -650,47 +949,32 @@ impl TuiApp {
                     msg.reasoning_expanded = !msg.reasoning_expanded;
                 }
             }
-            // Up/Down: scroll chat area (only when not focused on multi-line input)
-            // Use Ctrl+Up/Ctrl+Down for scrolling when input has multiple lines
             KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.chat_state.auto_scroll = false;
-                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                self.scroll_chat_up(1);
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.chat_state.auto_scroll {
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
-                }
+                self.scroll_chat_down(1);
             }
-            // When input is single-line, Up/Down scroll the chat
-            // When multi-line, they navigate within the textarea
             KeyCode::Up => {
                 if self.chat_input.lines().len() <= 1 {
-                    self.chat_state.auto_scroll = false;
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_sub(1);
+                    self.scroll_chat_up(1);
                 } else {
                     self.chat_input.input(tui_textarea::Input::from(key));
                 }
             }
             KeyCode::Down => {
                 if self.chat_input.lines().len() <= 1 {
-                    if !self.chat_state.auto_scroll {
-                        self.chat_state.scroll = self.chat_state.scroll.saturating_add(1);
-                    }
+                    self.scroll_chat_down(1);
                 } else {
                     self.chat_input.input(tui_textarea::Input::from(key));
                 }
             }
-            // PageUp/PageDown for fast scrolling
             KeyCode::PageUp => {
-                self.chat_state.auto_scroll = false;
-                self.chat_state.scroll = self.chat_state.scroll.saturating_sub(20);
+                self.scroll_chat_up(20);
             }
             KeyCode::PageDown => {
-                if !self.chat_state.auto_scroll {
-                    self.chat_state.scroll = self.chat_state.scroll.saturating_add(20);
-                }
+                self.scroll_chat_down(20);
             }
-            // Home/End
             KeyCode::Home => {
                 self.chat_state.auto_scroll = false;
                 self.chat_state.scroll = 0;
@@ -699,26 +983,74 @@ impl TuiApp {
                 self.chat_state.auto_scroll = true;
                 self.chat_state.scroll = 0;
             }
-            // Esc cancels ongoing generation
             KeyCode::Esc if self.chat_state.is_generating => {
                 self.cancel_generation();
             }
-            // All other keys go to the textarea
             _ => {
                 self.chat_input.input(tui_textarea::Input::from(key));
-                // Any typing re-enables auto-scroll
                 self.chat_state.auto_scroll = true;
             }
         }
     }
 
     async fn handle_model_list_key(&mut self, key: event::KeyEvent) {
+        // Delete confirmation modal
+        if let Some((name, _size)) = self.model_list_state.confirm_delete.clone() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.model_list_state.confirm_delete = None;
+                    self.model_list_state
+                        .set_status(format!("Deleting '{}'…", name));
+                    let models_dir = self.config.paths.models_dir.clone();
+                    self.model_delete_task = Some(tokio::task::spawn_blocking(move || {
+                        let registry = ModelRegistry::new(models_dir);
+                        let res = registry.remove_model(&name).map_err(|e| e.to_string());
+                        (name, res)
+                    }));
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.model_list_state.confirm_delete = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Live filter input mode
+        if self.model_list_state.filtering {
+            match key.code {
+                KeyCode::Esc => {
+                    self.model_list_state.filtering = false;
+                    self.model_list_state.filter.clear();
+                    self.model_list_state.clamp_selection();
+                }
+                KeyCode::Enter => {
+                    self.model_list_state.filtering = false;
+                }
+                KeyCode::Backspace => {
+                    self.model_list_state.filter.pop();
+                    self.model_list_state.clamp_selection();
+                }
+                KeyCode::Char(c) => {
+                    self.model_list_state.filter.push(c);
+                    self.model_list_state.clamp_selection();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.model_list_state.next();
+                self.model_list_state.clear_status();
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.model_list_state.previous();
+                self.model_list_state.clear_status();
+            }
+            KeyCode::Char('/') => {
+                self.model_list_state.filtering = true;
             }
             KeyCode::Enter => {
                 if let Some(path) = self
@@ -733,49 +1065,59 @@ impl TuiApp {
             }
             KeyCode::Delete | KeyCode::Char('d') => {
                 if let Some(model) = self.model_list_state.selected() {
-                    let name = model.name.clone();
-                    let registry = ModelRegistry::new(self.config.paths.models_dir.clone());
-                    match registry.remove_model(&name) {
-                        Ok(_) => {
-                            self.chat_state
-                                .add_message("system", &format!("Model '{}' deleted.", name));
-                            self.refresh_models();
-                        }
-                        Err(e) => {
-                            self.chat_state.add_message(
-                                "system",
-                                &format!("Failed to delete model '{}': {}", name, e),
-                            );
-                        }
-                    }
+                    self.model_list_state.confirm_delete = Some((
+                        model.name.clone(),
+                        theme::format_bytes_binary(model.file_size_bytes),
+                    ));
                 }
             }
             KeyCode::Char('u') => {
                 if self.backend.is_some() {
                     let name = self.chat_state.current_model.clone().unwrap_or_default();
                     let backend_name = self.chat_state.current_backend.clone().unwrap_or_default();
-                    // Drop the backend — this frees the model from memory
                     self.backend = None;
                     self.chat_state.current_model = None;
                     self.chat_state.current_backend = None;
-                    // Stop any ongoing stream
                     self.chat_stream_rx = None;
                     self.chat_cancel = None;
                     self.log(&format!(
                         "Model '{}' [{}] unloaded from memory",
                         name, backend_name
                     ));
+                    self.model_list_state
+                        .set_status(format!("Unloaded '{}' [{}]", name, backend_name));
                     self.chat_state.add_message(
                         "system",
                         &format!("Model '{}' [{}] unloaded from memory.", name, backend_name),
                     );
+                } else if self.server_state.is_some()
+                    && !self.server_panel_state.loaded_models.is_empty()
+                {
+                    // Unload from detached server as well
+                    self.unload_model_action().await;
+                    if let Some(msg) = self.server_panel_state.status_message.clone() {
+                        if self.server_panel_state.status_is_error {
+                            self.model_list_state.set_error(msg);
+                        } else {
+                            self.model_list_state.set_status(msg);
+                        }
+                    }
+                    if self.server_panel_state.loaded_models.is_empty() {
+                        self.chat_state.current_model = None;
+                        self.chat_state.current_backend = None;
+                    }
                 } else {
-                    self.chat_state
-                        .add_message("system", "No model is currently loaded.");
+                    self.model_list_state
+                        .set_error("No model is currently loaded");
                 }
             }
             KeyCode::Esc => {
-                self.mode = AppMode::Chat;
+                if !self.model_list_state.filter.is_empty() {
+                    self.model_list_state.filter.clear();
+                    self.model_list_state.clamp_selection();
+                } else {
+                    self.mode = AppMode::Chat;
+                }
             }
             _ => {}
         }
@@ -787,24 +1129,23 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.settings_state.cancel_edit();
                 }
-                KeyCode::Enter => {
-                    if let Err(e) = self.settings_state.save_edit() {
-                        self.settings_state.status_message = Some(e);
-                    } else {
-                        // Sync settings_state.config back to self.config
-                        // so that load_model uses the updated values
-                        self.config = self.settings_state.config.clone();
-                        self.server_panel_state.batch_size =
-                            self.config.inference.default_batch_size;
+                KeyCode::Enter => match self.settings_state.apply_edit() {
+                    Err(e) => self.settings_state.set_error(e),
+                    Ok(()) => {
+                        self.sync_config_from_settings();
+                        match self.save_config_async(self.config.clone()).await {
+                            Ok(()) => self.settings_state.set_status("Saved!"),
+                            Err(e) => {
+                                self.settings_state
+                                    .set_error(format!("Failed to save: {}", e));
+                            }
+                        }
                     }
-                }
+                },
                 KeyCode::Backspace => {
                     self.settings_state.edit_buffer.pop();
                 }
                 KeyCode::Char(c) => {
-                    if self.settings_state.edit_buffer == "[hidden — type to replace]" {
-                        self.settings_state.edit_buffer.clear();
-                    }
                     self.settings_state.edit_buffer.push(c);
                 }
                 _ => {}
@@ -813,54 +1154,27 @@ impl TuiApp {
             match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.settings_state.next();
-                    self.settings_state.status_message = None;
+                    self.settings_state.clear_status();
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.settings_state.previous();
-                    self.settings_state.status_message = None;
+                    self.settings_state.clear_status();
                 }
-                KeyCode::Enter => {
-                    // Device and GpuRuntime are toggles — cycle values
-                    // directly on Enter without entering edit mode.
-                    let field = self.settings_state.current_field().clone();
-                    if field == crate::settings::SettingsField::Device {
-                        let current = self.settings_state.config.inference.default_gpu_layers;
-                        let new_val = if current == 0 { -1 } else { 0 };
-                        self.settings_state.config.inference.default_gpu_layers = new_val;
-                        let device = if new_val == 0 { "CPU" } else { "GPU" };
-                        if let Err(e) = self.settings_state.config.save() {
-                            self.settings_state.status_message =
-                                Some(format!("Failed to save: {}", e));
-                        } else {
-                            self.settings_state.status_message =
-                                Some(format!("Device set to {} — saved", device));
-                            self.log(&format!("Device changed to {}", device));
-                            // Sync back to self.config so load_model uses it
-                            self.config = self.settings_state.config.clone();
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(summary) = self.settings_state.toggle_or_cycle_current() {
+                        self.sync_config_from_settings();
+                        match self.save_config_async(self.config.clone()).await {
+                            Ok(()) => {
+                                self.settings_state
+                                    .set_status(format!("{} — saved", summary));
+                                self.log(&summary);
+                            }
+                            Err(e) => {
+                                self.settings_state
+                                    .set_error(format!("Failed to save: {}", e));
+                            }
                         }
-                    } else if field == crate::settings::SettingsField::GpuRuntime {
-                        use athenas_core::GpuRuntime;
-                        let next = match self.settings_state.config.inference.gpu_runtime {
-                            GpuRuntime::Auto => GpuRuntime::Cuda,
-                            GpuRuntime::Cuda => GpuRuntime::Rocm,
-                            GpuRuntime::Rocm => GpuRuntime::Vulkan,
-                            GpuRuntime::Vulkan => GpuRuntime::Metal,
-                            GpuRuntime::Metal => GpuRuntime::Cpu,
-                            GpuRuntime::Cpu => GpuRuntime::Auto,
-                        };
-                        self.settings_state.config.inference.gpu_runtime = next;
-                        let rt_str = next.to_string();
-                        if let Err(e) = self.settings_state.config.save() {
-                            self.settings_state.status_message =
-                                Some(format!("Failed to save: {}", e));
-                        } else {
-                            self.settings_state.status_message =
-                                Some(format!("GPU runtime set to {} — saved", rt_str));
-                            self.log(&format!("GPU runtime changed to {}", rt_str));
-                            // Sync back to self.config so load_model uses it
-                            self.config = self.settings_state.config.clone();
-                        }
-                    } else {
+                    } else if key.code == KeyCode::Enter {
                         self.settings_state.start_edit();
                     }
                 }
@@ -873,6 +1187,26 @@ impl TuiApp {
     }
 
     async fn handle_logs_key(&mut self, key: event::KeyEvent) {
+        if self.logs_state.searching {
+            match key.code {
+                KeyCode::Esc => {
+                    self.logs_state.searching = false;
+                    self.logs_state.search_query.clear();
+                }
+                KeyCode::Enter => {
+                    self.logs_state.searching = false;
+                }
+                KeyCode::Backspace => {
+                    self.logs_state.search_query.pop();
+                }
+                KeyCode::Char(c) => {
+                    self.logs_state.search_query.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.logs_state.scroll_up(1);
@@ -881,10 +1215,10 @@ impl TuiApp {
                 self.logs_state.scroll_down(1);
             }
             KeyCode::PageUp => {
-                self.logs_state.scroll_up(10);
+                self.logs_state.scroll_up(15);
             }
             KeyCode::PageDown => {
-                self.logs_state.scroll_down(10);
+                self.logs_state.scroll_down(15);
             }
             KeyCode::End => {
                 self.logs_state.scroll_to_bottom();
@@ -893,14 +1227,37 @@ impl TuiApp {
                 self.logs_state.clear();
             }
             KeyCode::Char('a') => {
-                if self.logs_state.auto_scroll {
-                    self.logs_state.scroll_up(1);
-                } else {
-                    self.logs_state.scroll_to_bottom();
-                }
+                self.logs_state.level_filter = LogLevelFilter::All;
+                self.logs_state.scroll_to_bottom();
+            }
+            KeyCode::Char('e') => {
+                self.logs_state.level_filter = LogLevelFilter::Error;
+                self.logs_state.scroll_to_bottom();
+            }
+            KeyCode::Char('w') => {
+                self.logs_state.level_filter = LogLevelFilter::Warn;
+                self.logs_state.scroll_to_bottom();
+            }
+            KeyCode::Char('i') => {
+                self.logs_state.level_filter = LogLevelFilter::Info;
+                self.logs_state.scroll_to_bottom();
+            }
+            KeyCode::Char('d') => {
+                self.logs_state.level_filter = LogLevelFilter::Debug;
+                self.logs_state.scroll_to_bottom();
+            }
+            KeyCode::Char('/') => {
+                self.logs_state.searching = true;
+            }
+            KeyCode::Char('z') | KeyCode::Char('v') => {
+                self.logs_state.wrap_lines = !self.logs_state.wrap_lines;
             }
             KeyCode::Esc => {
-                self.mode = AppMode::Chat;
+                if !self.logs_state.search_query.is_empty() {
+                    self.logs_state.search_query.clear();
+                } else {
+                    self.mode = AppMode::Chat;
+                }
             }
             _ => {}
         }
@@ -911,10 +1268,8 @@ impl TuiApp {
             BrowserPhase::Search => match key.code {
                 KeyCode::Enter => {
                     let query = self.browser_state.search_input.trim().to_string();
-                    if !query.is_empty() {
-                        self.browser_state.status_message = Some("Searching...".to_string());
-                        self.browser_state.status_is_error = false;
-                        self.perform_search(&query).await;
+                    if !query.is_empty() && !self.browser_state.is_busy {
+                        self.start_browser_search(query);
                     }
                 }
                 KeyCode::Backspace => {
@@ -926,6 +1281,11 @@ impl TuiApp {
                     self.browser_state.gguf_only = !self.browser_state.gguf_only;
                 }
                 KeyCode::Esc => {
+                    if let Some(h) = self.browser_search_task.take() {
+                        h.abort();
+                    }
+                    self.browser_state.is_busy = false;
+                    self.browser_state.busy_label = None;
                     self.mode = AppMode::Chat;
                 }
                 KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -944,20 +1304,25 @@ impl TuiApp {
                     self.browser_state.prev_result();
                 }
                 KeyCode::Enter => {
-                    if let Some(result) = self.browser_state.selected_result() {
-                        let repo_id = result.id.clone();
-                        self.browser_state.status_message = Some("Loading files...".to_string());
-                        self.browser_state.status_is_error = false;
-                        self.list_files(&repo_id).await;
+                    if !self.browser_state.is_busy {
+                        if let Some(result) = self.browser_state.selected_result() {
+                            let repo_id = result.id.clone();
+                            self.start_browser_list_files(repo_id);
+                        }
                     }
                 }
-                KeyCode::Esc => {
-                    self.browser_state.back_to_search_edit();
-                }
-                KeyCode::Char('/') => {
+                KeyCode::Esc | KeyCode::Char('/') => {
+                    if let Some(h) = self.browser_files_task.take() {
+                        h.abort();
+                    }
+                    self.browser_state.is_busy = false;
+                    self.browser_state.busy_label = None;
                     self.browser_state.back_to_search_edit();
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if let Some(h) = self.browser_files_task.take() {
+                        h.abort();
+                    }
                     self.browser_state.reset_search();
                 }
                 _ => {}
@@ -996,7 +1361,6 @@ impl TuiApp {
             },
             BrowserPhase::Downloading => {
                 if key.code == KeyCode::Esc {
-                    // Abort: drop the receiver and task
                     self.download_progress_rx = None;
                     if let Some(handle) = self.download_task.take() {
                         handle.abort();
@@ -1011,81 +1375,134 @@ impl TuiApp {
         }
     }
 
-    async fn perform_search(&mut self, query: &str) {
-        let token = self.config.huggingface.token.clone();
-        let client = athenas_hub::HuggingFaceClient::new(token);
-        let filters = athenas_hub::ModelSearchFilters {
-            pipeline_tag: None,
-            library_name: None,
-            gguf_only: self.browser_state.gguf_only,
-            safetensors_only: false,
-        };
+    fn start_browser_search(&mut self, query: String) {
+        if let Some(h) = self.browser_search_task.take() {
+            h.abort();
+        }
+        self.browser_state.is_busy = true;
+        self.browser_state.busy_label = Some(format!("Searching HuggingFace for '{}'…", query));
+        self.browser_state.status_message = None;
+        self.browser_state.status_is_error = false;
 
-        match client.search_models(query, &filters).await {
-            Ok(results) => {
+        let token = self.config.huggingface.token.clone();
+        let gguf_only = self.browser_state.gguf_only;
+        self.browser_search_task = Some(tokio::spawn(async move {
+            let client = athenas_hub::HuggingFaceClient::new(token);
+            let filters = athenas_hub::ModelSearchFilters {
+                pipeline_tag: None,
+                library_name: None,
+                gguf_only,
+                safetensors_only: false,
+            };
+            client
+                .search_models(&query, &filters)
+                .await
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    async fn poll_browser_search(&mut self) {
+        let Some(task) = self.browser_search_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.browser_search_task = Some(task);
+            return;
+        }
+        self.browser_state.is_busy = false;
+        self.browser_state.busy_label = None;
+        match task.await {
+            Ok(Ok(results)) => {
                 self.browser_state.search_results = results;
                 self.browser_state.results_selected = 0;
                 self.browser_state.phase = BrowserPhase::Results;
                 self.browser_state.status_message = None;
                 self.browser_state.status_is_error = false;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.browser_state.status_message = Some(format!("Search failed: {}", e));
+                self.browser_state.status_is_error = true;
+            }
+            Err(e) => {
+                self.browser_state.status_message = Some(format!("Search task failed: {}", e));
                 self.browser_state.status_is_error = true;
             }
         }
     }
 
-    async fn list_files(&mut self, repo_id: &str) {
+    fn start_browser_list_files(&mut self, repo_id: String) {
+        if let Some(h) = self.browser_files_task.take() {
+            h.abort();
+        }
+        self.browser_state.is_busy = true;
+        self.browser_state.busy_label = Some(format!("Fetching files from {}…", repo_id));
+        self.browser_state.status_message = None;
+        self.browser_state.status_is_error = false;
+
         let token = self.config.huggingface.token.clone();
-        let client = athenas_hub::HuggingFaceClient::new(token);
+        self.browser_files_task = Some(tokio::spawn(async move {
+            let client = athenas_hub::HuggingFaceClient::new(token);
+            let files = client
+                .get_model_files_recursive(&repo_id, "main")
+                .await
+                .map_err(|e| e.to_string())?;
 
-        match client.get_model_files_recursive(repo_id, "main").await {
-            Ok(files) => {
-                let mut options: Vec<(String, Option<u64>, Option<String>)> = files
+            let mut options: Vec<(String, Option<u64>, Option<String>)> = files
+                .iter()
+                .filter(|f| f.path.ends_with(".gguf"))
+                .map(|f| {
+                    (
+                        f.path.clone(),
+                        f.size.or(f.lfs.as_ref().and_then(|l| l.size)),
+                        f.lfs.as_ref().and_then(|l| l.sha256.clone()),
+                    )
+                })
+                .collect();
+
+            let mut onnx_groups: Vec<(String, u64)> = Vec::new();
+            for f in files.iter().filter(|f| f.path.ends_with(".onnx")) {
+                let dir = f
+                    .path
+                    .rsplit_once('/')
+                    .map(|(d, _)| d.to_string())
+                    .unwrap_or_default();
+                let size: u64 = files
                     .iter()
-                    .filter(|f| f.path.ends_with(".gguf"))
-                    .map(|f| {
-                        (
-                            f.path.clone(),
-                            f.size.or(f.lfs.as_ref().and_then(|l| l.size)),
-                            f.lfs.as_ref().and_then(|l| l.sha256.clone()),
-                        )
+                    .filter(|g| {
+                        g.path
+                            .rsplit_once('/')
+                            .map(|(d, _)| d.to_string())
+                            .unwrap_or_default()
+                            == dir
                     })
-                    .collect();
-
-                // ONNX variants: group .onnx files by parent dir. The option
-                // name is `onnx-dir:<variant>` handled by start_download.
-                let mut onnx_groups: Vec<(String, u64)> = Vec::new();
-                for f in files.iter().filter(|f| f.path.ends_with(".onnx")) {
-                    let dir = f
-                        .path
-                        .rsplit_once('/')
-                        .map(|(d, _)| d.to_string())
-                        .unwrap_or_default();
-                    let size: u64 = files
-                        .iter()
-                        .filter(|g| {
-                            g.path
-                                .rsplit_once('/')
-                                .map(|(d, _)| d.to_string())
-                                .unwrap_or_default()
-                                == dir
-                        })
-                        .map(|g| g.size.or(g.lfs.as_ref().and_then(|l| l.size)).unwrap_or(0))
-                        .sum();
-                    if !onnx_groups.iter().any(|(d, _)| d == &dir) {
-                        onnx_groups.push((dir, size));
-                    }
+                    .map(|g| g.size.or(g.lfs.as_ref().and_then(|l| l.size)).unwrap_or(0))
+                    .sum();
+                if !onnx_groups.iter().any(|(d, _)| d == &dir) {
+                    onnx_groups.push((dir, size));
                 }
-                for (dir, size) in onnx_groups {
-                    options.push((format!("onnx-dir:{}", dir), Some(size), None));
-                }
+            }
+            for (dir, size) in onnx_groups {
+                options.push((format!("onnx-dir:{}", dir), Some(size), None));
+            }
+            Ok(options)
+        }));
+    }
 
+    async fn poll_browser_files(&mut self) {
+        let Some(task) = self.browser_files_task.take() else {
+            return;
+        };
+        if !task.is_finished() {
+            self.browser_files_task = Some(task);
+            return;
+        }
+        self.browser_state.is_busy = false;
+        self.browser_state.busy_label = None;
+        match task.await {
+            Ok(Ok(options)) => {
                 if options.is_empty() {
                     self.browser_state.status_message = Some(
-                        "No GGUF or ONNX files found in this repo. \
-                         Try searching for a quantized version."
+                        "No GGUF or ONNX files found in this repo. Try a quantized version."
                             .to_string(),
                     );
                     self.browser_state.status_is_error = true;
@@ -1097,8 +1514,12 @@ impl TuiApp {
                     self.browser_state.status_is_error = false;
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 self.browser_state.status_message = Some(format!("Failed to list files: {}", e));
+                self.browser_state.status_is_error = true;
+            }
+            Err(e) => {
+                self.browser_state.status_message = Some(format!("File list task failed: {}", e));
                 self.browser_state.status_is_error = true;
             }
         }
@@ -1205,8 +1626,7 @@ impl TuiApp {
                         self.browser_state.status_message =
                             Some(format!("Downloaded to: {}", path.display()));
                         self.browser_state.status_is_error = false;
-                        self.refresh_models();
-                        self.server_panel_state.refresh_models(&self.config);
+                        self.spawn_refresh_models();
                     }
                     Ok(Err(e)) => {
                         self.browser_state.phase = BrowserPhase::Results;
@@ -1297,25 +1717,15 @@ impl TuiApp {
             return;
         }
 
+        self.chat_state.push_history(text.clone());
         self.chat_state.add_message("user", &text);
-        self.chat_input = tui_textarea::TextArea::default();
-        self.chat_input.set_block(
-            ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input ")
-                .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
-        );
+        self.chat_input = new_chat_input();
         self.chat_state.is_generating = true;
         self.chat_state.generation_start = Some(std::time::Instant::now());
 
         // Build chat request from current messages
-        // Filter out ALL system messages — they are TUI informational messages
-        // (welcome, model loaded, errors) not meant for the model's context.
-        // Many model chat templates (e.g. Qwen) require system messages only
-        // at the beginning and reject them if placed after user/assistant turns.
         let mut messages: Vec<ChatMessage> = Vec::new();
 
-        // Prepend custom system prompt if set (via /system command)
         if !self.chat_state.system_prompt.is_empty() {
             messages.push(ChatMessage {
                 role: Role::System,
@@ -1323,12 +1733,11 @@ impl TuiApp {
             });
         }
 
-        // Add conversation messages (excluding TUI system messages)
         messages.extend(
             self.chat_state
                 .messages
                 .iter()
-                .filter(|m| m.role != "system")
+                .filter(|m| m.role != "system" && m.role != "error")
                 .map(|m| {
                     let role = match m.role.as_str() {
                         "user" => Role::User,
@@ -1357,7 +1766,6 @@ impl TuiApp {
             grammar: None,
         };
 
-        // Get a backend reference: prefer local backend, then in-process server, then detached server
         let backend_ref: Option<Box<dyn Backend>> = if let Some(ref b) = self.backend {
             Some(b.boxed_clone())
         } else if let Some(mgr) = &self.shared_model_manager {
@@ -1376,16 +1784,16 @@ impl TuiApp {
         };
 
         let Some(backend) = backend_ref else {
+            self.chat_state.is_generating = false;
+            self.chat_state.generation_start = None;
             self.chat_state
-                .add_message("system", "No backend available for inference.");
+                .add_error_message("No backend available for inference.");
             return;
         };
 
         if !self.config.inference.streaming_enabled {
-            // Non-streaming: spawn chat() in background, show result when done
-            let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+            let (tx, rx) = tokio::sync::mpsc::channel::<ChatStreamEvent>(100);
             let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-            // Mark the initial value as seen so changed() doesn't fire immediately
             cancel_rx.borrow_and_update();
             tokio::spawn(async move {
                 tokio::select! {
@@ -1393,24 +1801,25 @@ impl TuiApp {
                         match result {
                             Ok(resp) => {
                                 let _ = tx
-                                    .send(StreamChunk {
+                                    .send(ChatStreamEvent::Chunk(StreamChunk {
                                         text: resp.message.content.as_text(),
                                         done: false,
                                         is_reasoning: false,
                                         stats: None,
-                                    })
+                                    }))
                                     .await;
                                 let _ = tx
-                                    .send(StreamChunk {
+                                    .send(ChatStreamEvent::Chunk(StreamChunk {
                                         text: String::new(),
                                         done: true,
                                         is_reasoning: false,
                                         stats: Some(resp.stats),
-                                    })
+                                    }))
                                     .await;
                             }
                             Err(e) => {
                                 tracing::error!("Chat error: {}", e);
+                                let _ = tx.send(ChatStreamEvent::Error(e.to_string())).await;
                             }
                         }
                     }
@@ -1424,17 +1833,31 @@ impl TuiApp {
             return;
         }
 
-        // Start streaming in background — store receiver for polling
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
+        // Start streaming in background — bridge StreamChunk into ChatStreamEvent so errors surface in Chat
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<ChatStreamEvent>(100);
+        let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
-        // Mark the initial value as seen so changed() doesn't fire immediately
         cancel_rx.borrow_and_update();
+
+        let forward_tx = event_tx.clone();
         tokio::spawn(async move {
-            // Wrap the stream in a select! so we can abort when cancel is signaled
+            while let Some(chunk) = chunk_rx.recv().await {
+                if forward_tx
+                    .send(ChatStreamEvent::Chunk(chunk))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        tokio::spawn(async move {
             tokio::select! {
-                result = backend.chat_stream(req, tx) => {
+                result = backend.chat_stream(req, chunk_tx) => {
                     if let Err(e) = result {
                         tracing::error!("Chat stream error: {}", e);
+                        let _ = event_tx.send(ChatStreamEvent::Error(e.to_string())).await;
                     }
                 }
                 _ = cancel_rx.changed() => {
@@ -1443,40 +1866,33 @@ impl TuiApp {
             }
         });
 
-        self.chat_stream_rx = Some(rx);
+        self.chat_stream_rx = Some(event_rx);
         self.chat_cancel = Some(cancel_tx);
     }
 
     /// Cancel the ongoing chat generation.
-    /// Sends the cancel signal, finalizes whatever was generated so far,
-    /// and cleans up the stream receiver.
     fn cancel_generation(&mut self) {
-        // Send cancel signal to the background task
         if let Some(cancel_tx) = &self.chat_cancel {
             let _ = cancel_tx.send(true);
         }
         self.chat_cancel = None;
 
-        // Finalize whatever was generated so far as a partial response
         let had_content = !self.chat_state.streaming_text.is_empty()
             || !self.chat_state.streaming_reasoning.is_empty();
         self.chat_state.finalize_streaming();
 
-        // If nothing was generated, add a system message
         if !had_content {
             self.chat_state
                 .add_message("system", "Generation cancelled.");
-        } else {
-            // Append a note that this was cancelled
-            if let Some(last) = self.chat_state.messages.last_mut() {
-                if last.role == "assistant" {
-                    last.content
-                        .push_str("\n\n_⚠ Generation cancelled by user._");
-                }
+        } else if let Some(last) = self.chat_state.messages.last_mut() {
+            if last.role == "assistant" {
+                last.content
+                    .push_str("\n\n_⚠ Generation cancelled by user._");
+                let last_idx = self.chat_state.messages.len().saturating_sub(1);
+                self.chat_state.invalidate_md_cache(last_idx);
             }
         }
 
-        // Drop the stream receiver
         self.chat_stream_rx = None;
     }
 
@@ -1485,15 +1901,12 @@ impl TuiApp {
             return;
         }
 
-        // Timeout check: only abort if NO tokens received within 120s.
-        // If the model is actively generating (reasoning or content), keep waiting.
         if let Some(start) = self.chat_state.generation_start {
             let elapsed = start.elapsed().as_secs();
             let has_output = !self.chat_state.streaming_text.is_empty()
                 || !self.chat_state.streaming_reasoning.is_empty();
             if elapsed > 120 && !has_output {
-                self.chat_state.add_message(
-                    "system",
+                self.chat_state.add_error_message(
                     "Request timed out (120s with no output). The model may not be responding. \
                      Try a smaller model, reduce context size, or disable reasoning in Settings.",
                 );
@@ -1505,30 +1918,39 @@ impl TuiApp {
         }
 
         if let Some(rx) = &mut self.chat_stream_rx {
-            // Non-blocking: try to receive available chunks without waiting
-            while let Ok(chunk) = rx.try_recv() {
-                if chunk.done {
-                    if let Some(stats) = chunk.stats {
-                        self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    ChatStreamEvent::Error(err) => {
+                        self.chat_state.finalize_streaming();
+                        self.chat_state
+                            .add_error_message(&format!("Generation failed: {}", err));
+                        self.chat_stream_rx = None;
+                        self.chat_cancel = None;
+                        return;
                     }
-                    self.chat_state.finalize_streaming();
-                    self.chat_stream_rx = None;
-                    self.chat_cancel = None;
-                    return;
-                } else {
-                    if chunk.is_reasoning {
-                        self.chat_state.append_reasoning(&chunk.text);
-                    } else {
-                        self.chat_state.append_streaming(&chunk.text);
-                    }
-                    // Update tok/s live during streaming
-                    if let Some(stats) = &chunk.stats {
-                        self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+                    ChatStreamEvent::Chunk(chunk) => {
+                        if chunk.done {
+                            if let Some(stats) = chunk.stats {
+                                self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+                            }
+                            self.chat_state.finalize_streaming();
+                            self.chat_stream_rx = None;
+                            self.chat_cancel = None;
+                            return;
+                        } else {
+                            if chunk.is_reasoning {
+                                self.chat_state.append_reasoning(&chunk.text);
+                            } else {
+                                self.chat_state.append_streaming(&chunk.text);
+                            }
+                            if let Some(stats) = &chunk.stats {
+                                self.chat_state.tokens_per_second = Some(stats.tokens_per_second);
+                            }
+                        }
                     }
                 }
             }
 
-            // Check if the sender was dropped (stream ended without done chunk)
             if rx.is_closed() {
                 if self.chat_state.is_generating {
                     self.chat_state.finalize_streaming();
@@ -1572,15 +1994,13 @@ impl TuiApp {
                 }
             }
             "/model" | "/models" => {
-                self.mode = AppMode::ModelList;
-                self.refresh_models();
+                self.switch_to_mode(AppMode::ModelList);
             }
             "/browser" => {
                 self.mode = AppMode::Browser;
             }
             "/server" => {
-                self.mode = AppMode::Server;
-                self.server_panel_state.refresh_models(&self.config);
+                self.switch_to_mode(AppMode::Server);
             }
             "/settings" => {
                 self.mode = AppMode::Settings;
@@ -1595,13 +2015,14 @@ impl TuiApp {
                      /system <prompt> — set system prompt for the model\n\
                      /system — show current system prompt\n\
                      /system clear — remove system prompt\n\
-                     Esc — cancel ongoing generation\n\
-                     F1: Chat | F2: Models | F3: Browser | F4: Server | F5: Settings | F6: Logs | Ctrl+C: Quit",
+                     Alt+Enter / Ctrl+J / Shift+Enter — insert newline\n\
+                     Alt+↑ / Alt+↓ — recall prompt history\n\
+                     Tab — expand/collapse Thinking | Esc — cancel generation\n\
+                     F1–F6 or Alt+1–6: Switch tabs | Ctrl+C: Quit",
                 );
             }
             "/system" => {
                 if parts.len() < 2 || parts[1].trim().is_empty() {
-                    // Show current system prompt
                     if self.chat_state.system_prompt.is_empty() {
                         self.chat_state.add_message(
                             "system",
@@ -1633,13 +2054,7 @@ impl TuiApp {
                     .add_message("system", &format!("Unknown command: {}", parts[0]));
             }
         }
-        self.chat_input = tui_textarea::TextArea::default();
-        self.chat_input.set_block(
-            ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Input ")
-                .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray)),
-        );
+        self.chat_input = new_chat_input();
     }
 
     async fn load_model(&mut self, path: &str) {
@@ -1671,10 +2086,15 @@ impl TuiApp {
         // Skip auto-capping if user disabled it
         let auto_limits = self.config.inference.auto_resource_limits;
 
-        // 1. Check model file size vs available RAM
-        let model_size_mb = std::fs::metadata(path)
-            .map(|m| m.len() / (1024 * 1024))
-            .unwrap_or(0);
+        // 1. Check model file size vs available RAM (non-blocking metadata read)
+        let path_owned = path.to_string();
+        let model_size_mb = tokio::task::spawn_blocking(move || {
+            std::fs::metadata(&path_owned)
+                .map(|m| m.len() / (1024 * 1024))
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap_or(0);
 
         let avail_mb = self.hardware.memory_available_mb;
         let total_mb = self.hardware.memory_total_mb;
@@ -1718,15 +2138,17 @@ impl TuiApp {
             }
         }
 
-        // 3. Cap context size based on available memory
+        // 3. Cap context size based on available memory (overflow-safe u64 math)
         let mut context_size = self.config.inference.default_context_size;
         if auto_limits {
-            let max_ctx_by_mem = if total_mb > 0 {
-                // Reserve model size + ram_reserve_mb, allow up to 50% of remaining for context
-                let reserved = model_size_mb + self.config.inference.ram_reserve_mb;
+            let max_ctx_by_mem: u32 = if total_mb > 0 {
+                // Reserve model size + ram_reserve_mb, allow up to 40% of remaining for KV cache
+                let reserved = model_size_mb.saturating_add(self.config.inference.ram_reserve_mb);
                 let usable = total_mb.saturating_sub(reserved);
-                // Rough: ctx_mb = usable * 0.4, ctx = ctx_mb / 64 * 1024
-                ((usable * 1024) / (64 * 1024 / 1024)) as u32 * 1024
+                // ~64 MB per 1024 context tokens
+                let ctx_mb = (usable.saturating_mul(4)) / 10;
+                let ctx_tokens = (ctx_mb / 64).saturating_mul(1024);
+                u32::try_from(ctx_tokens).unwrap_or(u32::MAX)
             } else {
                 8192
             };
@@ -1859,20 +2281,15 @@ impl TuiApp {
                 KeyCode::Enter => match self.server_panel_state.save_edit() {
                     Err(e) => self.server_panel_state.set_error(e),
                     Ok(()) => {
-                        // Persist config to disk so changes survive restarts
-                        let config = self.server_panel_state.build_app_config(&self.config);
-                        if let Err(e) = config.save() {
+                        let config = self.sync_config_from_server_panel();
+                        if let Err(e) = self.save_config_async(config).await {
                             self.server_panel_state
                                 .set_error(format!("Failed to save config: {}", e));
+                        } else if self.server_panel_state.phase == ServerPhase::Running {
+                            self.server_panel_state
+                                .set_status("Saved — applies on next server start");
                         } else {
-                            self.config = config;
-                            self.settings_state.config = self.config.clone();
-                            if self.server_panel_state.phase == ServerPhase::Running {
-                                self.server_panel_state
-                                    .set_status("Saved — applies on next server start");
-                            } else {
-                                self.server_panel_state.set_status("Saved");
-                            }
+                            self.server_panel_state.set_status("Saved");
                         }
                     }
                 },
@@ -1887,11 +2304,45 @@ impl TuiApp {
         } else {
             let field = self.server_panel_state.current_field().clone();
             match key.code {
+                // Sub-tab switching with [ and ]
+                KeyCode::Char('[') => {
+                    self.server_panel_state.prev_subtab();
+                    self.server_panel_state.clear_status();
+                }
+                KeyCode::Char(']') => {
+                    self.server_panel_state.next_subtab();
+                    self.server_panel_state.clear_status();
+                }
+                // Pinned quick actions: s (start/stop), l (load additional), u (unload), k (API keys)
+                KeyCode::Char('s') => {
+                    if self.server_panel_state.phase == ServerPhase::Running
+                        || self.server_panel_state.phase == ServerPhase::LoadingModel
+                    {
+                        self.stop_server().await;
+                    } else {
+                        self.start_server().await;
+                    }
+                }
+                KeyCode::Char('l') => {
+                    self.load_additional_model().await;
+                }
+                KeyCode::Char('u') => {
+                    self.unload_model_action().await;
+                }
+                KeyCode::Char('k') => {
+                    self.api_key_modal.open();
+                    if self.server_state.is_none() {
+                        self.api_key_modal
+                            .set_error("Server not running — start it to manage keys".to_string());
+                    } else {
+                        self.refresh_api_keys().await;
+                    }
+                }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.server_panel_state.next();
                     self.server_panel_state.clear_status();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.server_panel_state.previous();
                     self.server_panel_state.clear_status();
                 }
@@ -1913,9 +2364,11 @@ impl TuiApp {
                     ConfigField::SetDefaultModel => {
                         self.server_panel_state.default_select_prev();
                     }
-                    _ => {}
+                    _ => {
+                        self.server_panel_state.prev_subtab();
+                    }
                 },
-                KeyCode::Right | KeyCode::Char('l') => match field {
+                KeyCode::Right => match field {
                     ConfigField::ModelSelection => {
                         self.server_panel_state.select_model_next();
                     }
@@ -1925,27 +2378,24 @@ impl TuiApp {
                     ConfigField::SetDefaultModel => {
                         self.server_panel_state.default_select_next();
                     }
-                    _ => {}
+                    _ => {
+                        self.server_panel_state.next_subtab();
+                    }
                 },
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char(' ') => {
                     if field.is_toggle() {
                         self.server_panel_state.toggle();
-                        // Persist config to disk so toggle changes survive restarts
-                        let config = self.server_panel_state.build_app_config(&self.config);
-                        if let Err(e) = config.save() {
+                        let config = self.sync_config_from_server_panel();
+                        if let Err(e) = self.save_config_async(config).await {
                             self.server_panel_state
                                 .set_error(format!("Failed to save config: {}", e));
+                        } else if self.server_panel_state.phase == ServerPhase::Running {
+                            self.server_panel_state
+                                .set_status("Toggled — applies on next server start");
                         } else {
-                            self.config = config;
-                            if self.server_panel_state.phase == ServerPhase::Running {
-                                self.server_panel_state
-                                    .set_status("Toggled — applies on next server start");
-                            } else {
-                                self.server_panel_state.set_status("Toggled — saved");
-                            }
+                            self.server_panel_state.set_status("Toggled — saved");
                         }
                     } else if field == ConfigField::GpuRuntime {
-                        // Cycle through GPU runtimes on Enter
                         use athenas_core::GpuRuntime;
                         let next = match self.server_panel_state.gpu_runtime {
                             GpuRuntime::Auto => GpuRuntime::Cuda,
@@ -1956,36 +2406,36 @@ impl TuiApp {
                             GpuRuntime::Cpu => GpuRuntime::Auto,
                         };
                         self.server_panel_state.gpu_runtime = next;
-                        // Persist config to disk
-                        let config = self.server_panel_state.build_app_config(&self.config);
-                        if let Err(e) = config.save() {
+                        let config = self.sync_config_from_server_panel();
+                        if let Err(e) = self.save_config_async(config).await {
                             self.server_panel_state
                                 .set_error(format!("Failed to save config: {}", e));
                         } else {
-                            self.config = config;
                             self.server_panel_state
                                 .set_status(format!("GPU runtime: {} — saved", next));
                         }
-                    } else if field.is_editable() {
-                        self.server_panel_state.start_edit();
-                    } else if field == ConfigField::StartServer {
-                        self.start_server().await;
-                    } else if field == ConfigField::StopServer {
-                        self.stop_server().await;
-                    } else if field == ConfigField::LoadAdditionalModel {
-                        self.load_additional_model().await;
-                    } else if field == ConfigField::UnloadModel {
-                        self.unload_model_action().await;
-                    } else if field == ConfigField::SetDefaultModel {
-                        self.set_default_model_action().await;
-                    } else if field == ConfigField::ManageApiKeys {
-                        self.api_key_modal.open();
-                        if self.server_state.is_none() {
-                            self.api_key_modal.set_error(
-                                "Server not running — start it to manage keys".to_string(),
-                            );
-                        } else {
-                            self.refresh_api_keys().await;
+                    } else if key.code == KeyCode::Enter {
+                        if field.is_editable() {
+                            self.server_panel_state.start_edit();
+                        } else if field == ConfigField::StartServer {
+                            self.start_server().await;
+                        } else if field == ConfigField::StopServer {
+                            self.stop_server().await;
+                        } else if field == ConfigField::LoadAdditionalModel {
+                            self.load_additional_model().await;
+                        } else if field == ConfigField::UnloadModel {
+                            self.unload_model_action().await;
+                        } else if field == ConfigField::SetDefaultModel {
+                            self.set_default_model_action().await;
+                        } else if field == ConfigField::ManageApiKeys {
+                            self.api_key_modal.open();
+                            if self.server_state.is_none() {
+                                self.api_key_modal.set_error(
+                                    "Server not running — start it to manage keys".to_string(),
+                                );
+                            } else {
+                                self.refresh_api_keys().await;
+                            }
                         }
                     }
                 }
@@ -2131,12 +2581,11 @@ impl TuiApp {
         self.server_panel_state
             .set_status(format!("Starting server with model: {}...", model_name));
 
-        // Save server config so it persists across restarts
-        let server_config = self.server_panel_state.build_app_config(&self.config);
-        if let Err(e) = server_config.save() {
+        // Save server config so it persists across restarts (via spawn_blocking)
+        let server_config = self.sync_config_from_server_panel();
+        if let Err(e) = self.save_config_async(server_config).await {
             tracing::warn!("Failed to save server config: {}", e);
         }
-        self.config = server_config;
 
         let backend_str = match self.server_panel_state.backend {
             athenas_core::BackendType::Auto => "auto",
@@ -2484,7 +2933,7 @@ impl TuiApp {
             let batch_size = self.server_panel_state.batch_size;
 
             let task = tokio::spawn(async move {
-                let client = reqwest::Client::new();
+                let client = http_client(120)?;
                 let url = format!("http://{}:{}/v1/models/load", host, port);
 
                 let body = serde_json::json!({
@@ -2673,7 +3122,7 @@ impl TuiApp {
             let mid = model_id.clone();
 
             let result = tokio::spawn(async move {
-                let client = reqwest::Client::new();
+                let client = http_client(15)?;
                 let url = format!("http://{}:{}/v1/models/unload", host, port);
                 let body = serde_json::json!({ "model_id": mid });
                 let mut req = client.post(&url).json(&body);
@@ -2772,7 +3221,7 @@ impl TuiApp {
             let mid = model_id.clone();
 
             let result = tokio::spawn(async move {
-                let client = reqwest::Client::new();
+                let client = http_client(15)?;
                 let url = format!("http://{}:{}/v1/models/default", host, port);
                 let body = serde_json::json!({ "model_id": mid });
                 let mut req = client.post(&url).json(&body);
@@ -2845,7 +3294,7 @@ impl TuiApp {
         let api_key = self.server_panel_state.auth_bearer().map(|s| s.to_string());
 
         let result = tokio::spawn(async move {
-            let client = reqwest::Client::new();
+            let client = http_client(15)?;
             let url = format!("http://{}:{}/v1/models", host, port);
             let mut req = client.get(&url);
             if let Some(ref key) = api_key {
@@ -3014,6 +3463,12 @@ impl TuiApp {
             ApiKeyModalPhase::CreateForm => match key.code {
                 KeyCode::Esc => {
                     self.api_key_modal.cancel_create();
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.api_key_modal.next_form_field();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.api_key_modal.prev_form_field();
                 }
                 KeyCode::Enter => {
                     let submitted = self.api_key_modal.advance_form();

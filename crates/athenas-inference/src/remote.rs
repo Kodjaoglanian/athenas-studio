@@ -18,8 +18,13 @@ pub struct RemoteBackend {
 
 impl RemoteBackend {
     pub fn new(host: &str, port: u16, model: &str, api_key: Option<&str>) -> Self {
+        let base_url = if host.contains(':') && !host.starts_with('[') {
+            format!("http://[{}]:{}", host, port)
+        } else {
+            format!("http://{}:{}", host, port)
+        };
         Self {
-            base_url: format!("http://{}:{}", host, port),
+            base_url,
             api_key: api_key.filter(|k| !k.is_empty()).map(|k| k.to_string()),
             model_name: model.to_string(),
             client: reqwest::Client::builder()
@@ -112,6 +117,43 @@ impl Backend for RemoteBackend {
             tokens_per_second: 0.0,
         };
 
+        let tool_calls = v
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(|tc| tc.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|tc| {
+                        let id = tc
+                            .get("id")
+                            .and_then(|val| val.as_str())
+                            .unwrap_or("call_0")
+                            .to_string();
+                        let call_type = tc
+                            .get("type")
+                            .and_then(|val| val.as_str())
+                            .unwrap_or("function")
+                            .to_string();
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(|val| val.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|val| val.as_str())
+                            .unwrap_or("{}")
+                            .to_string();
+                        crate::types::ToolCall {
+                            id,
+                            call_type,
+                            function: crate::types::ToolCallFunction { name, arguments },
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+
         let text = if !reasoning.is_empty() {
             format!("<think>{reasoning}</think>\n{content}")
         } else {
@@ -124,7 +166,7 @@ impl Backend for RemoteBackend {
                 content: crate::types::MessageContent::Text(text),
             },
             stats,
-            tool_calls: None,
+            tool_calls,
             finish_reason: finish,
         })
     }
@@ -150,15 +192,15 @@ impl Backend for RemoteBackend {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| AthenasError::Backend(format!("Stream: {e}")))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
@@ -181,30 +223,36 @@ impl Backend for RemoteBackend {
                             .and_then(|d| d.get("reasoning_content"))
                             .and_then(|c| c.as_str())
                         {
-                            if !r.is_empty() {
-                                let _ = tx
+                            if !r.is_empty()
+                                && tx
                                     .send(StreamChunk {
                                         text: r.to_string(),
                                         done: false,
                                         is_reasoning: true,
                                         stats: None,
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                            {
+                                return Ok(());
                             }
                         }
                         if let Some(c) = delta
                             .and_then(|d| d.get("content"))
                             .and_then(|c| c.as_str())
                         {
-                            if !c.is_empty() {
-                                let _ = tx
+                            if !c.is_empty()
+                                && tx
                                     .send(StreamChunk {
                                         text: c.to_string(),
                                         done: false,
                                         is_reasoning: false,
                                         stats: None,
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                            {
+                                return Ok(());
                             }
                         }
                         if json
@@ -324,15 +372,15 @@ impl Backend for RemoteBackend {
 
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| AthenasError::Backend(format!("Stream: {e}")))?;
-            buf.push_str(&String::from_utf8_lossy(&chunk));
+            buf.extend_from_slice(&chunk);
 
-            while let Some(pos) = buf.find('\n') {
-                let line = buf[..pos].trim().to_string();
-                buf = buf[pos + 1..].to_string();
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line_bytes).trim().to_string();
                 if line.is_empty() || line.starts_with(':') {
                     continue;
                 }
@@ -351,15 +399,18 @@ impl Backend for RemoteBackend {
                     }
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                         if let Some(c) = json.pointer("/choices/0/text").and_then(|t| t.as_str()) {
-                            if !c.is_empty() {
-                                let _ = tx
+                            if !c.is_empty()
+                                && tx
                                     .send(StreamChunk {
                                         text: c.to_string(),
                                         done: false,
                                         is_reasoning: false,
                                         stats: None,
                                     })
-                                    .await;
+                                    .await
+                                    .is_err()
+                            {
+                                return Ok(());
                             }
                         }
                         if json
@@ -425,6 +476,22 @@ impl Backend for RemoteBackend {
         resp.json()
             .await
             .map_err(|e| AthenasError::Backend(format!("Parse: {e}")))
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        let url = format!("{}/v1/health", self.base_url);
+        let result = self
+            .auth(
+                self.client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(3)),
+            )
+            .send()
+            .await;
+        match result {
+            Ok(resp) => Ok(resp.status().is_success()),
+            Err(_) => Ok(false),
+        }
     }
 
     fn model_info(&self) -> Option<ModelInfo> {

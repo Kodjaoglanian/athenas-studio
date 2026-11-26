@@ -153,7 +153,7 @@ impl ApiServer {
         let is_wildcard = bind_ip.map(|ip| ip.is_unspecified()).unwrap_or(false);
         if !is_loopback || is_wildcard {
             let key_count = match &self.api_key_manager {
-                Some(mgr) => mgr.lock().await.list_keys().len(),
+                Some(mgr) => mgr.lock().await.len(),
                 None => 0,
             };
             if key_count == 0 {
@@ -195,10 +195,44 @@ impl ApiServer {
             listener,
             app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| athenas_core::AthenasError::Server(format!("Server error: {}", e)))?;
 
         Ok(())
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to install Ctrl+C handler: {}", e);
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl+C, shutting down server gracefully...");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, shutting down server gracefully...");
+        }
     }
 }
 

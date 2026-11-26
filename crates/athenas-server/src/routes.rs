@@ -90,6 +90,65 @@ fn client_ip_from_req(
     Some(addr.ip())
 }
 
+/// Standard OpenAI-compatible JSON error response.
+fn api_error(status: StatusCode, error_type: &str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message.into(),
+                "type": error_type,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Sanitize a client-supplied upload filename to a safe basename (no path traversal).
+fn sanitize_upload_filename(raw: Option<&str>, fallback: &str) -> String {
+    let Some(name) = raw else {
+        return fallback.to_string();
+    };
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let trimmed = basename.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains("..")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        return fallback.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Validate a slot checkpoint name (reject path traversal and separators).
+fn is_valid_checkpoint_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed != "."
+        && trimmed != ".."
+        && !trimmed.contains("..")
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.contains('\0')
+}
+
+/// RAII guard that decrements `waiting_requests` when dropped, even if the
+/// awaiting future is cancelled mid-wait.
+struct WaitingGuard {
+    waiting_requests: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl Drop for WaitingGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.waiting_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// RAII guard that decrements the active request counter when dropped.
 /// Wraps an `OwnedSemaphorePermit` so the semaphore is also released.
 struct PermitGuard {
@@ -129,16 +188,18 @@ async fn acquire_with_tracking(state: &AppState) -> Option<(PermitGuard, u32)> {
         return Some((guard, 0));
     }
 
-    // Slow path — we're going to wait. Track our position.
+    // Slow path — we're going to wait. Track our position with an RAII guard.
     let queue_position = state.waiting_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let _waiting = WaitingGuard {
+        waiting_requests: state.waiting_requests.clone(),
+    };
 
     let permit_result = state.semaphore.clone().acquire_owned().await;
-
-    state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
-    state.active_requests.fetch_add(1, Ordering::Relaxed);
+    drop(_waiting);
 
     match permit_result {
         Ok(permit) => {
+            state.active_requests.fetch_add(1, Ordering::Relaxed);
             let guard = PermitGuard {
                 permit,
                 active_requests: state.active_requests.clone(),
@@ -174,11 +235,16 @@ async fn acquire_with_tracking_timeout(
     }
 
     let queue_position = state.waiting_requests.fetch_add(1, Ordering::Relaxed) + 1;
+    let _waiting = WaitingGuard {
+        waiting_requests: state.waiting_requests.clone(),
+    };
     let acquire_fut = state.semaphore.clone().acquire_owned();
 
-    match tokio::time::timeout(max_wait, acquire_fut).await {
+    let res = tokio::time::timeout(max_wait, acquire_fut).await;
+    drop(_waiting);
+
+    match res {
         Ok(Ok(permit)) => {
-            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
             state.active_requests.fetch_add(1, Ordering::Relaxed);
             let guard = PermitGuard {
                 permit,
@@ -186,14 +252,8 @@ async fn acquire_with_tracking_timeout(
             };
             Ok((guard, queue_position))
         }
-        Ok(Err(_)) => {
-            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
-            Err(QueueAcquireError::Closed)
-        }
-        Err(_) => {
-            state.waiting_requests.fetch_sub(1, Ordering::Relaxed);
-            Err(QueueAcquireError::TimedOut)
-        }
+        Ok(Err(_)) => Err(QueueAcquireError::Closed),
+        Err(_) => Err(QueueAcquireError::TimedOut),
     }
 }
 
@@ -324,8 +384,11 @@ pub fn create_router(
         .route("/v1/cache/clear", post(cache_clear))
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
-        .route("/health", get(health))
-        .route("/metrics", get(metrics_endpoint));
+        .route("/health", get(health));
+
+    if config.enable_metrics {
+        router = router.route("/metrics", get(metrics_endpoint));
+    }
 
     if config.cors_enabled {
         router = router.layer(CorsLayer::permissive());
@@ -355,8 +418,13 @@ pub fn create_router(
             (config.max_body_size_mb as usize) * 1024 * 1024,
         ))
         .layer(from_fn(request_logging_middleware))
-        .layer(from_fn_with_state(rate_limiter, rate_limit_middleware))
-        .layer(from_fn_with_state(metrics, metrics_middleware))
+        .layer(from_fn_with_state(rate_limiter, rate_limit_middleware));
+
+    if config.enable_metrics {
+        router = router.layer(from_fn_with_state(metrics, metrics_middleware));
+    }
+
+    router = router
         .layer(from_fn(crate::trace_context::trace_context_middleware))
         .layer(tower_http::request_id::SetRequestIdLayer::x_request_id(
             tower_http::request_id::MakeRequestUuid,
@@ -365,25 +433,74 @@ pub fn create_router(
     router.with_state(state)
 }
 
-/// Check auth for API key management endpoints.
-/// Allows access without auth when request comes from localhost (TUI admin)
-/// or no keys exist yet (bootstrap mode). Otherwise requires a valid
-/// multi-tenant key.
+/// Outcome of an admin-scoped authentication check.
+enum AdminAuthResult {
+    Allowed,
+    Unauthorized,
+    Forbidden,
+}
+
+impl AdminAuthResult {
+    fn into_error_response(self) -> Option<Response> {
+        match self {
+            AdminAuthResult::Allowed => None,
+            AdminAuthResult::Unauthorized => Some(api_error(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Invalid or missing API key",
+            )),
+            AdminAuthResult::Forbidden => Some(api_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "Admin privileges required for this operation",
+            )),
+        }
+    }
+}
+
+/// Check admin-scoped auth for privileged management endpoints (API keys,
+/// model load/unload/default, audit logs, cache clear/stats, vector store
+/// admin, and routing mutations).
+///
+/// Allows access when:
+/// - No key manager is configured, or no keys exist yet (bootstrap mode)
+/// - Request comes from localhost (TUI admin)
+/// - Bearer token belongs to an active key with `is_admin == true`
+///
+/// Valid non-admin API keys receive `AdminAuthResult::Forbidden` (403).
 async fn check_auth_for_key_mgmt(
     headers: &HeaderMap,
     state: &AppState,
     client_ip: Option<std::net::IpAddr>,
-) -> bool {
-    // Localhost (TUI) can always manage keys — admin access
+) -> AdminAuthResult {
+    let Some(ref mgr_arc) = state.api_key_manager else {
+        return AdminAuthResult::Allowed;
+    };
+
+    // Localhost (TUI) can always perform admin operations
     if let Some(ip) = client_ip {
         if ip.is_loopback() {
-            return true;
+            return AdminAuthResult::Allowed;
         }
     }
-    check_auth_any(headers, state, client_ip).await
+
+    let mgr = mgr_arc.lock().await;
+    if mgr.is_empty() {
+        return AdminAuthResult::Allowed;
+    }
+
+    let Some(ref token) = extract_bearer(headers) else {
+        return AdminAuthResult::Unauthorized;
+    };
+
+    match mgr.validate(token) {
+        Some(key) if key.is_admin => AdminAuthResult::Allowed,
+        Some(_) => AdminAuthResult::Forbidden,
+        None => AdminAuthResult::Unauthorized,
+    }
 }
 
-/// Check auth for model management endpoints (load/unload/set default).
+/// Check auth for general authenticated endpoints (non-admin keys allowed).
 /// Allows access without auth when:
 /// - No keys are configured at all (bootstrap mode)
 /// - Request comes from localhost (TUI admin)
@@ -395,36 +512,62 @@ async fn check_auth_any(
     client_ip: Option<std::net::IpAddr>,
 ) -> bool {
     // If no key manager, allow all
-    if state.api_key_manager.is_none() {
+    let Some(ref mgr_arc) = state.api_key_manager else {
         return true;
-    }
+    };
 
-    // If key manager has no keys, allow all (bootstrap mode)
-    if let Some(ref mgr_arc) = state.api_key_manager {
-        let mgr = mgr_arc.lock().await;
-        if mgr.list_keys().is_empty() {
-            return true;
-        }
-    }
-
-    // Localhost (TUI) can always manage models — admin access
+    // Localhost (TUI) can always access
     if let Some(ip) = client_ip {
         if ip.is_loopback() {
             return true;
         }
     }
 
+    let mgr = mgr_arc.lock().await;
+    // If key manager has no keys, allow all (bootstrap mode)
+    if mgr.is_empty() {
+        return true;
+    }
+
     // Check multi-tenant keys
     if let Some(ref token) = extract_bearer(headers) {
-        if let Some(ref mgr_arc) = state.api_key_manager {
-            let mgr = mgr_arc.lock().await;
-            if mgr.validate(token).is_some() {
-                return true;
-            }
+        if mgr.validate(token).is_some() {
+            return true;
         }
     }
 
     false
+}
+
+/// Resolve the effective target model ID (handling router aliases and default
+/// model fallback when `requested` is `None` or empty) BEFORE checking
+/// `allowed_models`, preventing `allowed_models` bypass via omitted model or alias.
+async fn resolve_effective_model_for_auth(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested.unwrap_or("");
+    let aliased = if !requested.is_empty() {
+        if let Some(ref router_arc) = state.model_router {
+            let router = router_arc.lock().await;
+            router.resolve(requested)
+        } else {
+            requested.to_string()
+        }
+    } else {
+        String::new()
+    };
+
+    let mgr = state.model_manager.lock().await;
+    if aliased.is_empty() {
+        mgr.default_id().map(|s| s.to_string())
+    } else if mgr.get(Some(&aliased)).is_some() {
+        Some(aliased)
+    } else if let Some(resolved) = mgr.resolve_id(&aliased) {
+        Some(resolved)
+    } else {
+        mgr.default_id().map(|s| s.to_string()).or(Some(aliased))
+    }
 }
 
 /// Mask an API key for display: `sk-ath-…<last4>`.
@@ -468,7 +611,7 @@ async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&s
     // If key manager has no keys, allow all (bootstrap mode)
     if let Some(ref mgr_arc) = state.api_key_manager {
         let mgr = mgr_arc.lock().await;
-        if mgr.list_keys().is_empty() {
+        if mgr.is_empty() {
             return AuthResult::NoAuthRequired;
         }
     }
@@ -513,23 +656,28 @@ async fn check_auth_full(headers: &HeaderMap, state: &AppState, model: Option<&s
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let mgr = state.model_manager.lock().await;
     let uptime = state.start_time.elapsed().as_secs();
-    let models = mgr.list();
+    // Extract backend Arc and metadata under a short lock, then drop the lock
+    // BEFORE awaiting backend.health_check() so other requests are never blocked.
+    let (models, models_loaded, default_model, backend_opt) = {
+        let mgr = state.model_manager.lock().await;
+        let models = mgr.list();
+        let count = mgr.count();
+        let default_model = mgr.default_id().map(|s| s.to_string());
+        let backend_opt = if mgr.has_models() {
+            mgr.get(None)
+        } else {
+            None
+        };
+        (models, count, default_model, backend_opt)
+    };
 
     // Check if the backend is actually responsive by doing a quick
     // health check on the underlying llama-server. This detects cases
     // where the axum server is alive but the backend is deadlocked.
-    let backend_healthy = if mgr.has_models() {
-        if let Some(backend) = mgr.get(None) {
-            // The backend's health check is backend-specific
-            // (llama-server pings its own /health endpoint with a 3s timeout)
-            backend.health_check().await.unwrap_or(false)
-        } else {
-            true // No backend to check
-        }
-    } else {
-        true // No models loaded, nothing to check
+    let backend_healthy = match backend_opt {
+        Some(backend) => backend.health_check().await.unwrap_or(false),
+        None => true,
     };
 
     let status = if backend_healthy { "ok" } else { "degraded" };
@@ -538,8 +686,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "status": status,
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_seconds": uptime,
-        "models_loaded": mgr.count(),
-        "default_model": mgr.default_id(),
+        "models_loaded": models_loaded,
+        "default_model": default_model,
         "backend_healthy": backend_healthy,
     });
 
@@ -680,11 +828,24 @@ fn default_true() -> bool {
     true
 }
 
+fn default_empty_content() -> MessageContent {
+    MessageContent::Text(String::new())
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ChatCompletionMessage {
     role: String,
-    #[serde(deserialize_with = "deserialize_content")]
+    #[serde(
+        default = "default_empty_content",
+        deserialize_with = "deserialize_content"
+    )]
     content: MessageContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 /// Deserialize content that can be either a string or an array of content parts
@@ -712,40 +873,51 @@ async fn chat_completions(
     headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
-    let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
-    {
-        AuthResult::NoAuthRequired => None,
-        AuthResult::Allowed { key_id, .. } => Some(key_id),
-        AuthResult::Unauthorized => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::RateLimited => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded for this API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::QuotaExceeded => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::Forbidden => {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "This API key is not allowed to use the requested model"}))).into_response();
-        }
-    };
+    let effective_model_for_auth =
+        resolve_effective_model_for_auth(&state, req.model.as_deref()).await;
+    let auth_key_id: Option<String> =
+        match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
+            AuthResult::NoAuthRequired => None,
+            AuthResult::Allowed { key_id, .. } => Some(key_id),
+            AuthResult::Unauthorized => {
+                return api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing API key",
+                );
+            }
+            AuthResult::RateLimited => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Rate limit exceeded for this API key",
+                );
+            }
+            AuthResult::QuotaExceeded => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Daily token quota exceeded",
+                );
+            }
+            AuthResult::Forbidden => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "This API key is not allowed to use the requested model",
+                );
+            }
+        };
 
     let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
         Some((permit, pos)) => (permit, pos),
-        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        None => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_error",
+                "Server is shutting down or unavailable",
+            );
+        }
     };
 
     // ─── Semantic cache: check for a hit before inference ───
@@ -759,6 +931,22 @@ async fn chat_completions(
 
     // Save cache-relevant fields before req is moved into chat_req
     let cache_model = req.model.clone();
+    let cache_model_key = effective_model_for_auth
+        .clone()
+        .or_else(|| cache_model.clone())
+        .unwrap_or_default();
+    let cache_system_hash = if cache_enabled && !is_streaming {
+        let sys_text: String = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .map(|m| m.content.as_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        crate::semantic_cache::hash_system_prompt(&sys_text)
+    } else {
+        0
+    };
     let cache_user_msg: String = if cache_enabled && !is_streaming {
         req.messages
             .iter()
@@ -770,8 +958,10 @@ async fn chat_completions(
         String::new()
     };
 
+    let mut cached_query_embedding: Option<Vec<f32>> = None;
+
     if cache_enabled && !is_streaming && !cache_user_msg.is_empty() {
-        // Generate embedding for the query
+        // Generate embedding for the query (computed once and reused on cache miss)
         let mgr = state.model_manager.lock().await;
         let backend_opt = mgr.get(cache_model.as_deref());
         drop(mgr);
@@ -787,10 +977,15 @@ async fn chat_completions(
                 if let Some(embed_data) = embed_resp.data.first() {
                     let query_embedding = embed_data.embedding.clone();
 
-                    // Check cache
+                    // Check cache (scoped by model, system prompt hash, and tenant/key_id)
                     if let Some(ref cache_arc) = state.semantic_cache {
                         let mut cache = cache_arc.lock().await;
-                        if let Some(cached) = cache.lookup(&query_embedding) {
+                        if let Some(cached) = cache.lookup(
+                            &query_embedding,
+                            &cache_model_key,
+                            cache_system_hash,
+                            auth_key_id.as_deref(),
+                        ) {
                             tracing::info!(
                                 "Semantic cache HIT for chat completion, tokens_saved={}",
                                 cached.tokens_saved
@@ -824,6 +1019,9 @@ async fn chat_completions(
                             return resp;
                         }
                     }
+
+                    // Reuse this embedding on cache miss instead of computing it twice
+                    cached_query_embedding = Some(query_embedding);
                 }
             }
         }
@@ -954,14 +1152,14 @@ async fn chat_completions(
             Some(b) => (b, resolved, tried),
             None => {
                 let available: Vec<_> = mgr.list().iter().map(|m| m.id.clone()).collect();
-                return (
+                return api_error(
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": format!("No model loaded. Tried: {:?}. Available models: {:?}",
-                            tried, available)
-                    })),
-                )
-                    .into_response();
+                    "invalid_request_error",
+                    format!(
+                        "No model loaded. Tried: {:?}. Available models: {:?}",
+                        tried, available
+                    ),
+                );
             }
         }
     };
@@ -976,6 +1174,8 @@ async fn chat_completions(
     if chat_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
         let model_name = public_model.clone();
+        let stream_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let created = chrono::Utc::now().timestamp();
 
         // Append new messages to session at stream start
         if let Some(ref sid) = session_id {
@@ -1004,8 +1204,11 @@ async fn chat_completions(
         });
 
         let stream = async_stream::stream! {
+            // Keep semaphore permit & active_requests count alive until stream completes
+            let _permit = _permit;
             let mut rx = rx;
             let mut full_text = String::new();
+            let mut first_chunk = true;
             while let Some(chunk) = rx.recv().await {
                 if chunk.done {
                     if let Some(stats) = &chunk.stats {
@@ -1015,7 +1218,7 @@ async fn chat_completions(
                         if let Some(ref key_id) = auth_key_id_clone {
                             if let Some(ref mgr_arc) = api_key_mgr_clone {
                                 let mut mgr = mgr_arc.lock().await;
-                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                if let Some(key) = mgr.get_key(key_id).cloned() {
                                     mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
                                 }
                             }
@@ -1033,9 +1236,9 @@ async fn chat_completions(
                     }
 
                     let json = serde_json::json!({
-                        "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                        "id": stream_id,
                         "object": "chat.completion.chunk",
-                        "created": chrono::Utc::now().timestamp(),
+                        "created": created,
                         "model": model_name,
                         "choices": [{
                             "index": 0,
@@ -1050,14 +1253,20 @@ async fn chat_completions(
                     break;
                 }
                 full_text.push_str(&chunk.text);
+                let delta = if first_chunk {
+                    first_chunk = false;
+                    serde_json::json!({"role": "assistant", "content": chunk.text})
+                } else {
+                    serde_json::json!({"content": chunk.text})
+                };
                 let json = serde_json::json!({
-                    "id": format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+                    "id": stream_id,
                     "object": "chat.completion.chunk",
-                    "created": chrono::Utc::now().timestamp(),
+                    "created": created,
                     "model": model_name,
                     "choices": [{
                         "index": 0,
-                        "delta": {"content": chunk.text},
+                        "delta": delta,
                         "finish_reason": null,
                     }],
                 });
@@ -1083,8 +1292,7 @@ async fn chat_completions(
                 if let Some(ref key_id) = auth_key_id {
                     if let Some(ref mgr_arc) = state.api_key_manager {
                         let mut mgr = mgr_arc.lock().await;
-                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
-                        {
+                        if let Some(key) = mgr.get_key(key_id).cloned() {
                             mgr.record_usage(
                                 &key,
                                 resp.stats.tokens_prompt as u64,
@@ -1167,41 +1375,22 @@ async fn chat_completions(
                     },
                 });
 
-                // ─── Semantic cache: store the response ───
-                if cache_enabled && !is_streaming && !cache_user_msg.is_empty() {
-                    // Re-generate embedding for caching (we need it for the key)
-                    let mgr = state.model_manager.lock().await;
-                    let backend_opt = mgr.get(cache_model.as_deref());
-                    drop(mgr);
-
-                    if let Some(backend) = backend_opt {
-                        let embed_req = EmbeddingRequest {
-                            model: cache_model.clone().unwrap_or_default(),
-                            input: athenas_inference::types::EmbeddingInput::Single(
-                                cache_user_msg.clone(),
-                            ),
-                            encoding_format: "float".to_string(),
-                        };
-
-                        if let Ok(embed_resp) = backend.embeddings(embed_req).await {
-                            if let Some(embed_data) = embed_resp.data.first() {
-                                let tokens_saved =
-                                    (resp.stats.tokens_prompt + resp.stats.tokens_generated) as u64;
-                                let response_json =
-                                    serde_json::to_string(&json).unwrap_or_default();
-
-                                if let Some(ref cache_arc) = state.semantic_cache {
-                                    let mut cache = cache_arc.lock().await;
-                                    cache.insert(
-                                        cache_user_msg.clone(),
-                                        embed_data.embedding.clone(),
-                                        response_json,
-                                        resp.model.clone(),
-                                        tokens_saved,
-                                    );
-                                }
-                            }
-                        }
+                // ─── Semantic cache: store the response (reusing the query embedding) ───
+                if let Some(query_embedding) = cached_query_embedding {
+                    if let Some(ref cache_arc) = state.semantic_cache {
+                        let tokens_saved =
+                            (resp.stats.tokens_prompt + resp.stats.tokens_generated) as u64;
+                        let response_json = serde_json::to_string(&json).unwrap_or_default();
+                        let mut cache = cache_arc.lock().await;
+                        cache.insert(
+                            cache_user_msg.clone(),
+                            query_embedding,
+                            response_json,
+                            cache_model_key.clone(),
+                            cache_system_hash,
+                            auth_key_id.clone(),
+                            tokens_saved,
+                        );
                     }
                 }
 
@@ -1239,6 +1428,17 @@ async fn chat_completions(
                     .unwrap_or(model_sequence.len());
 
                 for next_model in &model_sequence[fallback_idx..] {
+                    // Enforce allowed_models on fallback models too
+                    if let Some(ref key_id) = auth_key_id {
+                        if let Some(ref mgr_arc) = state.api_key_manager {
+                            let mgr = mgr_arc.lock().await;
+                            if let Some(key) = mgr.get_key(key_id) {
+                                if !mgr.check_model_access(key, next_model) {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     tracing::info!("Attempting fallback model: {}", next_model);
                     if let Some(ref router_arc) = state.model_router {
                         let router = router_arc.lock().await;
@@ -1332,13 +1532,11 @@ async fn chat_completions(
                     }
                 }
 
-                (
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": format!("All models in chain failed. Primary error: {}", e),
-                    })),
+                    "server_error",
+                    format!("All models in chain failed. Primary error: {}", e),
                 )
-                    .into_response()
             }
         }
     }
@@ -1366,40 +1564,41 @@ async fn completions(
     headers: HeaderMap,
     Json(req): Json<CompletionRequestBody>,
 ) -> Response {
-    let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
-    {
-        AuthResult::NoAuthRequired => None,
-        AuthResult::Allowed { key_id, .. } => Some(key_id),
-        AuthResult::Unauthorized => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::RateLimited => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::QuotaExceeded => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::Forbidden => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
-            )
-                .into_response();
-        }
-    };
+    let effective_model_for_auth =
+        resolve_effective_model_for_auth(&state, req.model.as_deref()).await;
+    let auth_key_id: Option<String> =
+        match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
+            AuthResult::NoAuthRequired => None,
+            AuthResult::Allowed { key_id, .. } => Some(key_id),
+            AuthResult::Unauthorized => {
+                return api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing API key",
+                );
+            }
+            AuthResult::RateLimited => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Rate limit exceeded",
+                );
+            }
+            AuthResult::QuotaExceeded => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Daily token quota exceeded",
+                );
+            }
+            AuthResult::Forbidden => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "Model not allowed for this API key",
+                );
+            }
+        };
 
     let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
         Some((permit, pos)) => (permit, pos),
@@ -1475,6 +1674,8 @@ async fn completions(
     if comp_req.stream {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(100);
         let model_name = public_model.clone();
+        let stream_id = format!("cmpl-{}", uuid::Uuid::new_v4());
+        let created = chrono::Utc::now().timestamp();
 
         let metrics = state.metrics.clone();
         let api_key_mgr_clone = state.api_key_manager.clone();
@@ -1488,6 +1689,8 @@ async fn completions(
         });
 
         let stream = async_stream::stream! {
+            // Keep semaphore permit & active_requests count alive until stream completes
+            let _permit = _permit;
             let mut rx = rx;
             while let Some(chunk) = rx.recv().await {
                 if chunk.done {
@@ -1498,16 +1701,16 @@ async fn completions(
                         if let Some(ref key_id) = auth_key_id_clone {
                             if let Some(ref mgr_arc) = api_key_mgr_clone {
                                 let mut mgr = mgr_arc.lock().await;
-                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                if let Some(key) = mgr.get_key(key_id).cloned() {
                                     mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
                                 }
                             }
                         }
                     }
                     let json = serde_json::json!({
-                        "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
+                        "id": stream_id,
                         "object": "text_completion",
-                        "created": chrono::Utc::now().timestamp(),
+                        "created": created,
                         "model": model_name,
                         "choices": [{
                             "index": 0,
@@ -1522,9 +1725,9 @@ async fn completions(
                     break;
                 }
                 let json = serde_json::json!({
-                    "id": format!("cmpl-{}", uuid::Uuid::new_v4()),
+                    "id": stream_id,
                     "object": "text_completion",
-                    "created": chrono::Utc::now().timestamp(),
+                    "created": created,
                     "model": model_name,
                     "choices": [{
                         "index": 0,
@@ -1554,8 +1757,7 @@ async fn completions(
                 if let Some(ref key_id) = auth_key_id {
                     if let Some(ref mgr_arc) = state.api_key_manager {
                         let mut mgr = mgr_arc.lock().await;
-                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
-                        {
+                        if let Some(key) = mgr.get_key(key_id).cloned() {
                             mgr.record_usage(
                                 &key,
                                 resp.stats.tokens_prompt as u64,
@@ -1821,7 +2023,7 @@ async fn transcribe_audio(
 
     let request = athenas_inference::TranscriptionRequest {
         audio_data,
-        filename: filename.unwrap_or_else(|| "audio.wav".to_string()),
+        filename: sanitize_upload_filename(filename.as_deref(), "audio.wav"),
         model: model_path,
         language: language.filter(|l| l != "auto"),
         response_format: response_format.or(Some("json".to_string())),
@@ -2015,14 +2217,15 @@ async fn load_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoadModelRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     // Pre-flight: enforce the model count limit
@@ -2208,14 +2411,15 @@ async fn unload_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<UnloadModelRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mut mgr = state.model_manager.lock().await;
@@ -2248,14 +2452,15 @@ async fn set_default_model_endpoint(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<SetDefaultModelRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mut mgr = state.model_manager.lock().await;
@@ -2594,12 +2799,20 @@ async fn save_slot(
     }
 
     let Some(ref slot_mgr) = state.slot_manager else {
-        return (
+        return api_error(
             StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Slot manager not configured"})),
-        )
-            .into_response();
+            "invalid_request_error",
+            "Slot manager not configured",
+        );
     };
+
+    if !is_valid_checkpoint_name(&req.checkpoint_name) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Invalid checkpoint_name: path separators and '..' are not allowed",
+        );
+    }
 
     match slot_mgr.save_slot(slot_id, &req.checkpoint_name).await {
         Ok(()) => Json(serde_json::json!({
@@ -2634,12 +2847,20 @@ async fn restore_slot(
     }
 
     let Some(ref slot_mgr) = state.slot_manager else {
-        return (
+        return api_error(
             StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Slot manager not configured"})),
-        )
-            .into_response();
+            "invalid_request_error",
+            "Slot manager not configured",
+        );
     };
+
+    if !is_valid_checkpoint_name(&req.checkpoint_name) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Invalid checkpoint_name: path separators and '..' are not allowed",
+        );
+    }
 
     match slot_mgr.restore_slot(slot_id, &req.checkpoint_name).await {
         Ok(()) => Json(serde_json::json!({
@@ -2725,39 +2946,41 @@ async fn tokenize(
     headers: HeaderMap,
     Json(req): Json<TokenizeApiRequest>,
 ) -> Response {
+    let effective_model_for_auth = resolve_effective_model_for_auth(&state, None).await;
     // Auth check (same as embeddings)
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, None).await {
-        AuthResult::NoAuthRequired => None,
-        AuthResult::Allowed { key_id, .. } => Some(key_id),
-        AuthResult::Unauthorized => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::RateLimited => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::QuotaExceeded => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::Forbidden => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
-            )
-                .into_response();
-        }
-    };
+    let auth_key_id: Option<String> =
+        match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
+            AuthResult::NoAuthRequired => None,
+            AuthResult::Allowed { key_id, .. } => Some(key_id),
+            AuthResult::Unauthorized => {
+                return api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing API key",
+                );
+            }
+            AuthResult::RateLimited => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Rate limit exceeded",
+                );
+            }
+            AuthResult::QuotaExceeded => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Daily token quota exceeded",
+                );
+            }
+            AuthResult::Forbidden => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "Model not allowed for this API key",
+                );
+            }
+        };
 
     // Resolve backend
     let backend = {
@@ -2766,11 +2989,11 @@ async fn tokenize(
     };
 
     let Some(backend) = backend else {
-        return (
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": "No model loaded"})),
-        )
-            .into_response();
+            "server_error",
+            "No model loaded",
+        );
     };
 
     let result = backend
@@ -2786,18 +3009,18 @@ async fn tokenize(
             if let Some(ref key_id) = auth_key_id {
                 if let Some(ref mgr_arc) = state.api_key_manager {
                     let mut mgr = mgr_arc.lock().await;
-                    if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                    if let Some(key) = mgr.get_key(key_id).cloned() {
                         mgr.record_usage(&key, resp.count as u64, 0);
                     }
                 }
             }
             Json(resp).into_response()
         }
-        Err(e) => (
+        Err(e) => api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+            "server_error",
+            e.to_string(),
+        ),
     }
 }
 
@@ -2881,36 +3104,41 @@ async fn responses(
     headers: HeaderMap,
     Json(req): Json<ResponsesApiRequest>,
 ) -> Response {
-    let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
-    {
-        AuthResult::NoAuthRequired => None,
-        AuthResult::Allowed { key_id, .. } => Some(key_id),
-        AuthResult::Unauthorized => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::RateLimited => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded for this API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::QuotaExceeded => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::Forbidden => {
-            return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "This API key is not allowed to use the requested model"}))).into_response();
-        }
-    };
+    let effective_model_for_auth =
+        resolve_effective_model_for_auth(&state, req.model.as_deref()).await;
+    let auth_key_id: Option<String> =
+        match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
+            AuthResult::NoAuthRequired => None,
+            AuthResult::Allowed { key_id, .. } => Some(key_id),
+            AuthResult::Unauthorized => {
+                return api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing API key",
+                );
+            }
+            AuthResult::RateLimited => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Rate limit exceeded for this API key",
+                );
+            }
+            AuthResult::QuotaExceeded => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Daily token quota exceeded",
+                );
+            }
+            AuthResult::Forbidden => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "This API key is not allowed to use the requested model",
+                );
+            }
+        };
 
     let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
         Some((permit, pos)) => (permit, pos),
@@ -3001,6 +3229,8 @@ async fn responses(
         });
 
         let stream = async_stream::stream! {
+            // Keep semaphore permit & active_requests count alive until stream completes
+            let _permit = _permit;
             let mut rx = rx;
             let mut full_text = String::new();
             while let Some(chunk) = rx.recv().await {
@@ -3010,7 +3240,7 @@ async fn responses(
                         if let Some(ref key_id) = auth_key_id_clone {
                             if let Some(ref mgr_arc) = api_key_mgr_clone {
                                 let mut mgr = mgr_arc.lock().await;
-                                if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                                if let Some(key) = mgr.get_key(key_id).cloned() {
                                     mgr.record_usage(&key, stats.tokens_prompt as u64, stats.tokens_generated as u64);
                                 }
                             }
@@ -3068,8 +3298,7 @@ async fn responses(
                 if let Some(ref key_id) = auth_key_id {
                     if let Some(ref mgr_arc) = state.api_key_manager {
                         let mut mgr = mgr_arc.lock().await;
-                        if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id)
-                        {
+                        if let Some(key) = mgr.get_key(key_id).cloned() {
                             mgr.record_usage(
                                 &key,
                                 resp.stats.tokens_prompt as u64,
@@ -3147,35 +3376,36 @@ async fn systemone(
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let model_for_auth = body.get("model").and_then(|v| v.as_str());
-    match check_auth_full(&headers, &state, model_for_auth).await {
+    let effective_model_for_auth = resolve_effective_model_for_auth(&state, model_for_auth).await;
+    match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
         AuthResult::NoAuthRequired | AuthResult::Allowed { .. } => {}
         AuthResult::Unauthorized => {
-            return (
+            return api_error(
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
+                "authentication_error",
+                "Invalid or missing API key",
+            );
         }
         AuthResult::RateLimited => {
-            return (
+            return api_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded"})),
-            )
-                .into_response();
+                "rate_limit_error",
+                "Rate limit exceeded",
+            );
         }
         AuthResult::QuotaExceeded => {
-            return (
+            return api_error(
                 StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
+                "rate_limit_error",
+                "Daily token quota exceeded",
+            );
         }
         AuthResult::Forbidden => {
-            return (
+            return api_error(
                 StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
-            )
-                .into_response();
+                "permission_error",
+                "Model not allowed for this API key",
+            );
         }
     }
 
@@ -3258,40 +3488,41 @@ async fn embeddings(
     headers: HeaderMap,
     Json(req): Json<EmbeddingsApiRequest>,
 ) -> Response {
-    let model_for_auth = req.model.as_deref();
-    let auth_key_id: Option<String> = match check_auth_full(&headers, &state, model_for_auth).await
-    {
-        AuthResult::NoAuthRequired => None,
-        AuthResult::Allowed { key_id, .. } => Some(key_id),
-        AuthResult::Unauthorized => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid or missing API key"})),
-            )
-                .into_response();
-        }
-        AuthResult::RateLimited => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Rate limit exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::QuotaExceeded => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({"error": "Daily token quota exceeded"})),
-            )
-                .into_response();
-        }
-        AuthResult::Forbidden => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "Model not allowed for this API key"})),
-            )
-                .into_response();
-        }
-    };
+    let effective_model_for_auth =
+        resolve_effective_model_for_auth(&state, req.model.as_deref()).await;
+    let auth_key_id: Option<String> =
+        match check_auth_full(&headers, &state, effective_model_for_auth.as_deref()).await {
+            AuthResult::NoAuthRequired => None,
+            AuthResult::Allowed { key_id, .. } => Some(key_id),
+            AuthResult::Unauthorized => {
+                return api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_error",
+                    "Invalid or missing API key",
+                );
+            }
+            AuthResult::RateLimited => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Rate limit exceeded",
+                );
+            }
+            AuthResult::QuotaExceeded => {
+                return api_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    "Daily token quota exceeded",
+                );
+            }
+            AuthResult::Forbidden => {
+                return api_error(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    "Model not allowed for this API key",
+                );
+            }
+        };
 
     let (_permit, queue_pos) = match acquire_with_tracking(&state).await {
         Some((permit, pos)) => (permit, pos),
@@ -3383,7 +3614,7 @@ async fn embeddings(
             if let Some(ref key_id) = auth_key_id {
                 if let Some(ref mgr_arc) = state.api_key_manager {
                     let mut mgr = mgr_arc.lock().await;
-                    if let Some(key) = mgr.list_keys().into_iter().find(|k| &k.key_id == key_id) {
+                    if let Some(key) = mgr.get_key(key_id).cloned() {
                         mgr.record_usage(&key, resp.usage.prompt_tokens as u64, 0);
                     }
                 }
@@ -3411,6 +3642,8 @@ struct CreateKeyRequest {
     #[serde(default)]
     allowed_models: Vec<String>,
     metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    is_admin: bool,
 }
 
 fn default_rate_limit() -> u32 {
@@ -3427,34 +3660,36 @@ async fn create_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateKeyRequest>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
         Some(m) => m,
         None => {
-            return (
+            return api_error(
                 StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({"error": "Multi-tenant API keys not enabled"})),
-            )
-                .into_response();
+                "invalid_request_error",
+                "Multi-tenant API keys not enabled",
+            );
         }
     };
 
     let mut mgr = mgr_arc.lock().await;
-    let key = mgr.create_key(
+    let key = mgr.create_key_with_admin(
         &req.name,
         req.rate_limit_per_minute,
         req.daily_token_limit,
         req.allowed_models,
         req.metadata,
+        req.is_admin,
     );
     Json(key).into_response()
 }
@@ -3464,24 +3699,25 @@ async fn list_api_keys(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
         Some(m) => m,
         None => {
-            return (
+            return api_error(
                 StatusCode::NOT_IMPLEMENTED,
-                Json(serde_json::json!({"error": "Multi-tenant API keys not enabled"})),
-            )
-                .into_response();
+                "invalid_request_error",
+                "Multi-tenant API keys not enabled",
+            );
         }
     };
 
@@ -3511,6 +3747,7 @@ async fn list_api_keys(
                 "created_at": k.created_at,
                 "expires_at": k.expires_at,
                 "active": k.active,
+                "is_admin": k.is_admin,
                 "rate_limit_per_minute": k.rate_limit_per_minute,
                 "daily_token_limit": k.daily_token_limit,
                 "allowed_models": k.allowed_models,
@@ -3535,14 +3772,15 @@ async fn get_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
@@ -3559,17 +3797,18 @@ async fn get_api_key(
             "created_at": key.created_at,
             "expires_at": key.expires_at,
             "active": key.active,
+            "is_admin": key.is_admin,
             "rate_limit_per_minute": key.rate_limit_per_minute,
             "daily_token_limit": key.daily_token_limit,
             "allowed_models": key.allowed_models,
             "metadata": key.metadata,
         }))
         .into_response(),
-        None => (
+        None => api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Key not found"})),
-        )
-            .into_response(),
+            "invalid_request_error",
+            "Key not found",
+        ),
     }
 }
 
@@ -3579,14 +3818,15 @@ async fn delete_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
@@ -3598,11 +3838,11 @@ async fn delete_api_key(
     if mgr.delete_key(&id) {
         Json(serde_json::json!({"status": "deleted", "key_id": id})).into_response()
     } else {
-        (
+        api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Key not found"})),
+            "invalid_request_error",
+            "Key not found",
         )
-            .into_response()
     }
 }
 
@@ -3612,14 +3852,15 @@ async fn revoke_api_key(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
@@ -3631,11 +3872,11 @@ async fn revoke_api_key(
     if mgr.revoke_key(&id) {
         Json(serde_json::json!({"status": "revoked", "key_id": id})).into_response()
     } else {
-        (
+        api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Key not found"})),
+            "invalid_request_error",
+            "Key not found",
         )
-            .into_response()
     }
 }
 
@@ -3645,14 +3886,15 @@ async fn get_api_key_usage(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_for_key_mgmt(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let mgr_arc = match &state.api_key_manager {
@@ -3700,14 +3942,15 @@ async fn create_alias(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateAliasRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let router_arc = match &state.model_router {
@@ -3764,14 +4007,15 @@ async fn create_chain(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<CreateChainRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let router_arc = match &state.model_router {
@@ -3901,14 +4145,15 @@ async fn query_audit_logs(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     axum::extract::Query(params): axum::extract::Query<AuditQueryParams>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let logger_arc = match &state.audit_logger {
@@ -3931,14 +4176,15 @@ async fn audit_stats(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let logger_arc = match &state.audit_logger {
@@ -3967,14 +4213,15 @@ async fn vs_add_document(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VsAddRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let vs = match &state.vector_store {
@@ -4012,14 +4259,15 @@ async fn vs_add_batch(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<VsAddBatchRequest>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let vs = match &state.vector_store {
@@ -4156,14 +4404,15 @@ async fn vs_delete_document(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Path(id): Path<String>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let vs = match &state.vector_store {
@@ -4174,11 +4423,11 @@ async fn vs_delete_document(
     if vs.delete_document(&id).await {
         Json(serde_json::json!({"status": "deleted", "id": id})).into_response()
     } else {
-        (
+        api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Document not found"})),
+            "invalid_request_error",
+            "Document not found",
         )
-            .into_response()
     }
 }
 
@@ -4187,14 +4436,15 @@ async fn vs_clear(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
 ) -> Response {
-    if !check_auth_any(
+    if let Some(err_resp) = check_auth_for_key_mgmt(
         &headers,
         &state,
         client_ip_from_req(&headers, &state, &addr),
     )
     .await
+    .into_error_response()
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return err_resp;
     }
 
     let vs = match &state.vector_store {
@@ -4233,7 +4483,22 @@ async fn vs_stats(
 // ─── Semantic Cache Endpoints ───
 
 #[tracing::instrument(skip_all, fields(endpoint = "/v1/cache/stats"))]
-async fn cache_stats(State(state): State<AppState>) -> Response {
+async fn cache_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if let Some(err_resp) = check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    .into_error_response()
+    {
+        return err_resp;
+    }
+
     match &state.semantic_cache {
         Some(cache) => {
             let c = cache.lock().await;
@@ -4263,18 +4528,33 @@ async fn cache_stats(State(state): State<AppState>) -> Response {
 }
 
 #[tracing::instrument(skip_all, fields(endpoint = "/v1/cache/clear"))]
-async fn cache_clear(State(state): State<AppState>) -> Response {
+async fn cache_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Response {
+    if let Some(err_resp) = check_auth_for_key_mgmt(
+        &headers,
+        &state,
+        client_ip_from_req(&headers, &state, &addr),
+    )
+    .await
+    .into_error_response()
+    {
+        return err_resp;
+    }
+
     match &state.semantic_cache {
         Some(cache) => {
             let mut c = cache.lock().await;
             c.clear();
             Json(serde_json::json!({"status": "cleared"})).into_response()
         }
-        None => (
+        None => api_error(
             StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({"error": "Semantic cache not enabled"})),
-        )
-            .into_response(),
+            "invalid_request_error",
+            "Semantic cache not enabled",
+        ),
     }
 }
 
@@ -4355,6 +4635,107 @@ mod tests {
         let ip = client_ip_from_req(&headers, &state, &state_addr);
         // First XFF entry wins
         assert_eq!(ip, Some("9.9.9.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn sanitize_upload_filename_prevents_traversal() {
+        assert_eq!(
+            sanitize_upload_filename(Some("clip.wav"), "audio.wav"),
+            "clip.wav"
+        );
+        assert_eq!(
+            sanitize_upload_filename(Some("../../etc/passwd"), "audio.wav"),
+            "passwd"
+        );
+        assert_eq!(
+            sanitize_upload_filename(Some("..\\..\\secret.wav"), "audio.wav"),
+            "secret.wav"
+        );
+        assert_eq!(
+            sanitize_upload_filename(Some(".."), "audio.wav"),
+            "audio.wav"
+        );
+        assert_eq!(
+            sanitize_upload_filename(Some("foo..bar.wav"), "audio.wav"),
+            "audio.wav"
+        );
+        assert_eq!(sanitize_upload_filename(Some(""), "audio.wav"), "audio.wav");
+        assert_eq!(sanitize_upload_filename(None, "audio.wav"), "audio.wav");
+    }
+
+    #[test]
+    fn checkpoint_name_validation() {
+        assert!(is_valid_checkpoint_name("ckpt_1"));
+        assert!(is_valid_checkpoint_name("my-checkpoint.bin"));
+        assert!(!is_valid_checkpoint_name(""));
+        assert!(!is_valid_checkpoint_name(".."));
+        assert!(!is_valid_checkpoint_name("../evil"));
+        assert!(!is_valid_checkpoint_name("a/b"));
+        assert!(!is_valid_checkpoint_name("a\\b"));
+    }
+
+    #[test]
+    fn chat_completion_message_preserves_tool_fields() {
+        let json = r#"{
+            "role": "assistant",
+            "content": null,
+            "name": "helper",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}],
+            "tool_call_id": "call_1"
+        }"#;
+        let msg: ChatCompletionMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.name.as_deref(), Some("helper"));
+        assert!(msg.tool_calls.is_some());
+        assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn admin_auth_separates_tenant_and_admin_keys() {
+        let dir = std::env::temp_dir().join(format!("athenas-admin-test-{}", uuid::Uuid::new_v4()));
+        let mut mgr = crate::api_keys::ApiKeyManager::new(dir);
+        let tenant = mgr.create_key("tenant", 60, 0, vec![], None);
+        let admin = mgr.create_key_with_admin("admin", 60, 0, vec![], None, true);
+
+        let mut state = test_app_state();
+        state.api_key_manager = Some(Arc::new(Mutex::new(mgr)));
+
+        let remote_ip: Option<std::net::IpAddr> = Some("8.8.8.8".parse().unwrap());
+        let loopback_ip: Option<std::net::IpAddr> = Some("127.0.0.1".parse().unwrap());
+
+        // Loopback is always admin
+        assert!(matches!(
+            check_auth_for_key_mgmt(&HeaderMap::new(), &state, loopback_ip).await,
+            AdminAuthResult::Allowed
+        ));
+
+        // Remote without token -> Unauthorized
+        assert!(matches!(
+            check_auth_for_key_mgmt(&HeaderMap::new(), &state, remote_ip).await,
+            AdminAuthResult::Unauthorized
+        ));
+
+        // Remote with tenant key -> Forbidden
+        let mut tenant_headers = HeaderMap::new();
+        tenant_headers.insert(
+            "authorization",
+            format!("Bearer {}", tenant.api_key).parse().unwrap(),
+        );
+        assert!(matches!(
+            check_auth_for_key_mgmt(&tenant_headers, &state, remote_ip).await,
+            AdminAuthResult::Forbidden
+        ));
+
+        // Remote with admin key -> Allowed
+        let mut admin_headers = HeaderMap::new();
+        admin_headers.insert(
+            "authorization",
+            format!("Bearer {}", admin.api_key).parse().unwrap(),
+        );
+        assert!(matches!(
+            check_auth_for_key_mgmt(&admin_headers, &state, remote_ip).await,
+            AdminAuthResult::Allowed
+        ));
     }
 
     fn test_app_state() -> AppState {

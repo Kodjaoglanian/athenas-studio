@@ -115,6 +115,9 @@ impl SessionManager {
 
     /// Create a new session and assign it a slot.
     pub fn create(&mut self, id: Option<String>) -> String {
+        if self.sessions.len() > 64 {
+            self.purge_expired();
+        }
         let session_id = id.unwrap_or_else(|| {
             format!("sess_{}", uuid::Uuid::new_v4().to_string().replace("-", ""))
         });
@@ -138,6 +141,9 @@ impl SessionManager {
 
     /// Get a mutable session by ID.
     pub fn get_mut(&mut self, session_id: &str) -> Option<&mut Session> {
+        if self.sessions.len() > 64 {
+            self.purge_expired();
+        }
         self.sessions.get_mut(session_id)
     }
 

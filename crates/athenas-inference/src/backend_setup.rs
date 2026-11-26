@@ -502,6 +502,7 @@ fn detect_vulkan_support() -> bool {
         let lib_paths = [
             "/usr/lib/x86_64-linux-gnu/libvulkan.so",
             "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+            "/usr/lib/aarch64-linux-gnu/libvulkan.so.1",
             "/usr/lib/libvulkan.so",
             "/usr/lib/libvulkan.so.1",
             "/usr/local/lib/libvulkan.so",
@@ -514,9 +515,16 @@ fn detect_vulkan_support() -> bool {
             }
         }
         // Method 3: check if NVIDIA driver is installed (provides Vulkan)
-        if std::path::Path::new("/usr/lib/x86_64-linux-gnu/libGL.so.1").exists()
+        let cuda_paths = [
+            "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "/usr/lib/aarch64-linux-gnu/libcuda.so.1",
+            "/usr/lib/libcuda.so.1",
+            "/usr/lib64/libcuda.so.1",
+        ];
+        if cuda_paths.iter().any(|p| std::path::Path::new(p).exists())
             || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libnvidia-glcore.so").exists()
             || std::path::Path::new("/proc/driver/nvidia").exists()
+            || detect_nvidia()
         {
             // NVIDIA driver is installed — Vulkan should work even if
             // vulkaninfo isn't installed
@@ -722,6 +730,10 @@ fn extract_tar_gz(data: &[u8], bin_dir: &std::path::Path) -> Result<PathBuf> {
     {
         let mut entry =
             entry.map_err(|e| AthenasError::Backend(format!("Failed to read tar entry: {}", e)))?;
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
 
         let file_name = entry
             .path()
@@ -1156,7 +1168,12 @@ fn cleanup_bin_dir(bin_dir: &std::path::Path, server_path: &std::path::Path) {
     if let Ok(entries) = std::fs::read_dir(bin_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("libllama") || name.starts_with("libggml") {
+            let lower = name.to_ascii_lowercase();
+            if name.starts_with("libllama")
+                || name.starts_with("libggml")
+                || name.starts_with("libmtmd")
+                || lower.ends_with(".dll")
+            {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
@@ -1201,12 +1218,21 @@ async fn get_latest_whisper_release_tag() -> Result<String> {
         "https://api.github.com/repos/{}/releases/latest",
         WHISPER_CPP_REPO
     );
-    let resp: serde_json::Value = client
+    let resp = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| AthenasError::Backend(format!("GitHub API request failed: {}", e)))?
+        .map_err(|e| AthenasError::Backend(format!("GitHub API request failed: {}", e)))?;
+
+    if !resp.status().is_success() {
+        return Err(AthenasError::Backend(format!(
+            "GitHub API returned {}",
+            resp.status()
+        )));
+    }
+
+    let resp: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| AthenasError::Backend(format!("Failed to parse GitHub response: {}", e)))?;
@@ -1312,6 +1338,10 @@ fn extract_tar_gz_whisper(data: &[u8], bin_dir: &std::path::Path) -> Result<Path
     {
         let mut entry =
             entry.map_err(|e| AthenasError::Backend(format!("Failed to read tar entry: {}", e)))?;
+
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
 
         let file_name = entry
             .path()

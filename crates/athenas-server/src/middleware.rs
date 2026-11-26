@@ -34,7 +34,7 @@ pub fn client_ip(req: &Request, trust_proxy: bool) -> IpAddr {
     req.extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)))
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
 }
 
 pub struct RateLimiter {
@@ -64,6 +64,24 @@ impl RateLimiter {
     async fn check(&self, ip: IpAddr) -> bool {
         let mut buckets = self.buckets.lock().await;
         let now = Instant::now();
+
+        // Periodically evict stale buckets to bound memory usage
+        if buckets.len() > 1024 {
+            let stale_cutoff = Duration::from_secs(300);
+            buckets.retain(|_, b| now.duration_since(b.last_refill) < stale_cutoff);
+            // If still large under heavy unique-IP traffic, drop fully refilled buckets
+            if buckets.len() > 2048 {
+                let max_t = self.max_tokens as f64;
+                let rate = self.refill_rate.as_secs_f64();
+                buckets.retain(|_, b| {
+                    let refilled = (b.tokens
+                        + now.duration_since(b.last_refill).as_secs_f64() / rate)
+                        .min(max_t);
+                    refilled < max_t
+                });
+            }
+        }
+
         let bucket = buckets.entry(ip).or_insert(Bucket {
             tokens: self.max_tokens as f64,
             last_refill: now,
@@ -238,7 +256,7 @@ pub async fn request_logging_middleware(req: Request, next: Next) -> Response {
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
     let start = Instant::now();
     let response = next.run(req).await;

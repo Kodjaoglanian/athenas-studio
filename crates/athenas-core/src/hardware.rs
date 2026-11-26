@@ -119,13 +119,19 @@ impl ModelMemoryEstimate {
             return Some(("RAM", self.ram_mb, avail_ram));
         }
         if let Some(vram_need) = self.vram_mb {
+            let dedicated_total: u64 = hw
+                .gpus
+                .iter()
+                .filter(|g| !g.is_apu)
+                .map(|g| g.vram_total_mb)
+                .sum();
             let dedicated_free: u64 = hw
                 .gpus
                 .iter()
                 .filter(|g| !g.is_apu)
                 .map(|g| g.vram_total_mb.saturating_sub(g.vram_used_mb))
                 .sum();
-            if dedicated_free > 0 {
+            if dedicated_total > 0 {
                 if vram_need > dedicated_free {
                     return Some(("VRAM", vram_need, dedicated_free));
                 }
@@ -303,14 +309,19 @@ impl HardwareDetector {
             return 0;
         }
 
-        // For APUs (integrated GPUs with unified memory), use system RAM
-        // instead of the tiny dedicated VRAM reported by the driver.
-        let has_apu = hw.gpus.iter().any(|g| g.is_apu);
-        let total_vram_mb: u64 = if has_apu {
+        // For APU-only systems (integrated GPU with unified memory and no
+        // discrete GPU), use system RAM instead of the tiny dedicated VRAM
+        // reported by the driver. On hybrid GPU+APU systems, sum discrete GPUs.
+        let all_apu = hw.gpus.iter().all(|g| g.is_apu);
+        let total_vram_mb: u64 = if all_apu {
             // APU uses unified memory — use available system RAM
             hw.memory_available_mb
         } else {
-            hw.gpus.iter().map(|g| g.vram_total_mb).sum()
+            hw.gpus
+                .iter()
+                .filter(|g| !g.is_apu)
+                .map(|g| g.vram_total_mb)
+                .sum()
         };
         let total_vram_gb = total_vram_mb as f64 / 1024.0;
         let available_vram_gb = total_vram_gb * 0.85; // Leave 15% headroom
@@ -721,5 +732,26 @@ mod tests {
         // Detection failure (0) must not produce a false rejection
         let est = estimate_model_memory(64 * 1024, 4096, 0, &hw(0, vec![]));
         assert!(est.fits(&hw(0, vec![])));
+    }
+
+    #[test]
+    fn full_vram_zero_free_reports_vram_shortfall() {
+        // 8GB discrete GPU with 8GB used -> dedicated_total=8192, dedicated_free=0.
+        // Must report VRAM shortfall instead of treating 0 as detection failure.
+        let h = hw(64 * 1024, vec![gpu(8192, 8192, false)]);
+        let est = estimate_model_memory(4096, 4096, -1, &h);
+        let (res, needed, avail) = est.shortfall(&h).unwrap();
+        assert_eq!(res, "VRAM");
+        assert!(needed > 0);
+        assert_eq!(avail, 0);
+    }
+
+    #[test]
+    fn hybrid_gpu_plus_apu_uses_discrete_vram_in_recommend_gpu_layers() {
+        // Discrete 8GB GPU + integrated APU on 64GB RAM machine:
+        // A 12GB model must NOT get full offload (-1) by mistakenly using 64GB RAM.
+        let h = hw(64 * 1024, vec![gpu(8192, 0, false), gpu(512, 0, true)]);
+        let layers = HardwareDetector::recommend_gpu_layers(&h, 12.0);
+        assert!(layers > 0, "expected partial offload, got {layers}");
     }
 }

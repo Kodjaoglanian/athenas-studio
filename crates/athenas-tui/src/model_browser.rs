@@ -1,5 +1,6 @@
 use athenas_hub::ModelSearchResult;
 
+#[derive(PartialEq, Eq)]
 pub enum BrowserPhase {
     Search,
     Results,
@@ -20,6 +21,9 @@ pub struct ModelBrowserState {
     /// (filename, size_bytes, expected sha256 from LFS metadata)
     pub file_options: Vec<(String, Option<u64>, Option<String>)>,
     pub file_selected: usize,
+    /// True while an async HF search or file listing is in flight
+    pub is_busy: bool,
+    pub busy_label: Option<String>,
 }
 
 impl Default for ModelBrowserState {
@@ -36,6 +40,8 @@ impl Default for ModelBrowserState {
             download_filename: None,
             file_options: Vec::new(),
             file_selected: 0,
+            is_busy: false,
+            busy_label: None,
         }
     }
 }
@@ -84,6 +90,8 @@ impl ModelBrowserState {
         self.results_selected = 0;
         self.status_message = None;
         self.status_is_error = false;
+        self.is_busy = false;
+        self.busy_label = None;
     }
 
     /// Go back to search editing phase, keeping the current query text.
@@ -92,4 +100,10 @@ impl ModelBrowserState {
         self.status_message = None;
         self.status_is_error = false;
     }
+}
+
+/// Returns true for recommended quantization levels (Q4_K_M, Q5_K_M, Q8_0).
+pub fn is_recommended_quant(filename: &str) -> bool {
+    let upper = filename.to_uppercase();
+    upper.contains("Q4_K_M") || upper.contains("Q5_K_M") || upper.contains("Q8_0")
 }

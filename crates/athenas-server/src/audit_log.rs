@@ -71,20 +71,29 @@ impl AuditLogger {
     }
 
     fn append_to_disk(&self, entry: &AuditEntry) {
-        if let Some(parent) = self.log_file().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string(entry) {
+        let log_file = self.log_file();
+        let Ok(json) = serde_json::to_string(entry) else {
+            return;
+        };
+        let write_fn = move || {
+            if let Some(parent) = log_file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(self.log_file())
+                .open(&log_file)
             {
                 if let Err(e) = writeln!(file, "{}", json) {
                     warn!("Failed to write audit log: {}", e);
                 }
             }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(write_fn);
+        } else {
+            write_fn();
         }
     }
 
